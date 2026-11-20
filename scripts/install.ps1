@@ -57,7 +57,7 @@ try {
   }
 
   Invoke-CheckedStep -Label 'Packaging VSIX' -Action {
-    npx vsce package --allow-star-activation
+    npm run package:vsix
   }
 
   $vsix = Get-ChildItem -LiteralPath $repoRoot -Filter '*.vsix' |
@@ -78,7 +78,7 @@ try {
     $global:LASTEXITCODE = 0
     node scripts/patch-sessions-ui.js --apply
     if ($LASTEXITCODE -ne 0) {
-      throw "UI patch failed with exit code $LASTEXITCODE. If VS Code is installed under Program Files, re-run PowerShell as Administrator or pass -SkipUiPatch."
+      throw "UI patch failed with exit code $LASTEXITCODE. See the [patch-sessions-ui] message above for the cause. Run 'node scripts/patch-sessions-ui.js --check' to inspect compatibility, or retry with -SkipUiPatch to install without the UI patch."
     }
   } else {
     Write-Host "`n==> Skipping VS Code UI patch (-SkipUiPatch)" -ForegroundColor Yellow
