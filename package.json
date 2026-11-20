@@ -4,7 +4,11 @@
   "description": "Integrate Google Antigravity (agy acp) natively into VS Code Agents / Chat Sessions with account, quota, model, terminal, diff, and browser control support.",
   "version": "0.1.0",
   "publisher": "antigravity",
-  "license": "MIT",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/preca-hoshino/agy-copilot-harness.git"
+  },
   "engines": {
     "vscode": "^1.109.0"
   },
@@ -217,7 +221,7 @@
     "@types/vscode": "^1.109.0",
     "@typescript-eslint/eslint-plugin": "^8.56.1",
     "@typescript-eslint/parser": "^8.56.1",
-    "@vscode/vsce": "^3.3.2",
+    "@vscode/vsce": "^4.1.1",
     "esbuild": "^0.25.0",
     "eslint": "^10.0.2",
     "eslint-config-biome": "^2.1.3",
