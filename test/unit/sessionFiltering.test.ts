@@ -112,6 +112,10 @@ vi.mock('vscode', () => {
     inputStateGroupWrites: 0,
   };
 
+  class MockChatRequestTurn {
+    public constructor(public readonly prompt: string) {}
+  }
+
   const ChatSessionStatus = {
     Failed: 0,
     Completed: 1,
@@ -196,6 +200,17 @@ vi.mock('vscode', () => {
     CancellationError: MockCancellationError,
     CancellationTokenSource: MockCancellationTokenSource,
     ChatSessionStatus,
+    ChatRequestTurn2: MockChatRequestTurn,
+    ChatResponseMarkdownPart: class {
+      public constructor(public readonly value: unknown) {}
+    },
+    MarkdownString: class {
+      public constructor(public readonly value = '') {}
+      public appendCodeblock(): this { return this; }
+      public appendText(): this { return this; }
+    },
+    ChatQuestionType: { SingleSelect: 2 },
+    window: { showQuickPick: vi.fn() },
     CancellationToken: { None: { isCancellationRequested: false } },
     chat: {
       createChatSessionItemController: createController,
@@ -236,15 +251,18 @@ vi.mock('vscode', () => {
 });
 
 import * as vscode from 'vscode';
-import type { AcpSessionSummary, AcpSessionUpdate } from '../../src/acp/acpTypes.js';
+import type { AcpRequestPermissionParams, AcpSessionPromptResult, AcpSessionSummary, AcpSessionUpdate } from '../../src/acp/acpTypes.js';
+import type { AgyLanguageModelProvider } from '../../src/models/agyLanguageModelProvider.js';
+import { AgyChatParticipant } from '../../src/sessions/agyChatParticipant.js';
 import { AgySessionContentProvider } from '../../src/sessions/agySessionContentProvider.js';
 import {
   AgySessionController,
   buildSessionResource,
   getAntigravityScratchDir,
+  normalizeAcpCwd,
 } from '../../src/sessions/agySessionController.js';
 import type { BrowserSubagentRenderer } from '../../src/sessions/browserSubagentRenderer.js';
-import type { AcpBackendInterface } from '../../src/shared/contracts.js';
+import type { AcpBackendInterface, PermissionPrompt, QuotaServiceInterface } from '../../src/shared/contracts.js';
 
 interface TestMockWorkspace extends Record<string, unknown> {
   workspaceFolders: vscode.WorkspaceFolder[] | undefined;
@@ -320,6 +338,18 @@ function makeWorkspaceFolder(folderPath: string, name: string): vscode.Workspace
     index: 0,
   };
 }
+
+describe('normalizeAcpCwd', () => {
+  it.each([
+    ['/d:/Code%20Library/harness', 'd:\\Code Library\\harness'],
+    ['/d%3A/Code%20Library/harness', 'd:\\Code Library\\harness'],
+    ['file:///d:/Code%20Library/harness', 'd:\\Code Library\\harness'],
+    ['/d:/Code%2520Library/harness', 'd:\\Code%20Library\\harness'],
+    ['d:\\Code%20Library\\harness', 'd:\\Code%20Library\\harness'],
+  ])('normalizes %s to %s', (cwd, expected) => {
+    expect(normalizeAcpCwd(cwd)).toBe(expected);
+  });
+});
 
 describe('AgySessionController inputState & workspace filtering', () => {
   beforeEach(() => {
@@ -439,6 +469,38 @@ describe('AgySessionController inputState & workspace filtering', () => {
     disposeBackend();
   });
 
+  it('keeps a realized session in its project after ACP lists an encoded cwd', async () => {
+    const project = 'd:\\Code Library\\harness';
+    getMockWorkspace().workspaceFolders = [makeWorkspaceFolder(project, 'harness')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'real-sess', cwd: '/d:/Code%20Library/harness', title: 'Test' },
+    ]);
+    const loadSession = vi.spyOn(backend, 'loadSession');
+    const output = createFakeOutputChannel();
+    const controller = new AgySessionController(backend, output, nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    const provider = new AgySessionContentProvider(backend, controller, {} as BrowserSubagentRenderer, output);
+    const cts = new vscode.CancellationTokenSource();
+    const resource = buildSessionResource('real-sess');
+    const untitledId = 'untitled-project';
+
+    try {
+      await expect(controller.getSessionCwd(untitledId)).resolves.toBe(project);
+      controller.markSessionRealized(untitledId, 'real-sess');
+      await controller.refreshSessions(undefined, true);
+
+      expect(controller.controller.items.get(resource)).toBeDefined();
+      await expect(controller.getSessionCwd(untitledId)).resolves.toBe(project);
+      const inputState = controller.controller.createChatSessionInputState([]);
+      await provider.provideChatSessionContent(resource, cts.token, { inputState });
+      expect(loadSession).toHaveBeenCalledWith('real-sess', project);
+    } finally {
+      cts.dispose();
+      provider.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
+
   it('skips redundant setConfigOption and inputState mutations when mode is unchanged', async () => {
     const projectA = process.platform === 'win32' ? 'D:\\Code Library\\agy-copilot-harness' : '/work/agy-copilot-harness';
     const ws = getMockWorkspace();
@@ -476,6 +538,114 @@ describe('AgySessionController inputState & workspace filtering', () => {
     contentProvider.dispose();
     controller.dispose();
     disposeBackend();
+  });
+
+  it.each([
+    { action: 'finishing normally', stopAfterReopening: false },
+    { action: 'pressing Stop', stopAfterReopening: true },
+  ])('reattaches without reloading ACP history before $action', async ({ stopAfterReopening }) => {
+    const { backend, disposeBackend } = createFakeBackend([{ sessionId: 'running', cwd: '', title: 'Running session' }]);
+    const finish = Promise.withResolvers<AcpSessionPromptResult>();
+    const prompt = vi.spyOn(backend, 'prompt').mockReturnValue(finish.promise);
+    const load = vi.spyOn(backend, 'loadSession');
+    const cancel = vi.spyOn(backend, 'cancel');
+    const updates = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
+    Object.assign(backend, { onDidChangeUpdate: updates.event });
+    const output = createFakeOutputChannel();
+    const controller = new AgySessionController(backend, output, nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    const browser = { disposeSession: vi.fn() } as unknown as BrowserSubagentRenderer;
+    const participant = new AgyChatParticipant(
+      backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      browser, output,
+    );
+    const provider = new AgySessionContentProvider(
+      backend, controller, browser, output, undefined, (id) => participant.getActiveSession(id),
+    );
+    const resource = buildSessionResource('running');
+    const draftResource = buildSessionResource('untitled-background');
+    const chatSessionItem = { resource, label: 'Running session' };
+    controller.markSessionRealized('untitled-background', 'running');
+    const source = new vscode.CancellationTokenSource();
+    const historyLoad = new vscode.CancellationTokenSource();
+    const stop = new vscode.CancellationTokenSource();
+    const completedLoad = new vscode.CancellationTokenSource();
+    const carousel = Promise.withResolvers<Record<string, unknown> | undefined>();
+    const first = { push: vi.fn(), questionCarousel: vi.fn(() => carousel.promise) } as unknown as vscode.ChatResponseStream;
+    const reopened = { push: vi.fn() } as unknown as vscode.ChatResponseStream;
+    const inputState = controller.controller.createChatSessionInputState([]);
+    let ask: PermissionPrompt | undefined;
+    backend.registerPermissionPrompt = (_id, handler) => {
+      ask = handler;
+      return { dispose: () => { ask = undefined; } };
+    };
+
+    const running = participant.createHandler()(
+      { prompt: 'Keep working', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+      { history: [], chatSessionContext: { chatSessionItem: { ...chatSessionItem, resource: draftResource }, isUntitled: true } }, first, source.token,
+    );
+    const emit = (text: string): void => {
+      updates.fire({ sessionId: 'running', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } } });
+    };
+    const permission: AcpRequestPermissionParams = {
+      sessionId: 'running', toolCall: { toolCallId: 'terminal-1', kind: 'execute', rawInput: { command: 'Get-Location' } },
+      options: [{ optionId: 'no', kind: 'reject_once', name: 'Reject' }],
+    };
+    const pick = vi.mocked(vscode.window.showQuickPick);
+    pick.mockReset();
+    try {
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+      emit('before reopening');
+      expect(first.push).toHaveBeenCalledTimes(1);
+      pick.mockResolvedValueOnce({ label: 'Reject', optionId: 'no' } as vscode.QuickPickItem);
+      const pendingPermission = ask?.(permission);
+      expect(first.questionCarousel).toHaveBeenCalledOnce();
+      expect(pick).not.toHaveBeenCalled();
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.NeedsInput);
+      const content = await provider.provideChatSessionContent(resource, historyLoad.token, { inputState });
+      expect(content.history.at(-1)).toMatchObject({ prompt: 'Keep working' });
+      expect(load).not.toHaveBeenCalled();
+      const attached = content.activeResponseCallback?.(reopened, stop.token);
+      historyLoad.cancel();
+      source.cancel();
+      emit('after reopening');
+      expect(reopened.push).toHaveBeenNthCalledWith(1, expect.objectContaining({ value: { value: 'before reopening' } }));
+      expect(reopened.push).toHaveBeenNthCalledWith(2, expect.objectContaining({ value: { value: 'after reopening' } }));
+      expect(first.push).toHaveBeenCalledTimes(1);
+      expect(cancel).not.toHaveBeenCalled();
+      expect(prompt).toHaveBeenCalledTimes(1);
+
+      await expect(pendingPermission).resolves.toBe('no');
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.InProgress);
+      carousel.resolve(undefined);
+      expect(pick).toHaveBeenCalledWith([expect.objectContaining({ detail: 'Get-Location' })], expect.anything(), expect.anything());
+
+      if (stopAfterReopening) {
+        stop.cancel();
+        expect(cancel).toHaveBeenCalledExactlyOnceWith('running');
+      }
+      finish.resolve({ stopReason: stopAfterReopening ? 'cancelled' : 'end_turn' });
+      await running;
+      await attached;
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.Completed);
+      expect(cancel).toHaveBeenCalledTimes(stopAfterReopening ? 1 : 0);
+      await provider.provideChatSessionContent(resource, completedLoad.token, { inputState });
+      expect(load).toHaveBeenCalledTimes(1);
+    } finally {
+      carousel.resolve(undefined);
+      finish.resolve({ stopReason: 'end_turn' });
+      await running;
+      source.dispose();
+      historyLoad.dispose();
+      stop.dispose();
+      completedLoad.dispose();
+      updates.dispose();
+      provider.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
   });
 
   it('rejects provideChatSessionContent immediately with CancellationError when token cancels mid-load', async () => {

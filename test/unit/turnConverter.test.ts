@@ -127,6 +127,14 @@ vi.mock('vscode', () => {
     }
   }
 
+  class MockChatResponseWarningPart {
+    public readonly value: MockMarkdownString;
+
+    public constructor(value: string | MockMarkdownString) {
+      this.value = typeof value === 'string' ? new MockMarkdownString(value) : value;
+    }
+  }
+
   class MockChatResponseThinkingProgressPart {
     public value: string | string[];
     public id: string | undefined;
@@ -189,6 +197,7 @@ vi.mock('vscode', () => {
     ChatRequestTurn2: MockChatRequestTurn2,
     ChatResponseTurn2: MockChatResponseTurn2,
     ChatResponseMarkdownPart: MockChatResponseMarkdownPart,
+    ChatResponseWarningPart: MockChatResponseWarningPart,
     ChatResponseAnchorPart: class {
       public constructor(public readonly value: vscode.Uri, public readonly title?: string) {}
     },
@@ -264,6 +273,45 @@ describe('TurnConverter', () => {
     expect(push.mock.calls.map(([part]) => part.constructor)).toEqual([
       vscode.ChatResponseMarkdownPart, vscode.ChatResponseAnchorPart,
     ]);
+  });
+
+  it('renders the ACP low-credit notice as a native warning after replayed response text', () => {
+    const renderer = new BrowserSubagentRenderer(nodePath.join(os.tmpdir(), 'non-existent-brain'));
+    const converter = new TurnConverter(renderer, 'session-credit-warning');
+    const warning = 'Your AI credits balance is too low to continue.';
+    converter.processUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Run the tests' } });
+    converter.processUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Tests started.' } });
+    converter.processUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `\n⚠ ${warning}\n` } });
+
+    const [, responseTurn] = converter.finalizeHistory().turns;
+    const parts = (responseTurn as vscode.ChatResponseTurn2).response;
+    expect(parts.map((part) => part.constructor)).toEqual([
+      vscode.ChatResponseMarkdownPart,
+      vscode.ChatResponseWarningPart,
+    ]);
+    expect(parts).toMatchObject([{ value: { value: 'Tests started.' } }, { value: { value: warning } }]);
+  });
+
+  it('streams the low-credit warning without restyling quoted or unrelated text', () => {
+    const renderer = new BrowserSubagentRenderer(nodePath.join(os.tmpdir(), 'non-existent-brain'));
+    const push = vi.fn<(part: vscode.ChatResponsePart) => void>();
+    const stream = { push } as unknown as vscode.ChatResponseStream;
+    const live = new LiveStreamAdapter(renderer, 'session-live-credit-warning', stream, () => {});
+    const warning = 'Your AI credits balance is too low to continue.';
+    const quoted = `> ⚠ ${warning}`;
+    const unrelated = '⚠ Review the test output.';
+
+    for (const text of [quoted, unrelated, `\n⚠\uFE0F ${warning}\n`]) {
+      live.handleUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+    }
+
+    const parts = push.mock.calls.map(([part]) => part);
+    expect(parts.map((part) => part.constructor)).toEqual([
+      vscode.ChatResponseMarkdownPart,
+      vscode.ChatResponseMarkdownPart,
+      vscode.ChatResponseWarningPart,
+    ]);
+    expect(parts).toMatchObject([{ value: { value: quoted } }, { value: { value: unrelated } }, { value: { value: warning } }]);
   });
 
   it('converts user prompt, thinking, markdown, plan, run_command, read_file, and write_file updates', () => {
@@ -403,6 +451,7 @@ describe('TurnConverter', () => {
       if (cmdPart instanceof vscode.ChatToolInvocationPart) {
         expect(cmdPart.isComplete).toBe(true);
         expect(cmdPart.isError).toBe(false);
+        expect(cmdPart.pastTenseMessage).toBeUndefined();
         expect(cmdPart.toolSpecificData).toEqual({
           commandLine: { original: 'npx vitest run' },
           language: 'pwsh',
@@ -430,6 +479,50 @@ describe('TurnConverter', () => {
     expect(history.changes[0]?.insertions).toBe(2);
     expect(history.changes[0]?.deletions).toBe(1);
     expect(history.changes[0]?.modifiedUri.fsPath).toContain('app.ts');
+  });
+
+  it('streams terminal progress and failure output without a duplicate command description', () => {
+    const renderer = new BrowserSubagentRenderer(nodePath.join(os.tmpdir(), 'non-existent-brain'));
+    const push = vi.fn<(part: vscode.ChatToolInvocationPart) => void>();
+    const stream = { push } as unknown as vscode.ChatResponseStream;
+    const adapter = new LiveStreamAdapter(renderer, 'session-live-terminal', stream, () => {});
+    const command = 'Get-ChildItem -Force missing-folder';
+
+    adapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'live-terminal-1',
+      name: 'run_command',
+      kind: 'execute',
+      status: 'in_progress',
+      args: { CommandLine: command },
+    });
+
+    const runningPart = push.mock.lastCall?.[0];
+    expect(runningPart).toMatchObject({
+      isComplete: false,
+      invocationMessage: `Run \`${command}\``,
+      toolSpecificData: { commandLine: { original: command } },
+    });
+    expect(runningPart?.pastTenseMessage).toBeUndefined();
+
+    adapter.handleUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'live-terminal-1',
+      status: 'failed',
+      rawOutput: { stderr: 'Cannot find path', exitCode: 1, duration: 25 },
+    });
+
+    const completedPart = push.mock.lastCall?.[0];
+    expect(completedPart).toMatchObject({
+      isComplete: true,
+      isError: true,
+      toolSpecificData: {
+        commandLine: { original: command },
+        output: { text: 'Cannot find path' },
+        state: { exitCode: 1, duration: 25 },
+      },
+    });
+    expect(completedPart?.pastTenseMessage).toBeUndefined();
   });
 
   it('replays browser invoke_subagent with ChatSubagentToolInvocationData, nested steps, Uint8Array images, and WebM button', async () => {

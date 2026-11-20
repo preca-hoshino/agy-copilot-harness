@@ -15,6 +15,7 @@ declare module 'vscode' {
   }
 
   export interface ChatResponseStream {
+    push(part: ChatResponsePart | ChatResponseWarningPart): void;
     questionCarousel(questions: ChatQuestion[], allowSkip?: boolean): Thenable<Record<string, unknown> | undefined>;
   }
 
@@ -212,16 +213,21 @@ declare module 'vscode' {
   }
 
   export class ChatResponseTurn2 implements ChatResponseTurn {
-    readonly response: ReadonlyArray<ChatResponsePart>;
+    readonly response: ReadonlyArray<ChatResponsePart | ChatResponseWarningPart>;
     readonly result: ChatResult;
     readonly participant: string;
     readonly command?: string;
     constructor(
-      response: ReadonlyArray<ChatResponsePart>,
+      response: ReadonlyArray<ChatResponsePart | ChatResponseWarningPart>,
       result: ChatResult,
       participant: string,
       command?: string
     );
+  }
+
+  export class ChatResponseWarningPart {
+    value: MarkdownString;
+    constructor(value: string | MarkdownString);
   }
 
   export class ChatResponseThinkingProgressPart {

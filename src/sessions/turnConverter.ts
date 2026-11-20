@@ -19,9 +19,10 @@ export interface ConvertedHistory {
 }
 
 type ToolCallCategory = 'browser' | 'execute' | 'read' | 'edit' | 'generic';
+type ResponsePart = vscode.ChatResponseTurn2['response'][number];
 
 type ResponseTurnSlot =
-  | { readonly kind: 'part'; readonly part: vscode.ChatResponsePart }
+  | { readonly kind: 'part'; readonly part: ResponsePart }
   | { readonly kind: 'plan'; entries: AcpPlanUpdatePayload['entries'] }
   | { readonly kind: 'tool'; readonly toolCallId: string };
 
@@ -198,10 +199,10 @@ export class TurnConverter {
   private handleAgentMessageChunk(content: AcpContentBlock): void {
     this.flushPendingUserTurn();
     this.flushThinkingBuffer();
-    const attachment = buildMessageAttachmentPart(content, this.attachmentDir);
-    if (attachment) {
+    const part = buildStandaloneAgentMessagePart(content, this.attachmentDir);
+    if (part !== undefined) {
       this.flushMarkdownBuffer();
-      this.currentTurnSlots.push({ kind: 'part', part: attachment });
+      this.currentTurnSlots.push({ kind: 'part', part });
       return;
     }
     const chunkText = extractContentBlockText(content);
@@ -296,7 +297,7 @@ export class TurnConverter {
       return;
     }
 
-    const parts: vscode.ChatResponsePart[] = [];
+    const parts: ResponsePart[] = [];
     for (const slot of this.currentTurnSlots) {
       if (slot.kind === 'part') {
         parts.push(slot.part);
@@ -330,7 +331,7 @@ export class TurnConverter {
 export class LiveStreamAdapter {
   private readonly browserRenderer: BrowserSubagentRenderer;
   private readonly sessionId: string;
-  private readonly stream: vscode.ChatResponseStream;
+  private readonly stream: Pick<vscode.ChatResponseStream, 'push'>;
   private readonly onFileChange: (change: vscode.ChatSessionFileChange) => void;
   private readonly onNeedsInput: ((reason: string) => void) | undefined;
 
@@ -342,7 +343,7 @@ export class LiveStreamAdapter {
   public constructor(
     browserRenderer: BrowserSubagentRenderer,
     sessionId: string,
-    stream: vscode.ChatResponseStream,
+    stream: Pick<vscode.ChatResponseStream, 'push'>,
     onFileChange: (change: vscode.ChatSessionFileChange) => void,
     onNeedsInput?: (reason: string) => void,
     private readonly attachmentDir?: string,
@@ -368,9 +369,9 @@ export class LiveStreamAdapter {
       }
       case 'agent_message_chunk': {
         if (isMessageChunkPayload(update)) {
-          const attachment = buildMessageAttachmentPart(update.content, this.attachmentDir);
-          if (attachment) {
-            this.stream.push(attachment);
+          const part = buildStandaloneAgentMessagePart(update.content, this.attachmentDir);
+          if (part !== undefined) {
+            this.stream.push(part);
             break;
           }
           const text = extractContentBlockText(update.content);
@@ -581,9 +582,8 @@ function populateExecutePart(
   const exitCode = extractExitCode(merged.rawOutput);
   const duration = getFirstNumber(merged.rawOutput, ['duration', 'durationMs', 'duration_ms']);
 
-  const label = command.length > 0 ? `Run \`${command}\`` : (merged.title ?? 'Run command');
-  part.invocationMessage = label;
-  part.pastTenseMessage = label;
+  // The terminal card already shows the command above its output; a past-tense message would repeat it.
+  part.invocationMessage = command.length > 0 ? `Run \`${command}\`` : (merged.title ?? 'Run command');
 
   if (exitCode !== undefined && exitCode !== 0) {
     part.isError = true;
@@ -1045,7 +1045,15 @@ function resolveMessageAttachment(
   return { id: uri.toString(), name, uri, image };
 }
 
-function buildMessageAttachmentPart(block: AcpContentBlock, directory?: string): vscode.ChatResponsePart | undefined {
+function buildStandaloneAgentMessagePart(block: AcpContentBlock, directory?: string): ResponsePart | undefined {
+  if (block.type === 'text' && typeof block.text === 'string') {
+    // ACP sends this notice as a standalone text chunk, without a warning field.
+    const match = /^⚠\uFE0F?[ \t]+(Your AI credits balance is too low to continue\.)$/.exec(block.text.trim());
+    const message = match?.[1];
+    if (message !== undefined && typeof vscode.ChatResponseWarningPart === 'function') {
+      return new vscode.ChatResponseWarningPart(message);
+    }
+  }
   const attachment = resolveMessageAttachment(block, directory);
   if (!attachment) {
     return undefined;

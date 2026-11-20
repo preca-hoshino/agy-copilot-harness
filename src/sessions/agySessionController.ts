@@ -73,16 +73,16 @@ function buildItemsSignature(items: readonly vscode.ChatSessionItem[]): string {
 }
 
 export function normalizeAcpCwd(rawCwd: string): string {
-  const trimmed = rawCwd;
-  if (trimmed.length === 0) {
+  if (rawCwd.length === 0) {
     return '';
   }
 
-  let candidate = trimmed;
-  if (trimmed.toLowerCase().startsWith('file://')) {
-    candidate = parseFileUriToPath(trimmed);
-  } else if (/^\/[a-z]%3a(?:\/|$)/i.test(trimmed)) {
-    candidate = decodePercentSequences(trimmed);
+  let candidate = rawCwd;
+  if (rawCwd.toLowerCase().startsWith('file://')) {
+    candidate = parseFileUriToPath(rawCwd);
+  } else if (/^\/[a-z](?::|%3a)(?:\/|$)/i.test(rawCwd)) {
+    // ACP can encode path segments without encoding the drive colon.
+    candidate = decodePercentSequences(rawCwd);
   }
 
   // Handle Windows UNC paths such as //server/share/dir or \\server\share\dir
