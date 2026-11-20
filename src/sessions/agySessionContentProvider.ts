@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import type { AcpConfigOption, AcpSessionLoadResult } from '../acp/acpTypes.js';
 import type { AcpBackendInterface } from '../shared/contracts.js';
 import { ANTIGRAVITY_SCHEME } from '../shared/contracts.js';
+import type { ActiveAgySession } from './agyChatParticipant.js';
 import type { AgySessionController } from './agySessionController.js';
 import { extractSessionIdFromUri } from './agySessionController.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
@@ -32,6 +33,7 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
     browserRenderer: BrowserSubagentRenderer,
     outputChannel: vscode.OutputChannel,
     private readonly attachmentDir?: string,
+    private readonly getActiveSession?: (sessionId: string) => ActiveAgySession | undefined,
   ) {
     this.backend = backend;
     this.controller = controller;
@@ -65,6 +67,17 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
       throw createCancellationError();
     }
     const cwd = await raceWithCancellation(this.controller.getSessionCwd(sessionId), token);
+
+    // ACP session/load can stop a running cascade; reattach without asking the backend to replay history.
+    const active = this.getActiveSession?.(sessionId);
+    if (active !== undefined) {
+      const title = this.controller.getSessionTitle(sessionId);
+      return {
+        ...active,
+        ...(title !== undefined && title.length > 0 ? { title } : {}),
+        options: { mode: this.controller.getSessionMode(sessionId) },
+      };
+    }
 
     const converter = new TurnConverter(this.browserRenderer, sessionId, ANTIGRAVITY_SCHEME, this.attachmentDir);
     const updateSubscription = this.backend.onDidChangeUpdate((event) => {

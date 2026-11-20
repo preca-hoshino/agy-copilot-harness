@@ -183,7 +183,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const lmProvider = new AgyLanguageModelProvider(backend, quotaService);
   const sessionController = new AgySessionController(backend, outputChannel);
   const attachmentDir = path.join(context.globalStorageUri.fsPath, 'attachments');
-  const contentProvider = new AgySessionContentProvider(backend, sessionController, browserRenderer, outputChannel, attachmentDir);
   const chatParticipant = new AgyChatParticipant(
     backend,
     sessionController,
@@ -197,6 +196,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     attachmentDir,
   );
 
+  const contentProvider = new AgySessionContentProvider(
+    backend,
+    sessionController,
+    browserRenderer,
+    outputChannel,
+    attachmentDir,
+    (sessionId) => chatParticipant.getActiveSession(sessionId),
+  );
   const participant = vscode.chat.createChatParticipant(ANTIGRAVITY_SCHEME, chatParticipant.createHandler());
 
   const runLogin = async (): Promise<void> => {

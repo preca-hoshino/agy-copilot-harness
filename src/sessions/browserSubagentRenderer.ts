@@ -524,7 +524,7 @@ export class BrowserSubagentRenderer {
   public handleLiveToolCall(
     update: AcpToolCallUpdatePayload,
     sessionId: string,
-    stream: vscode.ChatResponseStream,
+    stream: Pick<vscode.ChatResponseStream, 'push'>,
     onNeedsInput?: (reason: string) => void,
   ): void {
     let state = this.liveCalls.get(update.toolCallId);

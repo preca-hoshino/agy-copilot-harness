@@ -1,9 +1,10 @@
 import * as crypto from 'node:crypto';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import type { AcpContentBlock } from '../acp/acpTypes.js';
+import type { AcpContentBlock, AcpRequestPermissionParams } from '../acp/acpTypes.js';
 import type { AgyLanguageModelProvider } from '../models/agyLanguageModelProvider.js';
 import type { AcpBackendInterface, QuotaServiceInterface } from '../shared/contracts.js';
+import { ActiveAgyTurn } from './activeAgyTurn.js';
 import type { AgySessionController } from './agySessionController.js';
 import { extractSessionIdFromUri } from './agySessionController.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
@@ -54,6 +55,11 @@ const IMAGE_MIME_BY_EXT: Readonly<Record<string, string>> = {
 
 const MAX_TITLE_LENGTH = 60;
 
+export interface ActiveAgySession {
+  readonly history: vscode.ChatSession['history'];
+  readonly activeResponseCallback: NonNullable<vscode.ChatSession['activeResponseCallback']>;
+}
+
 export class AgyChatParticipant implements vscode.Disposable {
   private readonly backend: AcpBackendInterface;
   private readonly controller: AgySessionController;
@@ -65,6 +71,7 @@ export class AgyChatParticipant implements vscode.Disposable {
 
   private readonly syncedConfigs = new Map<string, SyncedSessionConfig>();
   private readonly activeDisposables = new Set<vscode.Disposable>();
+  private readonly activeTurns = new Map<string, ActiveAgyTurn>();
 
   public constructor(
     backend: AcpBackendInterface,
@@ -96,7 +103,16 @@ export class AgyChatParticipant implements vscode.Disposable {
     };
   }
 
+  public getActiveSession(sessionId: string): ActiveAgySession | undefined {
+    const turn = this.activeTurns.get(sessionId);
+    return turn === undefined ? undefined : { history: turn.history, activeResponseCallback: turn.attach };
+  }
+
   public dispose(): void {
+    for (const turn of this.activeTurns.values()) {
+      turn.finish();
+    }
+    this.activeTurns.clear();
     for (const disposable of this.activeDisposables) {
       disposable.dispose();
     }
@@ -120,6 +136,12 @@ export class AgyChatParticipant implements vscode.Disposable {
 
     let sessionId = this.controller.resolveSessionId(rawSessionId);
 
+    const existingTurnMessage = { errorDetails: { message: 'Antigravity is still running a request in this session.' } };
+    if (this.activeTurns.has(sessionId)) {
+      return existingTurnMessage;
+    }
+
+    let activeTurn: ActiveAgyTurn | undefined;
     try {
       const cwd = await this.controller.getSessionCwd(rawSessionId);
       if (!this.backend.isReady) {
@@ -169,18 +191,31 @@ export class AgyChatParticipant implements vscode.Disposable {
 
       const contentBlocks = await buildPromptBlocks(request, this.outputChannel);
 
+      if (this.activeTurns.has(sessionId)) {
+        return existingTurnMessage;
+      }
       if (isTokenCancelled(token)) {
         this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
         return {};
       }
 
+      const history = [...context.history, createRequestTurn(request)];
+      const turn = new ActiveAgyTurn(history, stream, () => {
+        void this.backend.cancel(sessionId).catch((cancelError: unknown) => {
+          this.outputChannel.appendLine(
+            `[AgyChatParticipant] Failed to cancel session ${sessionId}: ${formatError(cancelError)}`,
+          );
+        });
+      });
+      activeTurn = turn;
+      this.activeTurns.set(sessionId, turn);
       this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.InProgress);
 
       const turnState = { needsInput: false };
       const liveAdapter = new LiveStreamAdapter(
         this.browserRenderer,
         sessionId,
-        stream,
+        turn,
         (change: vscode.ChatSessionFileChange): void => {
           this.controller.recordFileChange(sessionId, change);
         },
@@ -208,60 +243,29 @@ export class AgyChatParticipant implements vscode.Disposable {
       });
 
       let pendingPermissions = 0;
-      const permissionSubscription = typeof stream.questionCarousel === 'function'
-        ? this.backend.registerPermissionPrompt?.(sessionId, async (permission) => {
-            const tool = permission.toolCall;
-            const fields = tool.rawInput ?? {};
-            const command = fields.CommandLine ?? fields.commandLine ?? fields.command ?? fields.cmd ?? fields.script;
-            const cwd = fields.Cwd ?? fields.cwd ?? fields.WorkingDirectory;
-            const isTerminal = tool.kind === 'execute' || /^(run_command|execute_command|bash|sh|pwsh|powershell|terminal)$/.test(tool.name ?? '');
-            const requestId = crypto.randomUUID();
-            const id = isTerminal && typeof command === 'string' && command.trim().length > 0
-              ? `agy-terminal:${JSON.stringify({
-                  requestId,
-                  command,
-                  cwd: typeof cwd === 'string' ? cwd : undefined,
-                  options: permission.options.map(({ optionId, kind }) => ({ optionId, kind })),
-                })}`
-              : requestId;
-            const message = new vscode.MarkdownString();
-            if (typeof command === 'string') {
-              message.appendCodeblock(command, 'shell');
-            } else {
-              message.appendText(tool.title ?? tool.name ?? tool.toolCallId);
-            }
-            if (typeof cwd === 'string') {
-              message.appendText(`\nWorking directory: ${cwd}`);
-            }
-            pendingPermissions++;
-            this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.NeedsInput);
-            try {
-              const answer = await stream.questionCarousel([{
-                id,
-                type: vscode.ChatQuestionType.SingleSelect,
-                title: 'Antigravity: Approve tool execution?',
-                message,
-                options: permission.options.map((option) => ({ id: option.optionId, label: option.name, value: option.optionId })),
-                defaultValue: permission.options.find((option) => option.kind === 'reject_once')?.optionId ?? '',
-              }], true);
-              const choice = answer?.[id];
-              return !isTokenCancelled(token) && typeof choice === 'string' ? choice : undefined;
-            } finally {
-              pendingPermissions--;
-              if (pendingPermissions === 0 && !turnState.needsInput && !isTokenCancelled(token) && this.backend.isReady) {
-                this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.InProgress);
-              }
-            }
-          })
-        : undefined;
+      const permissionSubscription = this.backend.registerPermissionPrompt?.(sessionId, async (permission) => {
+        pendingPermissions++;
+        this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.NeedsInput);
+        try {
+          return await askTurnPermission(turn, permission);
+        } catch (error: unknown) {
+          this.outputChannel.appendLine(`[AgyChatParticipant] Permission prompt failed: ${formatError(error)}`);
+          return undefined;
+        } finally {
+          pendingPermissions--;
+          if (
+            pendingPermissions === 0 &&
+            !turnState.needsInput &&
+            !isTokenCancelled(turn.stopToken) &&
+            this.backend.isReady
+          ) {
+            this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.InProgress);
+          }
+        }
+      });
 
       const cancelSubscription = token.onCancellationRequested(() => {
-        permissionSubscription?.dispose();
-        void this.backend.cancel(sessionId).catch((cancelError: unknown) => {
-          this.outputChannel.appendLine(
-            `[AgyChatParticipant] Failed to cancel session ${sessionId}: ${formatError(cancelError)}`,
-          );
-        });
+        turn.stopRequestStream(stream);
       });
 
       this.activeDisposables.add(updateSubscription);
@@ -272,7 +276,7 @@ export class AgyChatParticipant implements vscode.Disposable {
 
       try {
         const promptResult = await this.backend.prompt(sessionId, contentBlocks);
-        if (!turnState.needsInput) {
+        if (!turnState.needsInput || turn.stopToken.isCancellationRequested) {
           this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
         }
 
@@ -282,18 +286,21 @@ export class AgyChatParticipant implements vscode.Disposable {
         };
         return { metadata };
       } finally {
-        liveAdapter.flush();
-        updateSubscription.dispose();
-        cancelSubscription.dispose();
-        if (permissionSubscription !== undefined) {
-          permissionSubscription.dispose();
-          this.activeDisposables.delete(permissionSubscription);
+        try {
+          liveAdapter.flush();
+        } finally {
+          updateSubscription.dispose();
+          cancelSubscription.dispose();
+          if (permissionSubscription !== undefined) {
+            permissionSubscription.dispose();
+            this.activeDisposables.delete(permissionSubscription);
+          }
+          this.activeDisposables.delete(updateSubscription);
+          this.activeDisposables.delete(cancelSubscription);
         }
-        this.activeDisposables.delete(updateSubscription);
-        this.activeDisposables.delete(cancelSubscription);
       }
     } catch (error: unknown) {
-      if (isTokenCancelled(token) && !isAuthenticationRequiredError(error)) {
+      if ((activeTurn?.stopToken.isCancellationRequested ?? isTokenCancelled(token)) && !isAuthenticationRequiredError(error)) {
         this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
         return {};
       }
@@ -303,12 +310,13 @@ export class AgyChatParticipant implements vscode.Disposable {
       this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Failed);
 
       if (isAuthenticationRequiredError(error)) {
-        stream.push(
+        const response = activeTurn ?? stream;
+        response.push(
           new vscode.ChatResponseMarkdownPart(
             'Antigravity authentication is required. Please sign in with your Google account to continue.\n\n',
           ),
         );
-        stream.push(
+        response.push(
           new vscode.ChatResponseCommandButtonPart({
             title: 'Sign In with Google',
             command: 'antigravityHarness.signIn',
@@ -322,6 +330,12 @@ export class AgyChatParticipant implements vscode.Disposable {
         },
       };
     } finally {
+      if (activeTurn !== undefined) {
+        activeTurn.finish();
+        if (this.activeTurns.get(sessionId) === activeTurn) {
+          this.activeTurns.delete(sessionId);
+        }
+      }
       try {
         await this.quotaService.refresh(true);
       } catch (refreshError: unknown) {
@@ -367,6 +381,96 @@ export class AgyChatParticipant implements vscode.Disposable {
         this.controller.setSessionMode(sessionId, selectedId);
       }
     }
+  }
+}
+
+function createRequestTurn(request: vscode.ChatRequest): vscode.ChatRequestTurn {
+  const references = request.references.filter((reference) => reference.id !== 'vscode.customizations.index');
+  // Both API names refer to the same runtime constructor; the stable declaration has a private constructor.
+  const requestTurnConstructor = vscode.ChatRequestTurn2 as new (
+    ...args: ConstructorParameters<typeof vscode.ChatRequestTurn2>
+  ) => vscode.ChatRequestTurn;
+  return new requestTurnConstructor(
+    request.prompt,
+    request.command,
+    references,
+    'antigravity',
+    request.toolReferences,
+    undefined,
+    undefined,
+    getModelIdSafely(request.model),
+  );
+}
+
+async function askTurnPermission(turn: ActiveAgyTurn, permission: AcpRequestPermissionParams): Promise<string | undefined> {
+  const tool = permission.toolCall;
+  const fields = tool.rawInput ?? {};
+  const command = fields.CommandLine ?? fields.commandLine ?? fields.command ?? fields.cmd ?? fields.script;
+  const cwd = fields.Cwd ?? fields.cwd ?? fields.WorkingDirectory;
+  const isTerminal = tool.kind === 'execute' || /^(run_command|execute_command|bash|sh|pwsh|powershell|terminal)$/.test(tool.name ?? '');
+  const requestId = crypto.randomUUID();
+  const id = isTerminal && typeof command === 'string' && command.trim().length > 0
+    ? `agy-terminal:${JSON.stringify({
+        requestId,
+        command,
+        cwd: typeof cwd === 'string' ? cwd : undefined,
+        options: permission.options.map(({ optionId, kind }) => ({ optionId, kind })),
+      })}`
+    : requestId;
+  const title = tool.title ?? tool.name ?? tool.toolCallId;
+  const message = new vscode.MarkdownString();
+  if (typeof command === 'string') {
+    message.appendCodeblock(command, 'shell');
+  } else {
+    message.appendText(title);
+  }
+  if (typeof cwd === 'string') {
+    message.appendText(`\nWorking directory: ${cwd}`);
+  }
+
+  const stream = turn.permissionStream;
+  if (typeof stream?.questionCarousel === 'function') {
+    const answers = await Promise.race([
+      askInChat(stream, [{
+        id,
+        type: vscode.ChatQuestionType.SingleSelect,
+        title: 'Antigravity: Approve tool execution?',
+        message,
+        options: permission.options.map((option) => ({ id: option.optionId, label: option.name, value: option.optionId })),
+        defaultValue: permission.options.find((option) => option.kind === 'reject_once')?.optionId ?? '',
+      }]),
+      turn.onViewSwitched.then(() => undefined),
+    ]);
+    if (answers !== undefined && turn.permissionStream === stream) {
+      const choice = answers[id];
+      return typeof choice === 'string' ? choice : undefined;
+    }
+  }
+
+  if (turn.stopToken.isCancellationRequested) {
+    return undefined;
+  }
+  // Restored chat streams cannot answer the original request's carousel; require a fresh, explicit choice.
+  const picked = await vscode.window.showQuickPick(permission.options.map((option) => ({
+    label: option.name,
+    description: option.kind,
+    detail: typeof command === 'string' ? command : title,
+    optionId: option.optionId,
+  })), {
+    placeHolder: `Antigravity permission request: ${title}`,
+    ignoreFocusOut: true,
+  }, turn.stopToken);
+  return isTokenCancelled(turn.stopToken) ? undefined : picked?.optionId;
+}
+
+async function askInChat(
+  stream: vscode.ChatResponseStream,
+  questions: vscode.ChatQuestion[],
+): Promise<Record<string, unknown> | undefined> {
+  try {
+    return (await stream.questionCarousel(questions, true)) ?? {};
+  } catch {
+    return undefined;
   }
 }
 
