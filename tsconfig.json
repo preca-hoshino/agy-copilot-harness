@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "lib": ["ESNext"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": true,
+    "noPropertyAccessFromIndexSignature": false,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": false,
+    "isolatedDeclarations": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+    "incremental": true,
+    "tsBuildInfoFile": "./dist/.tsbuildinfo",
+
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*", "vscode.proposed.d.ts"],
+  "exclude": ["node_modules", "dist", "build", "coverage", ".git"]
+}
