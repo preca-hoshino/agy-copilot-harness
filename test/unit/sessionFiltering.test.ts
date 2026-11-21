@@ -201,6 +201,9 @@ vi.mock('vscode', () => {
     CancellationTokenSource: MockCancellationTokenSource,
     ChatSessionStatus,
     ChatRequestTurn2: MockChatRequestTurn,
+    ChatResponseTurn2: class {
+      public constructor(public readonly response: unknown[], public readonly result: unknown, public readonly participant: string) {}
+    },
     ChatResponseMarkdownPart: class {
       public constructor(public readonly value: unknown) {}
     },
@@ -317,6 +320,7 @@ function createFakeBackend(sessions: AcpSessionSummary[]): {
       return undefined;
     },
     prompt: async () => ({ stopReason: 'end_turn' }),
+    waitForConversationFullyIdle: async () => {},
     cancel: async () => {},
     getLastKnownConfigOptions: () => [],
   };
@@ -492,7 +496,7 @@ describe('AgySessionController inputState & workspace filtering', () => {
       await expect(controller.getSessionCwd(untitledId)).resolves.toBe(project);
       const inputState = controller.controller.createChatSessionInputState([]);
       await provider.provideChatSessionContent(resource, cts.token, { inputState });
-      expect(loadSession).toHaveBeenCalledWith('real-sess', project);
+      expect(loadSession).toHaveBeenCalledWith('real-sess', project, cts.token);
     } finally {
       cts.dispose();
       provider.dispose();
@@ -685,6 +689,275 @@ describe('AgySessionController inputState & workspace filtering', () => {
     contentProvider.dispose();
     controller.dispose();
     disposeBackend();
+  });
+
+  it('drains replay updates after the response and isolates concurrent loads of one session', async () => {
+    const { backend, disposeBackend } = createFakeBackend([{ sessionId: 'replay', cwd: '', title: 'Replay' }]);
+    const updates = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
+    Object.assign(backend, { onDidChangeUpdate: updates.event });
+    const firstResponse = Promise.withResolvers<{ sessionId: string }>();
+    const load = vi.spyOn(backend, 'loadSession').mockReturnValueOnce(firstResponse.promise)
+      .mockResolvedValueOnce({ sessionId: 'replay' });
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    const provider = new AgySessionContentProvider(backend, controller, {} as BrowserSubagentRenderer, createFakeOutputChannel());
+    const source = new vscode.CancellationTokenSource();
+    const resource = buildSessionResource('replay');
+    const context = { inputState: undefined } as unknown as vscode.ChatSessionContentContext;
+    const emit = (text: string): void => updates.fire({ sessionId: 'replay', update: {
+      sessionUpdate: 'user_message_chunk', content: { type: 'text', text },
+    } });
+    try {
+      const first = provider.provideChatSessionContent(resource, source.token, context);
+      await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(1));
+      const second = provider.provideChatSessionContent(resource, source.token, context);
+      firstResponse.resolve({ sessionId: 'replay' });
+      await Promise.resolve();
+      emit('first tail');
+      const firstResult = await first;
+      expect(firstResult.history).toMatchObject([{ prompt: 'first tail' }]);
+      await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+      emit('second tail');
+      const secondResult = await second;
+      expect(secondResult.history).toMatchObject([{ prompt: 'second tail' }]);
+    } finally {
+      firstResponse.resolve({ sessionId: 'replay' });
+      source.dispose();
+      provider.dispose();
+      controller.dispose();
+      updates.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('does not let a cancelled in-flight replay contaminate a reopened session', async () => {
+    const { backend, disposeBackend } = createFakeBackend([{ sessionId: 'cancel-replay', cwd: '', title: 'Replay' }]);
+    const updates = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
+    Object.assign(backend, { onDidChangeUpdate: updates.event });
+    const firstResponse = Promise.withResolvers<{ sessionId: string }>();
+    const load = vi.spyOn(backend, 'loadSession').mockReturnValueOnce(firstResponse.promise)
+      .mockResolvedValueOnce({ sessionId: 'cancel-replay' });
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    const provider = new AgySessionContentProvider(backend, controller, {} as BrowserSubagentRenderer, createFakeOutputChannel());
+    const firstToken = new vscode.CancellationTokenSource();
+    const secondToken = new vscode.CancellationTokenSource();
+    const resource = buildSessionResource('cancel-replay');
+    const context = { inputState: undefined } as unknown as vscode.ChatSessionContentContext;
+    const emit = (text: string): void => updates.fire({ sessionId: 'cancel-replay', update: {
+      sessionUpdate: 'user_message_chunk', content: { type: 'text', text },
+    } });
+    try {
+      const first = provider.provideChatSessionContent(resource, firstToken.token, context);
+      await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(1));
+      firstToken.cancel();
+      await expect(first).rejects.toThrow('Canceled');
+      const second = provider.provideChatSessionContent(resource, secondToken.token, context);
+      firstResponse.resolve({ sessionId: 'cancel-replay' });
+      await Promise.resolve();
+      emit('old tail');
+      expect(load).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(load).toHaveBeenCalledTimes(2));
+      emit('new replay');
+      expect((await second).history).toMatchObject([{ prompt: 'new replay' }]);
+    } finally {
+      firstResponse.resolve({ sessionId: 'cancel-replay' });
+      firstToken.dispose();
+      secondToken.dispose();
+      provider.dispose();
+      controller.dispose();
+      updates.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('keeps late updates from a failed load out of the next replay', async () => {
+    const sessionId = 'failed-replay';
+    const { backend, disposeBackend } = createFakeBackend([{ sessionId, cwd: '', title: 'Replay' }]);
+    const updates = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
+    Object.assign(backend, { onDidChangeUpdate: updates.event });
+    const firstResponse = Promise.withResolvers<{ sessionId: string }>();
+    const load = vi.spyOn(backend, 'loadSession').mockReturnValueOnce(firstResponse.promise)
+      .mockResolvedValueOnce({ sessionId });
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const provider = new AgySessionContentProvider(backend, controller, {} as BrowserSubagentRenderer, createFakeOutputChannel());
+    const source = new vscode.CancellationTokenSource();
+    const resource = buildSessionResource(sessionId);
+    const context = { inputState: undefined } as unknown as vscode.ChatSessionContentContext;
+    const emit = (text: string): void => updates.fire({ sessionId, update: {
+      sessionUpdate: 'user_message_chunk', content: { type: 'text', text },
+    } });
+    vi.useFakeTimers();
+    try {
+      const failed = expect(provider.provideChatSessionContent(resource, source.token, context)).rejects.toThrow('RPC failed');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(load).toHaveBeenCalledOnce();
+      const retried = provider.provideChatSessionContent(resource, source.token, context);
+      firstResponse.reject(new Error('RPC failed'));
+      await vi.advanceTimersByTimeAsync(200);
+      emit('failed replay tail');
+      await vi.advanceTimersByTimeAsync(200);
+      expect(load).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(50);
+      await failed;
+      expect(load).toHaveBeenCalledTimes(2);
+      emit('retried replay');
+      await vi.advanceTimersByTimeAsync(250);
+      expect((await retried).history).toMatchObject([{ prompt: 'retried replay' }]);
+    } finally {
+      firstResponse.resolve({ sessionId });
+      source.cancel();
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+      source.dispose();
+      provider.dispose();
+      controller.dispose();
+      updates.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('rejects a replay that never becomes quiet instead of returning partial history', async () => {
+    const { backend, disposeBackend } = createFakeBackend([{ sessionId: 'noisy', cwd: '', title: 'Replay' }]);
+    const updates = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
+    Object.assign(backend, { onDidChangeUpdate: updates.event });
+    const load = vi.spyOn(backend, 'loadSession');
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const provider = new AgySessionContentProvider(backend, controller, {} as BrowserSubagentRenderer, createFakeOutputChannel());
+    const source = new vscode.CancellationTokenSource();
+    vi.useFakeTimers();
+    try {
+      const pending = provider.provideChatSessionContent(buildSessionResource('noisy'), source.token,
+        { inputState: undefined } as unknown as vscode.ChatSessionContentContext);
+      const rejection = expect(pending).rejects.toThrow(/history may be incomplete/);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(load).toHaveBeenCalledOnce();
+      for (let elapsed = 0; elapsed < 10_000; elapsed += 200) {
+        updates.fire({ sessionId: 'noisy', update: { sessionUpdate: 'usage_update', used: 1, size: 2 } });
+        await vi.advanceTimersByTimeAsync(200);
+      }
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+      source.dispose();
+      provider.dispose();
+      controller.dispose();
+      updates.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('continues streaming after prompt response while background work is not idle', async () => {
+    const { backend, disposeBackend } = createFakeBackend([{ sessionId: 'background', cwd: '', title: 'Background' }]);
+    const idle = Promise.withResolvers<void>();
+    const waitForIdle = vi.spyOn(backend, 'waitForConversationFullyIdle').mockReturnValue(idle.promise);
+    const updates = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
+    Object.assign(backend, { onDidChangeUpdate: updates.event });
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    const participant = new AgyChatParticipant(backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn() } as unknown as BrowserSubagentRenderer, createFakeOutputChannel());
+    const source = new vscode.CancellationTokenSource();
+    const stream = { push: vi.fn() } as unknown as vscode.ChatResponseStream;
+    const resource = buildSessionResource('background');
+    try {
+      const running = participant.createHandler()(
+        { prompt: 'Start', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Background' }, isUntitled: false } },
+        stream, source.token,
+      );
+      await vi.waitFor(() => expect(waitForIdle).toHaveBeenCalledTimes(1));
+      expect(participant.getActiveSession('background')).toBeDefined();
+      updates.fire({ sessionId: 'background', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'after prompt' } } });
+      idle.resolve();
+      await Promise.resolve();
+      updates.fire({ sessionId: 'background', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'after idle' } } });
+      await running;
+      expect(stream.push).toHaveBeenCalledTimes(2);
+      expect(participant.getActiveSession('background')).toBeUndefined();
+    } finally {
+      idle.resolve();
+      source.dispose();
+      participant.dispose();
+      controller.dispose();
+      updates.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('fails a turn if the backend disconnects during the final drain even when it reconnects', async () => {
+    const sessionId = 'drain-disconnect';
+    const { backend, disposeBackend } = createFakeBackend([{ sessionId, cwd: '', title: 'Background' }]);
+    const states = new vscode.EventEmitter<{ ready: boolean }>();
+    const updates = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
+    Object.assign(backend, { onDidChangeBackendState: states.event, onDidChangeUpdate: updates.event });
+    const waitForIdle = vi.spyOn(backend, 'waitForConversationFullyIdle');
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn() } as unknown as BrowserSubagentRenderer, createFakeOutputChannel());
+    const source = new vscode.CancellationTokenSource();
+    const push = vi.fn();
+    const resource = buildSessionResource(sessionId);
+    vi.useFakeTimers();
+    try {
+      const running = participant.createHandler()(
+        { prompt: 'Start', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Background' }, isUntitled: false } },
+        { push } as unknown as vscode.ChatResponseStream, source.token,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(waitForIdle).toHaveBeenCalledOnce();
+      states.fire({ ready: false });
+      states.fire({ ready: true });
+      updates.fire({ sessionId, update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'wrong stream' } } });
+      const result = await running;
+      expect(result?.errorDetails?.message).toContain('backend disconnected');
+      expect(push).not.toHaveBeenCalled();
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.Failed);
+      expect(participant.getActiveSession(sessionId)).toBeUndefined();
+    } finally {
+      source.cancel();
+      await vi.runOnlyPendingTimersAsync();
+      vi.useRealTimers();
+      source.dispose();
+      participant.dispose();
+      controller.dispose();
+      updates.dispose();
+      states.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('reports a failure instead of completing when backend idle cannot be confirmed', async () => {
+    const { backend, disposeBackend } = createFakeBackend([{ sessionId: 'idle-error', cwd: '', title: 'Background' }]);
+    vi.spyOn(backend, 'waitForConversationFullyIdle').mockRejectedValue(new Error('HTTP 503'));
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn() } as unknown as BrowserSubagentRenderer, createFakeOutputChannel());
+    const source = new vscode.CancellationTokenSource();
+    const resource = buildSessionResource('idle-error');
+    try {
+      const result = await participant.createHandler()(
+        { prompt: 'Start', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Background' }, isUntitled: false } },
+        { push: vi.fn() } as unknown as vscode.ChatResponseStream, source.token,
+      );
+      expect(result?.errorDetails?.message).toContain('HTTP 503');
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.Failed);
+      expect(participant.getActiveSession('idle-error')).toBeUndefined();
+    } finally {
+      source.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
   });
 
   it('skips redundant controller.items.replace when background watcher refreshes identical sessions', async () => {

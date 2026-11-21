@@ -209,6 +209,34 @@ describe('JsonRpcTransport', () => {
     transport.dispose();
   });
 
+  it.each(['error', 'close'] as const)('rejects an in-flight request on a writable stream %s', async (event) => {
+    const { clientReadable, clientWritable, serverWrite } = createDuplexStreams();
+    const onClose = vi.fn();
+    const onError = vi.fn();
+    const onNotification = vi.fn();
+    const transport = new JsonRpcTransport(clientReadable, clientWritable, { onClose, onError, onNotification });
+    const outcome = transport.sendRequest('session/prompt', {}, 0).catch((error: unknown) => error);
+
+    try {
+      if (event === 'error') {
+        const failure = new Error('ACP pipe failed');
+        clientWritable.emit('error', failure);
+        expect(onError).toHaveBeenCalledWith(failure);
+      } else {
+        clientWritable.emit('close');
+      }
+      expect(onClose).toHaveBeenCalledOnce();
+      await expect(outcome).resolves.toMatchObject({ message: 'JSON-RPC stream closed' });
+      serverWrite('{"jsonrpc":"2.0","method":"session/update"}\n');
+      clientReadable.emit('close');
+      expect(onNotification).not.toHaveBeenCalled();
+      expect(onClose).toHaveBeenCalledOnce();
+      await expect(transport.sendRequest('session/load')).rejects.toThrow(/closed/);
+    } finally {
+      transport.dispose();
+    }
+  });
+
   it('rejects all pending requests cleanly on dispose and blocks new requests', async () => {
     const { clientReadable, clientWritable } = createDuplexStreams();
     const transport = new JsonRpcTransport(clientReadable, clientWritable, { requestTimeoutMs: 10_000 });

@@ -6,7 +6,7 @@ import * as fsPromises from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import type { AcpBackendInterface, PermissionPrompt } from '../shared/contracts.js';
+import type { AcpBackendInterface, FileWriteHandler, PermissionPrompt } from '../shared/contracts.js';
 import type {
   AcpConfigOption,
   AcpContentBlock,
@@ -24,6 +24,8 @@ const RECONNECT_BACKOFF_DELAYS_MS: readonly number[] = [1000, 2000, 5000];
 const LOG_POLL_INTERVAL_MS = 150;
 const UPTIME_RESET_MS = 5000;
 const HTTP_PORT_LOG_REGEX = /Language server listening on random port at (\d+) for HTTP(?:\s|$)/;
+const IDLE_WAIT_TIMEOUT_MS = 10 * 60_000;
+const IDLE_PORT_TIMEOUT_MS = 10_000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -131,6 +133,8 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
   private disposed = false;
   private spawnCounter = 0;
   private stderrBuffer = '';
+  private readonly promptOwners = new Map<string, ChildProcessWithoutNullStreams>();
+  private readonly idleWaits = new Set<AbortController>();
 
   public constructor(storagePath: string, outputChannel: vscode.OutputChannel) {
     this.storagePath = storagePath;
@@ -153,6 +157,10 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
 
   public registerPermissionPrompt(sessionId: string, prompt: PermissionPrompt): vscode.Disposable {
     return this.capabilitiesHandler.registerPermissionPrompt(sessionId, prompt);
+  }
+
+  public registerFileWriteHandler(sessionId: string, handler: FileWriteHandler): vscode.Disposable {
+    return this.capabilitiesHandler.registerFileWriteHandler(sessionId, handler);
   }
 
   public getLastKnownConfigOptions(): AcpConfigOption[] {
@@ -206,10 +214,17 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
     });
   }
 
-  public async loadSession(sessionId: string, cwd: string): Promise<AcpSessionLoadResult> {
+  public async loadSession(sessionId: string, cwd: string, token?: vscode.CancellationToken): Promise<AcpSessionLoadResult> {
     await this.ensureStarted();
+    const owner = this.process;
     return await this.runSerializedBootOp(async () => {
       const result = await this.retryOnBootAuth(async () => {
+        if (token?.isCancellationRequested) {
+          throw new vscode.CancellationError();
+        }
+        if (owner === undefined || owner !== this.process || !this._isReady) {
+          throw new Error('ACP backend disconnected or restarted before session load was sent.');
+        }
         return await this.requireTransport().sendRequest<AcpSessionLoadResult>('session/load', {
           sessionId,
           cwd,
@@ -281,10 +296,18 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
     return updatedOptions;
   }
 
-  public async prompt(sessionId: string, content: AcpContentBlock[]): Promise<AcpSessionPromptResult> {
+  public async prompt(sessionId: string, content: AcpContentBlock[], token?: vscode.CancellationToken): Promise<AcpSessionPromptResult> {
     await this.ensureStarted();
+    const owner = this.process;
     return await this.runSerializedBootOp(async () => {
-      return await this.requireTransport().sendRequest<AcpSessionPromptResult>(
+      this.promptOwners.delete(sessionId);
+      if (token?.isCancellationRequested) {
+        throw new Error('Prompt cancelled before it was sent.');
+      }
+      if (owner === undefined || owner !== this.process || !this._isReady) {
+        throw new Error('ACP backend disconnected or restarted before prompt was sent.');
+      }
+      const result = await this.requireTransport().sendRequest<AcpSessionPromptResult>(
         'session/prompt',
         {
           sessionId,
@@ -292,7 +315,73 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
         },
         0,
       );
+      if (result.stopReason !== 'cancelled' && !token?.isCancellationRequested) {
+        this.promptOwners.set(sessionId, owner);
+      }
+      return result;
     });
+  }
+
+  public async waitForConversationFullyIdle(sessionId: string, token: vscode.CancellationToken): Promise<void> {
+    const owner = this.promptOwners.get(sessionId);
+    this.promptOwners.delete(sessionId);
+    if (owner === undefined || owner !== this.process || !this._isReady || this.disposed) {
+      throw new Error('Cannot confirm conversation is idle: the prompt backend disconnected or restarted.');
+    }
+
+    const controller = new AbortController();
+    this.idleWaits.add(controller);
+    const cancellation = token.onCancellationRequested(() => {
+      controller.abort(new Error('Idle wait cancelled; background activity may still be running.'));
+    });
+    const timeout = setTimeout(() => {
+      controller.abort(new Error('Timed out waiting for conversation to become fully idle.'));
+    }, IDLE_WAIT_TIMEOUT_MS);
+    const portDeadline = Date.now() + IDLE_PORT_TIMEOUT_MS;
+    try {
+      if (token.isCancellationRequested) {
+        controller.abort(new Error('Idle wait cancelled; background activity may still be running.'));
+      }
+      while (this._internalHttpPort === undefined) {
+        if (controller.signal.aborted) {
+          throw controller.signal.reason;
+        }
+        if (Date.now() >= portDeadline) {
+          throw new Error('Cannot confirm conversation is idle: local HTTP port was not detected.');
+        }
+        await new Promise<void>((resolve, reject) => {
+          const onAbort = (): void => { clearTimeout(timer); reject(new Error(toErrorMessage(controller.signal.reason))); };
+          const timer = setTimeout(() => { controller.signal.removeEventListener('abort', onAbort); resolve(); }, LOG_POLL_INTERVAL_MS);
+          controller.signal.addEventListener('abort', onAbort, { once: true });
+        });
+      }
+      const response = await fetch(
+        `http://127.0.0.1:${this._internalHttpPort}/exa.language_server_pb.LanguageServerService/WaitForConversationFullyIdle`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1', 'x-codeium-csrf-token': this.csrfToken },
+          body: JSON.stringify({ conversationId: sessionId }),
+          signal: controller.signal,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`WaitForConversationFullyIdle returned HTTP ${response.status}.`);
+      }
+      const payload: unknown = await response.json();
+      if (!isRecord(payload) || Object.keys(payload).length !== 0) {
+        throw new Error('WaitForConversationFullyIdle returned an unexpected response.');
+      }
+      if (controller.signal.aborted) {
+        throw controller.signal.reason;
+      }
+    } catch (error: unknown) {
+      const reason: unknown = controller.signal.aborted ? controller.signal.reason : error;
+      throw new Error(`Cannot confirm conversation is fully idle: ${toErrorMessage(reason)}`);
+    } finally {
+      clearTimeout(timeout);
+      cancellation.dispose();
+      this.idleWaits.delete(controller);
+    }
   }
 
   public async cancel(sessionId: string): Promise<void> {
@@ -362,7 +451,7 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
 
     const args = ['acp', '--app-data-dir', appDataDir, '--log-file', logPath];
     const mainAgent = config.get<string>('mainAgent')?.trim();
-    if (mainAgent) {
+    if (mainAgent !== undefined && mainAgent.length > 0) {
       args.push('--agent', mainAgent);
     }
     this.outputChannel.appendLine(`[ACP Backend] Spawning "${cliPath}" ${args.join(' ')}`);
@@ -408,6 +497,9 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
       },
       onError: (err: Error): void => {
         this.outputChannel.appendLine(`[ACP Transport] ${err.message}`);
+      },
+      onClose: (): void => {
+        this.handleProcessExit(child, null, null);
       },
     });
     this.transport = transport;
@@ -744,6 +836,7 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
   private async stopCurrentProcess(): Promise<void> {
     this.clearUptimeResetTimer();
     this.stopLogMonitor();
+    this.abortIdleWaits();
 
     const activeProcess = this.process;
     const activeTransport = this.transport;
@@ -755,6 +848,7 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
     this.bootAuthCompleted = false;
 
     activeTransport?.dispose();
+    this.backendStateEmitter.fire({ ready: false });
 
     if (activeProcess === undefined || activeProcess.exitCode !== null || activeProcess.killed) {
       return;
@@ -789,6 +883,7 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
   }
 
   private teardownActiveInstances(): void {
+    this.abortIdleWaits();
     const activeTransport = this.transport;
     const activeProcess = this.process;
     this.transport = undefined;
@@ -815,6 +910,13 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
         this.consecutiveUnexpectedExits = 0;
       }
     }, UPTIME_RESET_MS);
+  }
+
+  private abortIdleWaits(): void {
+    for (const controller of this.idleWaits) {
+      controller.abort(new Error('ACP backend disconnected or restarted.'));
+    }
+    this.promptOwners.clear();
   }
 
   private clearUptimeResetTimer(): void {

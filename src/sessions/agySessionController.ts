@@ -469,6 +469,7 @@ export class AgySessionController implements vscode.Disposable {
       if (entry.modifiedUri.toString() === targetKey) {
         const originalUri = entry.originalUri ?? change.originalUri;
         updatedList.push({
+          uri: change.uri,
           modifiedUri: change.modifiedUri,
           ...(originalUri !== undefined ? { originalUri } : {}),
           insertions: entry.insertions + change.insertions,
@@ -678,7 +679,7 @@ export class AgySessionController implements vscode.Disposable {
 
   private buildModeGroup(selectedModeId: string): vscode.ChatSessionProviderOptionGroup {
     const mode = this.backend.getLastKnownConfigOptions().find((option) => option.id === 'mode');
-    const choices = mode?.options.length ? mode.options.map((choice) => {
+    const choices = mode !== undefined && mode.options.length > 0 ? mode.options.map((choice) => {
       const known = MODE_OPTIONS.find((option) => option.id === choice.value);
       return { id: choice.value, name: choice.name, description: choice.description ?? known?.description, icon: known?.icon ?? 'settings-sliders' };
     }) : MODE_OPTIONS;

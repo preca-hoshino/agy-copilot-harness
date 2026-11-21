@@ -75,8 +75,13 @@ export class JsonRpcTransport {
     this.handleStreamClose();
   };
 
+  private readonly onWriteCloseListener = (): void => {
+    this.handleStreamClose();
+  };
+
   private readonly onErrorListener = (err: unknown): void => {
     this.options.onError?.(toError(err));
+    this.handleStreamClose();
   };
 
   public constructor(
@@ -94,6 +99,7 @@ export class JsonRpcTransport {
     this.readable.on('close', this.onCloseListener);
     this.readable.on('error', this.onErrorListener);
     if (!Object.is(this.writable, this.readable)) {
+      this.writable.on('close', this.onWriteCloseListener);
       this.writable.on('error', this.onErrorListener);
     }
   }
@@ -165,12 +171,13 @@ export class JsonRpcTransport {
     this.readable.removeListener('close', this.onCloseListener);
     this.readable.removeListener('error', this.onErrorListener);
     if (!Object.is(this.writable, this.readable)) {
+      this.writable.removeListener('close', this.onWriteCloseListener);
       this.writable.removeListener('error', this.onErrorListener);
     }
   }
 
   private handleData(chunk: Buffer | string): void {
-    if (this.disposed) {
+    if (this.disposed || this.closed) {
       return;
     }
     const text = typeof chunk === 'string' ? chunk : this.decoder.write(chunk);
@@ -179,7 +186,7 @@ export class JsonRpcTransport {
   }
 
   private flushRemainingBuffer(): void {
-    if (this.disposed) {
+    if (this.disposed || this.closed) {
       return;
     }
     const trailing = this.decoder.end();

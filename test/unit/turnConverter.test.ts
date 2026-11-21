@@ -198,6 +198,17 @@ vi.mock('vscode', () => {
     ChatResponseTurn2: MockChatResponseTurn2,
     ChatResponseMarkdownPart: MockChatResponseMarkdownPart,
     ChatResponseWarningPart: MockChatResponseWarningPart,
+    ChatResponseCodeblockUriPart: class {
+      public constructor(public readonly value: vscode.Uri, public readonly isEdit?: boolean, public readonly undoStopId?: string) {}
+    },
+    ChatResponseTextEditPart: class {
+      public readonly edits: vscode.TextEdit[];
+      public readonly isDone: boolean;
+      public constructor(public readonly uri: vscode.Uri, edits: vscode.TextEdit | vscode.TextEdit[] | true) {
+        this.isDone = edits === true;
+        this.edits = edits === true ? [] : Array.isArray(edits) ? edits : [edits];
+      }
+    },
     ChatResponseAnchorPart: class {
       public constructor(public readonly value: vscode.Uri, public readonly title?: string) {}
     },
@@ -216,6 +227,7 @@ vi.mock('vscode', () => {
 });
 
 import * as vscode from 'vscode';
+import type { AcpSessionUpdate } from '../../src/acp/acpTypes.js';
 import { BrowserSubagentRenderer, openMediaPreviewPanel } from '../../src/sessions/browserSubagentRenderer.js';
 import { LiveStreamAdapter, TurnConverter } from '../../src/sessions/turnConverter.js';
 
@@ -236,6 +248,30 @@ describe('TurnConverter', () => {
         await fs.rm(dir, { recursive: true, force: true });
       }
     }
+  });
+
+  it.skipIf(process.env.AGY_REPLAY_SAMPLE === undefined)('replays a real session sample without losing response turns', async () => {
+    const samplePath = process.env.AGY_REPLAY_SAMPLE;
+    if (samplePath === undefined) throw new Error('AGY_REPLAY_SAMPLE is required');
+    const updates = JSON.parse(await fs.readFile(samplePath, 'utf8')) as AcpSessionUpdate[];
+    const renderer = new BrowserSubagentRenderer(nodePath.join(os.tmpdir(), 'non-existent-brain'));
+    const converter = new TurnConverter(renderer, 'sample-replay');
+    for (const update of updates) converter.processUpdate(update);
+    const result = converter.finalizeHistory();
+    const requests = result.turns.filter((turn): turn is vscode.ChatRequestTurn2 => turn instanceof vscode.ChatRequestTurn2);
+    const responseCount = result.turns.filter((turn) => turn instanceof vscode.ChatResponseTurn2).length;
+    const userChunks = updates.filter((update) => update.sessionUpdate === 'user_message_chunk');
+    const inputLength = userChunks.reduce((sum, update) => {
+      const content = 'content' in update ? update.content : undefined;
+      return sum + (typeof content === 'object' && content !== null && 'text' in content && typeof content.text === 'string'
+        ? content.text.length : 0);
+    }, 0);
+    expect(updates).toHaveLength(993);
+    expect(userChunks).toHaveLength(23);
+    expect(requests).toHaveLength(22);
+    expect(requests.reduce((sum, request) => sum + request.prompt.length, 0)).toBe(inputLength);
+    expect(responseCount).toBeGreaterThan(0);
+    expect(result.turns.at(-1)).toBeInstanceOf(vscode.ChatResponseTurn2);
   });
 
   it('keeps replayed attachments outside the prompt and preserves assistant attachment order', async () => {
@@ -415,7 +451,7 @@ describe('TurnConverter', () => {
     if (responseTurn instanceof vscode.ChatResponseTurn2) {
       expect(responseTurn.participant).toBe('antigravity');
       const parts = responseTurn.response;
-      expect(parts).toHaveLength(6);
+      expect(parts).toHaveLength(11);
 
       const thoughtPart = parts[0];
       expect(thoughtPart).toBeInstanceOf(vscode.ChatResponseThinkingProgressPart);
@@ -464,11 +500,17 @@ describe('TurnConverter', () => {
       expect(writePart).toBeInstanceOf(vscode.ChatToolInvocationPart);
       if (writePart instanceof vscode.ChatToolInvocationPart) {
         expect(writePart.isComplete).toBe(true);
+        expect(writePart.presentation).toBe('hidden');
         expect(writePart.invocationMessage).toBeInstanceOf(vscode.MarkdownString);
         expect((writePart.invocationMessage as vscode.MarkdownString).value).toContain('Write [app.ts (+2 -1)]');
       }
 
-      const mdPart = parts[5];
+      expect(parts[5]).toMatchObject({ value: { value: '\n````\n' } });
+      expect(parts[6]).toMatchObject({ isEdit: true, value: { fsPath: 'D:\\repo\\src\\app.ts' } });
+      expect(parts[7]).toMatchObject({ edits: [], isDone: false });
+      expect(parts[8]).toMatchObject({ edits: [], isDone: true });
+      expect(parts[9]).toMatchObject({ value: { value: '\n````\n' } });
+      const mdPart = parts[10];
       expect(mdPart).toBeInstanceOf(vscode.ChatResponseMarkdownPart);
       if (mdPart instanceof vscode.ChatResponseMarkdownPart) {
         expect(mdPart.value.value).toBe('All done!');
@@ -479,6 +521,39 @@ describe('TurnConverter', () => {
     expect(history.changes[0]?.insertions).toBe(2);
     expect(history.changes[0]?.deletions).toBe(1);
     expect(history.changes[0]?.modifiedUri.fsPath).toContain('app.ts');
+    expect(history.changes[0]?.uri.toString()).toBe(history.changes[0]?.modifiedUri.toString());
+  });
+
+  it('creates one native history edit pill per file and preserves an existing empty original', () => {
+    const renderer = new BrowserSubagentRenderer(nodePath.join(os.tmpdir(), 'non-existent-brain'));
+    const converter = new TurnConverter(renderer, 'multi-edit');
+    converter.processUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Edit files' } });
+    converter.processUpdate({ sessionUpdate: 'tool_call', toolCallId: 'multi', name: 'edit_file', kind: 'edit',
+      status: 'completed', content: [
+        { type: 'diff', path: 'D:\\repo\\empty.txt', oldText: '', newText: 'new' },
+        { type: 'diff', path: 'D:\\repo\\created.txt', newText: 'created' },
+      ] });
+    const result = converter.finalizeHistory();
+    const response = result.turns[1] as vscode.ChatResponseTurn2;
+    expect(response.response).toHaveLength(11);
+    expect(response.response[0]).toMatchObject({ presentation: 'hidden' });
+    expect(response.response[2]).toMatchObject({ isEdit: true, value: { fsPath: 'D:\\repo\\empty.txt' } });
+    expect(response.response[7]).toMatchObject({ isEdit: true, value: { fsPath: 'D:\\repo\\created.txt' } });
+    expect(result.changes[0]?.originalUri?.toString()).toBe(result.changes[0]?.uri.toString());
+    expect(result.changes[1]?.originalUri).toBeUndefined();
+  });
+
+  it('keeps failed edit tools visible and does not report them as file changes', () => {
+    const renderer = new BrowserSubagentRenderer(nodePath.join(os.tmpdir(), 'non-existent-brain'));
+    const converter = new TurnConverter(renderer, 'failed-edit');
+    converter.processUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Edit' } });
+    converter.processUpdate({ sessionUpdate: 'tool_call', toolCallId: 'failed', name: 'write_file', kind: 'edit',
+      status: 'failed', args: { Path: 'D:\\repo\\failed.txt', Content: 'not written' } });
+    const result = converter.finalizeHistory();
+    const response = result.turns[1] as vscode.ChatResponseTurn2;
+    expect(response.response).toHaveLength(1);
+    expect(response.response[0]).toMatchObject({ isError: true, presentation: undefined });
+    expect(result.changes).toEqual([]);
   });
 
   it('streams terminal progress and failure output without a duplicate command description', () => {
@@ -661,6 +736,7 @@ describe('TurnConverter', () => {
       progress: vi.fn(),
       reference: vi.fn(),
       questionCarousel: vi.fn(async () => undefined),
+      externalEdit: vi.fn(async (_uri, callback) => { await callback(); return 'undo'; }),
       push: (part: vscode.ChatResponsePart) => {
         pushedParts.push(part);
       },

@@ -6,7 +6,11 @@ import type { ActiveAgySession } from './agyChatParticipant.js';
 import type { AgySessionController } from './agySessionController.js';
 import { extractSessionIdFromUri } from './agySessionController.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
+import { acquireSessionOperation } from './sessionOperationCoordinator.js';
 import { TurnConverter } from './turnConverter.js';
+
+const REPLAY_QUIET_MS = 250;
+const REPLAY_MAX_DRAIN_MS = 10_000;
 
 export class AgySessionContentProvider implements vscode.ChatSessionContentProvider, vscode.Disposable {
   private readonly backend: AcpBackendInterface;
@@ -68,6 +72,39 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
     }
     const cwd = await raceWithCancellation(this.controller.getSessionCwd(sessionId), token);
 
+    const active = this.getActiveSession?.(sessionId);
+    if (active !== undefined) {
+      const title = this.controller.getSessionTitle(sessionId);
+      return {
+        ...active,
+        ...(title !== undefined && title.length > 0 ? { title } : {}),
+        options: { mode: this.controller.getSessionMode(sessionId) },
+      };
+    }
+
+    // A cancelled caller returns immediately, but an already-sent load must retain its
+    // session lock until the backend has finished sending its replay tail.
+    return await raceWithCancellation(this.loadSessionContent(sessionId, cwd, token), token);
+  }
+
+  private async loadSessionContent(
+    sessionId: string,
+    cwd: string,
+    token: vscode.CancellationToken,
+  ): Promise<vscode.ChatSession> {
+    const release = await acquireSessionOperation(this.backend, sessionId, token);
+    try {
+      return await this.loadSessionContentLocked(sessionId, cwd, token);
+    } finally {
+      release();
+    }
+  }
+
+  private async loadSessionContentLocked(
+    sessionId: string,
+    cwd: string,
+    token: vscode.CancellationToken,
+  ): Promise<vscode.ChatSession> {
     // ACP session/load can stop a running cascade; reattach without asking the backend to replay history.
     const active = this.getActiveSession?.(sessionId);
     if (active !== undefined) {
@@ -80,15 +117,79 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
     }
 
     const converter = new TurnConverter(this.browserRenderer, sessionId, ANTIGRAVITY_SCHEME, this.attachmentDir);
+    let resetQuietTimer: (() => void) | undefined;
+    let collectUpdates = true;
+    let disconnected: Error | undefined;
+    let rejectDrain: ((error: Error) => void) | undefined;
     const updateSubscription = this.backend.onDidChangeUpdate((event) => {
-      if (event.sessionId === sessionId && !isTokenCancelled(token)) {
-        converter.processUpdate(event.update);
+      if (event.sessionId === sessionId) {
+        resetQuietTimer?.();
+        if (collectUpdates && !isTokenCancelled(token)) {
+          converter.processUpdate(event.update);
+        }
+      }
+    });
+    const backendSubscription = this.backend.onDidChangeBackendState((event) => {
+      if (!event.ready) {
+        disconnected = new Error('ACP backend disconnected while replaying session history.');
+        collectUpdates = false;
+        rejectDrain?.(disconnected);
       }
     });
 
+    const drain = async (): Promise<void> => {
+      if (disconnected !== undefined) {
+        throw disconnected;
+      }
+      await new Promise<void>((resolve, reject) => {
+        let quietTimer: ReturnType<typeof setTimeout> | undefined;
+        const cleanup = (): void => {
+          clearTimeout(quietTimer);
+          clearTimeout(maximumTimer);
+          resetQuietTimer = undefined;
+          rejectDrain = undefined;
+        };
+        const maximumTimer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`Replay drain timed out for session ${sessionId}; history may be incomplete.`));
+        }, REPLAY_MAX_DRAIN_MS);
+        rejectDrain = (error): void => {
+          cleanup();
+          reject(error);
+        };
+        resetQuietTimer = (): void => {
+          clearTimeout(quietTimer);
+          quietTimer = setTimeout(() => {
+            cleanup();
+            resolve();
+          }, REPLAY_QUIET_MS);
+        };
+        resetQuietTimer();
+      });
+    };
+
     let loadResult: AcpSessionLoadResult;
     try {
-      loadResult = await raceWithCancellation(this.backend.loadSession(sessionId, cwd), token);
+      try {
+        loadResult = await this.backend.loadSession(sessionId, cwd, token);
+      } catch (error: unknown) {
+        // A failed RPC can still have started replay. Quarantine its tail before releasing the lock.
+        collectUpdates = false;
+        if (!isCancellationError(error) && disconnected === undefined) {
+          try {
+            await drain();
+          } catch (drainError: unknown) {
+            this.outputChannel.appendLine(
+              `[AgySessionContentProvider] Failed to drain replay for ${sessionId}: ${formatError(drainError)}`,
+            );
+          }
+        }
+        throw error;
+      }
+      await drain();
+      if (disconnected !== undefined) {
+        throw disconnected;
+      }
     } catch (error: unknown) {
       if (!isCancellationError(error)) {
         this.outputChannel.appendLine(
@@ -97,6 +198,7 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
       }
       throw error;
     } finally {
+      backendSubscription.dispose();
       updateSubscription.dispose();
     }
 

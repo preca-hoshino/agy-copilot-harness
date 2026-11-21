@@ -20,6 +20,7 @@ export interface ConvertedHistory {
 
 type ToolCallCategory = 'browser' | 'execute' | 'read' | 'edit' | 'generic';
 type ResponsePart = vscode.ChatResponseTurn2['response'][number];
+type ReplayPart = ResponsePart | vscode.ChatResponseCodeblockUriPart | vscode.ChatResponseTextEditPart;
 
 type ResponseTurnSlot =
   | { readonly kind: 'part'; readonly part: ResponsePart }
@@ -146,7 +147,7 @@ export class TurnConverter {
       if (merged === undefined) {
         continue;
       }
-      if (classifyToolCall(merged, this.browserRenderer) !== 'edit') {
+      if (merged.status !== 'completed' || classifyToolCall(merged, this.browserRenderer) !== 'edit') {
         continue;
       }
       for (const change of extractFileChangesFromToolCall(merged)) {
@@ -157,6 +158,7 @@ export class TurnConverter {
     const changes: vscode.ChatSessionFileChange[] = [];
     for (const item of aggregatedChanges.values()) {
       changes.push({
+        uri: item.modifiedUri,
         modifiedUri: item.modifiedUri,
         ...(item.originalUri !== undefined ? { originalUri: item.originalUri } : {}),
         insertions: item.insertions,
@@ -297,7 +299,7 @@ export class TurnConverter {
       return;
     }
 
-    const parts: ResponsePart[] = [];
+    const parts: ReplayPart[] = [];
     for (const slot of this.currentTurnSlots) {
       if (slot.kind === 'part') {
         parts.push(slot.part);
@@ -316,7 +318,14 @@ export class TurnConverter {
           }
         } else {
           const toolPart = buildToolInvocationPart(merged, true);
+          const edits = merged.status === 'completed' && classifyToolCategoryWithoutBrowser(merged) === 'edit'
+            ? buildReplayEditParts(merged)
+            : [];
+          if (edits.length > 0) {
+            toolPart.presentation = 'hidden';
+          }
           parts.push(toolPart as unknown as vscode.ChatResponsePart);
+          parts.push(...edits);
         }
       }
     }
@@ -326,6 +335,25 @@ export class TurnConverter {
 
     this.turns.push(new vscode.ChatResponseTurn2(parts, {}, this.participantId));
   }
+}
+
+function buildReplayEditParts(merged: AcpToolCallUpdatePayload): ReplayPart[] {
+  if (typeof vscode.ChatResponseCodeblockUriPart !== 'function' || typeof vscode.ChatResponseTextEditPart !== 'function') {
+    return [];
+  }
+  const parts: ReplayPart[] = [];
+  for (const change of extractFileChangesFromToolCall(merged)) {
+    const uri = change.modifiedUri;
+    // Match VS Code's history representation without inventing an undo stop or snapshots.
+    parts.push(
+      new vscode.ChatResponseMarkdownPart('\n````\n'),
+      new vscode.ChatResponseCodeblockUriPart(uri, true),
+      new vscode.ChatResponseTextEditPart(uri, []),
+      new vscode.ChatResponseTextEditPart(uri, true),
+      new vscode.ChatResponseMarkdownPart('\n````\n'),
+    );
+  }
+  return parts;
 }
 
 export class LiveStreamAdapter {
@@ -338,6 +366,7 @@ export class LiveStreamAdapter {
   private readonly toolCallsById = new Map<string, AcpToolCallUpdatePayload>();
   private readonly liveToolParts = new Map<string, vscode.ChatToolInvocationPart>();
   private readonly reportedEditToolIds = new Set<string>();
+  private readonly externallyTrackedToolIds = new Set<string>();
   private livePlanPart: vscode.ChatToolInvocationPart | undefined;
 
   public constructor(
@@ -404,12 +433,33 @@ export class LiveStreamAdapter {
     }
   }
 
+  public markExternalEdit(uri: vscode.Uri): void {
+    const key = uri.toString();
+    for (const [toolCallId, call] of this.toolCallsById) {
+      if (call.status !== 'in_progress' && call.status !== 'pending') {
+        continue;
+      }
+      if (classifyToolCall(call, this.browserRenderer) !== 'edit') {
+        continue;
+      }
+      if (!extractFileChangesFromToolCall(call).some((change) => change.modifiedUri.toString() === key)) {
+        continue;
+      }
+      this.externallyTrackedToolIds.add(toolCallId);
+      const part = this.liveToolParts.get(toolCallId);
+      if (part !== undefined) {
+        part.presentation = 'hidden';
+        this.stream.push(part as unknown as vscode.ChatResponsePart);
+      }
+    }
+  }
+
   public flush(): void {
     for (const [toolCallId, merged] of this.toolCallsById.entries()) {
       if (this.reportedEditToolIds.has(toolCallId)) {
         continue;
       }
-      if (classifyToolCall(merged, this.browserRenderer) !== 'edit') {
+      if (merged.status !== 'completed' || classifyToolCall(merged, this.browserRenderer) !== 'edit') {
         continue;
       }
       const changes = extractFileChangesFromToolCall(merged);
@@ -436,6 +486,9 @@ export class LiveStreamAdapter {
     const existingPart = this.liveToolParts.get(merged.toolCallId);
     const part = buildToolInvocationPart(merged, false, existingPart);
     part.enablePartialUpdate = true;
+    if (this.externallyTrackedToolIds.has(merged.toolCallId)) {
+      part.presentation = 'hidden';
+    }
     this.liveToolParts.set(merged.toolCallId, part);
     this.stream.push(part as unknown as vscode.ChatResponsePart);
 
@@ -718,8 +771,9 @@ function extractFileChangesFromToolCall(merged: AcpToolCallUpdatePayload): vscod
       }
       const uri = parseUriSafe(item.path);
       const stats = computeLineDiffStats(item.oldText, item.newText);
-      const hasOldText = item.oldText !== undefined && item.oldText.length > 0;
+      const hasOldText = item.oldText !== undefined;
       accumulateFileChange(results, {
+        uri,
         modifiedUri: uri,
         ...(hasOldText ? { originalUri: uri } : {}),
         insertions: stats.insertions,
@@ -757,6 +811,7 @@ function extractFileChangesFromToolCall(merged: AcpToolCallUpdatePayload): vscod
   if (explicitInsertions !== undefined || explicitDeletions !== undefined) {
     return [
       {
+        uri,
         modifiedUri: uri,
         originalUri: uri,
         insertions: explicitInsertions ?? 0,
@@ -781,6 +836,7 @@ function extractFileChangesFromToolCall(merged: AcpToolCallUpdatePayload): vscod
     }
     return [
       {
+        uri,
         modifiedUri: uri,
         originalUri: uri,
         insertions,
@@ -806,9 +862,10 @@ function extractFileChangesFromToolCall(merged: AcpToolCallUpdatePayload): vscod
 
   if (oldText !== undefined || newText !== undefined) {
     const stats = computeLineDiffStats(oldText, newText);
-    const hasOld = oldText !== undefined && oldText.length > 0;
+    const hasOld = oldText !== undefined;
     return [
       {
+        uri,
         modifiedUri: uri,
         ...(hasOld ? { originalUri: uri } : {}),
         insertions: stats.insertions,
@@ -819,6 +876,7 @@ function extractFileChangesFromToolCall(merged: AcpToolCallUpdatePayload): vscod
 
   return [
     {
+      uri,
       modifiedUri: uri,
       insertions: 0,
       deletions: 0,
@@ -850,6 +908,7 @@ function materializeFileChanges(map: Map<string, MutableFileChange>): vscode.Cha
   const result: vscode.ChatSessionFileChange[] = [];
   for (const item of map.values()) {
     result.push({
+      uri: item.modifiedUri,
       modifiedUri: item.modifiedUri,
       ...(item.originalUri !== undefined ? { originalUri: item.originalUri } : {}),
       insertions: item.insertions,
@@ -1012,19 +1071,19 @@ function resolveMessageAttachment(
   const mimeType = block.resource?.mimeType ?? block.mimeType ?? '';
   const imageExtension = IMAGE_EXTENSIONS[mimeType];
   let uri: vscode.Uri | undefined;
-  if (rawUri && /^(?:file|https?|vscode-remote):\/\//i.test(rawUri)) {
+  if (rawUri !== undefined && rawUri.length > 0 && /^(?:file|https?|vscode-remote):\/\//i.test(rawUri)) {
     uri = vscode.Uri.parse(rawUri);
-  } else if (rawUri && /^[a-z]:[\\/]|^[\\/]{1,2}/i.test(rawUri)) {
+  } else if (rawUri !== undefined && rawUri.length > 0 && /^[a-z]:[\\/]|^[\\/]{1,2}/i.test(rawUri)) {
     uri = vscode.Uri.file(rawUri);
   }
 
   const data = block.type === 'image' ? block.data : block.resource?.blob;
   const text = block.resource?.text;
-  const bytes = data && data.length <= 24_000_000 && (block.type === 'resource' || imageExtension)
+  const bytes = data !== undefined && data.length > 0 && data.length <= 24_000_000 && (block.type === 'resource' || imageExtension !== undefined)
     ? Buffer.from(data, 'base64')
-    : !uri && text !== undefined && text.length <= 6_000_000 ? Buffer.from(text) : undefined;
-  if (directory && bytes?.length) {
-    const extension = imageExtension ?? (mimeType === 'application/pdf' ? 'pdf' : data ? 'bin' : 'txt');
+    : uri === undefined && text !== undefined && text.length <= 6_000_000 ? Buffer.from(text) : undefined;
+  if (directory !== undefined && directory.length > 0 && bytes !== undefined && bytes.length > 0) {
+    const extension = imageExtension ?? (mimeType === 'application/pdf' ? 'pdf' : data !== undefined && data.length > 0 ? 'bin' : 'txt');
     const filename = path.join(directory, `${createHash('sha256').update(bytes).digest('hex')}.${extension}`);
     try {
       fs.mkdirSync(directory, { recursive: true });
@@ -1039,8 +1098,8 @@ function resolveMessageAttachment(
   if (!uri) {
     return undefined;
   }
-  const sourceName = rawUri ? getPathBasename(rawUri.split(/[?#]/, 1)[0] ?? '') : '';
-  const name = block.name ?? (sourceName || (imageExtension ? `Image.${imageExtension}` : getPathBasename(uri.path)));
+  const sourceName = rawUri !== undefined && rawUri.length > 0 ? getPathBasename(rawUri.split(/[?#]/, 1)[0] ?? '') : '';
+  const name = block.name ?? (sourceName || (imageExtension !== undefined ? `Image.${imageExtension}` : getPathBasename(uri.path)));
   const image = uri.scheme === 'file' && /\.(png|jpe?g|gif|webp|bmp)$/i.test(uri.path);
   return { id: uri.toString(), name, uri, image };
 }

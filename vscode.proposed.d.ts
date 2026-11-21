@@ -17,6 +17,7 @@ declare module 'vscode' {
   export interface ChatResponseStream {
     push(part: ChatResponsePart | ChatResponseWarningPart): void;
     questionCarousel(questions: ChatQuestion[], allowSkip?: boolean): Thenable<Record<string, unknown> | undefined>;
+    externalEdit(uri: Uri | readonly Uri[], callback: () => Thenable<void>): Thenable<string>;
   }
 
   export enum ChatSessionStatus {
@@ -47,6 +48,7 @@ declare module 'vscode' {
   }
 
   export interface ChatSessionFileChange {
+    readonly uri: Uri;
     readonly modifiedUri: Uri;
     readonly originalUri?: Uri;
     readonly insertions: number;
@@ -218,7 +220,7 @@ declare module 'vscode' {
     readonly participant: string;
     readonly command?: string;
     constructor(
-      response: ReadonlyArray<ChatResponsePart | ChatResponseWarningPart>,
+      response: ReadonlyArray<ChatResponsePart | ChatResponseWarningPart | ChatResponseCodeblockUriPart | ChatResponseTextEditPart>,
       result: ChatResult,
       participant: string,
       command?: string
@@ -228,6 +230,20 @@ declare module 'vscode' {
   export class ChatResponseWarningPart {
     value: MarkdownString;
     constructor(value: string | MarkdownString);
+  }
+
+  export class ChatResponseCodeblockUriPart {
+    value: Uri;
+    isEdit?: boolean;
+    undoStopId?: string;
+    constructor(value: Uri, isEdit?: boolean, undoStopId?: string);
+  }
+
+  export class ChatResponseTextEditPart {
+    uri: Uri;
+    edits: TextEdit[];
+    isDone?: boolean;
+    constructor(uri: Uri, edits: TextEdit | TextEdit[] | true);
   }
 
   export class ChatResponseThinkingProgressPart {

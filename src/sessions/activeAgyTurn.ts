@@ -1,5 +1,4 @@
-import type * as vscode from 'vscode';
-import { CancellationTokenSource } from 'vscode';
+import * as vscode from 'vscode';
 
 type ChatPart = Parameters<vscode.ChatResponseStream['push']>[0];
 
@@ -7,7 +6,7 @@ export class ActiveAgyTurn {
   private readonly parts = new Set<ChatPart>();
   private readonly completed = Promise.withResolvers<void>();
   private readonly switchedView = Promise.withResolvers<void>();
-  private readonly stopSource = new CancellationTokenSource();
+  private readonly stopSource = new vscode.CancellationTokenSource();
   private stream: vscode.ChatResponseStream | undefined;
   private requestStream: vscode.ChatResponseStream | undefined;
   private interruptionToken: vscode.CancellationToken | undefined;
@@ -38,6 +37,55 @@ export class ActiveAgyTurn {
     // Tool and plan updates reuse mutable part objects; replay each once in its original position.
     this.parts.add(part);
     this.send(part);
+  }
+
+  public async externalEdit(uri: vscode.Uri, write: () => Promise<void>, onTracked: () => void): Promise<void> {
+    const stream = this.stream;
+    if (stream === undefined || typeof stream.externalEdit !== 'function' || this.stopToken.isCancellationRequested) {
+      await write();
+      return;
+    }
+
+    const state = { started: false };
+    let writing: Promise<void> | undefined;
+    const writeOnce = async (): Promise<void> => {
+      writing ??= Promise.resolve().then(write);
+      await writing;
+    };
+    try {
+      const undoStopId = await stream.externalEdit(uri, async () => {
+        state.started = true;
+        await writeOnce();
+      });
+      await writeOnce();
+      if (state.started) {
+        onTracked();
+        this.rememberExternalEdit(uri, undoStopId, stream);
+      }
+    } catch {
+      // If the UI failed before or after the callback, reuse the same write. A
+      // failed write remains failed; an already successful write is never repeated.
+      await writeOnce();
+    }
+  }
+
+  private rememberExternalEdit(uri: vscode.Uri, undoStopId: string, source: vscode.ChatResponseStream): void {
+    if (typeof vscode.ChatResponseCodeblockUriPart !== 'function' || typeof vscode.ChatResponseTextEditPart !== 'function') {
+      return;
+    }
+    const replayParts = [
+      new vscode.ChatResponseMarkdownPart('\n````\n'),
+      new vscode.ChatResponseCodeblockUriPart(uri, true, undoStopId),
+      new vscode.ChatResponseTextEditPart(uri, []),
+      new vscode.ChatResponseTextEditPart(uri, true),
+      new vscode.ChatResponseMarkdownPart('\n````\n'),
+    ] as unknown as ChatPart[];
+    for (const part of replayParts) {
+      this.parts.add(part);
+      if (this.stream !== source) {
+        this.send(part);
+      }
+    }
   }
 
   public readonly attach = async (

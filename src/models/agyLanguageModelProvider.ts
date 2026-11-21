@@ -210,7 +210,7 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
       id: params.id,
       name: params.name,
       family,
-      ...(icon ? { statusIcon: new vscode.ThemeIcon(icon) } : {}),
+      ...(icon !== undefined && icon.length > 0 ? { statusIcon: new vscode.ThemeIcon(icon) } : {}),
       version: '1.0.0',
       maxInputTokens: limits.maxInputTokens,
       maxOutputTokens: limits.maxOutputTokens,
@@ -249,7 +249,7 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
 }
 
 function getModelChoices(modelConfig: AcpConfigOption | undefined, models: readonly ModelQuotaInfo[]): AcpConfigOptionChoice[] {
-  return modelConfig?.options.length
+  return modelConfig !== undefined && modelConfig.options.length > 0
     ? modelConfig.options
     : models.map((model) => ({ value: model.modelId, name: model.label, description: model.description }));
 }
@@ -459,7 +459,7 @@ function buildQuotaTooltip(
   quotaInfo: ModelQuotaInfo | undefined,
   signedIn: boolean,
 ): string {
-  if (description) {
+  if (description !== undefined && description.length > 0) {
     return description;
   }
   const lines: string[] = [`${name} (${id})`];

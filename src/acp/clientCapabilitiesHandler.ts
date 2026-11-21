@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import type { PermissionPrompt } from '../shared/contracts.js';
+import type { FileWriteHandler, PermissionPrompt } from '../shared/contracts.js';
 import type { AcpPermissionOption, AcpRequestPermissionParams } from './acpTypes.js';
 import { JsonRpcError } from './jsonRpcTransport.js';
 
@@ -463,6 +463,7 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
   private readonly terminalManager: AgyTerminalManager;
   private readonly sessionModes = new Map<string, string>();
   private readonly permissionPrompts = new Map<string, PermissionPrompt>();
+  private readonly fileWriteHandlers = new Map<string, FileWriteHandler>();
 
   public constructor(outputChannel: vscode.OutputChannel, terminalManager?: AgyTerminalManager) {
     this.outputChannel = outputChannel;
@@ -479,11 +480,20 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
 
   public registerPermissionPrompt(sessionId: string, prompt: PermissionPrompt): vscode.Disposable {
     this.permissionPrompts.set(sessionId, prompt);
-    return { dispose: () => {
+    return new vscode.Disposable(() => {
       if (this.permissionPrompts.get(sessionId) === prompt) {
         this.permissionPrompts.delete(sessionId);
       }
-    } };
+    });
+  }
+
+  public registerFileWriteHandler(sessionId: string, handler: FileWriteHandler): vscode.Disposable {
+    this.fileWriteHandlers.set(sessionId, handler);
+    return new vscode.Disposable(() => {
+      if (this.fileWriteHandlers.get(sessionId) === handler) {
+        this.fileWriteHandlers.delete(sessionId);
+      }
+    });
   }
 
   public async handleRequest(method: string, params: unknown): Promise<unknown> {
@@ -513,6 +523,7 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
     this.terminalManager.dispose();
     this.sessionModes.clear();
     this.permissionPrompts.clear();
+    this.fileWriteHandlers.clear();
   }
 
   private async handleReadTextFile(params: unknown): Promise<{ content: string }> {
@@ -548,8 +559,21 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
 
     const targetUri = vscode.Uri.file(filePath);
     const parentUri = vscode.Uri.file(path.dirname(targetUri.fsPath));
-    await vscode.workspace.fs.createDirectory(parentUri);
-    await vscode.workspace.fs.writeFile(targetUri, Buffer.from(params.content, 'utf8'));
+    const content = params.content;
+    const write = async (): Promise<void> => {
+      if (vscode.workspace.textDocuments.some((doc) => doc.isDirty && this.urisMatch(doc.uri, targetUri))) {
+        throw new Error(`Cannot write ${filePath}: the document has unsaved changes.`);
+      }
+      await vscode.workspace.fs.createDirectory(parentUri);
+      await vscode.workspace.fs.writeFile(targetUri, Buffer.from(content, 'utf8'));
+    };
+    const sessionId = typeof params.sessionId === 'string' ? params.sessionId : undefined;
+    const handler = sessionId === undefined ? undefined : this.fileWriteHandlers.get(sessionId);
+    if (handler === undefined) {
+      await write();
+    } else {
+      await handler(targetUri, write);
+    }
     return {};
   }
 

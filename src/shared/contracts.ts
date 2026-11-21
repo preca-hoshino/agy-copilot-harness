@@ -14,6 +14,7 @@ export const EXTENSION_ID = 'antigravity.agy-copilot-harness';
 export const AUTH_PROVIDER_ID = 'google-antigravity';
 
 export type PermissionPrompt = (request: AcpRequestPermissionParams) => Promise<string | undefined>;
+export type FileWriteHandler = (uri: vscode.Uri, write: () => Promise<void>) => Promise<void>;
 
 export interface ModelQuotaInfo {
   label: string;
@@ -61,13 +62,15 @@ export interface AcpBackendInterface {
   readonly onDidChangeUpdate: vscode.Event<{ sessionId: string; update: AcpSessionUpdate }>;
   readonly onDidChangeBackendState: vscode.Event<{ ready: boolean; error?: string | undefined }>;
   registerPermissionPrompt?: (sessionId: string, prompt: PermissionPrompt) => vscode.Disposable;
+  registerFileWriteHandler?: (sessionId: string, handler: FileWriteHandler) => vscode.Disposable;
   ensureStarted: () => Promise<void>;
   listSessions: () => Promise<AcpSessionListResult>;
-  loadSession: (sessionId: string, cwd: string) => Promise<AcpSessionLoadResult>;
+  loadSession: (sessionId: string, cwd: string, token?: vscode.CancellationToken) => Promise<AcpSessionLoadResult>;
   resumeSession: (sessionId: string, cwd: string) => Promise<AcpSessionLoadResult>;
   newSession: (cwd: string) => Promise<AcpSessionLoadResult>;
   setConfigOption: (sessionId: string, configId: string, value: string) => Promise<AcpConfigOption[] | undefined>;
-  prompt: (sessionId: string, content: AcpContentBlock[]) => Promise<AcpSessionPromptResult>;
+  prompt: (sessionId: string, content: AcpContentBlock[], token?: vscode.CancellationToken) => Promise<AcpSessionPromptResult>;
+  waitForConversationFullyIdle: (sessionId: string, token: vscode.CancellationToken) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
   logout: () => Promise<void>;
   restart: () => Promise<void>;

@@ -8,6 +8,7 @@ import { ActiveAgyTurn } from './activeAgyTurn.js';
 import type { AgySessionController } from './agySessionController.js';
 import { extractSessionIdFromUri } from './agySessionController.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
+import { acquireSessionOperation } from './sessionOperationCoordinator.js';
 import { LiveStreamAdapter } from './turnConverter.js';
 
 interface SyncedSessionConfig {
@@ -54,6 +55,8 @@ const IMAGE_MIME_BY_EXT: Readonly<Record<string, string>> = {
 };
 
 const MAX_TITLE_LENGTH = 60;
+const LIVE_UPDATE_QUIET_MS = 250;
+const LIVE_UPDATE_MAX_DRAIN_MS = 10_000;
 
 export interface ActiveAgySession {
   readonly history: vscode.ChatSession['history'];
@@ -142,6 +145,7 @@ export class AgyChatParticipant implements vscode.Disposable {
     }
 
     let activeTurn: ActiveAgyTurn | undefined;
+    let releaseSession: (() => void) | undefined;
     try {
       const cwd = await this.controller.getSessionCwd(rawSessionId);
       if (!this.backend.isReady) {
@@ -157,6 +161,11 @@ export class AgyChatParticipant implements vscode.Disposable {
         this.controller.updateSessionMetadata(sessionId, {
           ...(derivedTitle !== undefined ? { title: derivedTitle } : {}),
         });
+      }
+
+      releaseSession = await acquireSessionOperation(this.backend, sessionId, token);
+      if (this.activeTurns.has(sessionId)) {
+        return existingTurnMessage;
       }
 
       const effectiveMode = request.command === 'plan' ? 'plan' : this.controller.getSessionMode(sessionId);
@@ -209,9 +218,14 @@ export class AgyChatParticipant implements vscode.Disposable {
       });
       activeTurn = turn;
       this.activeTurns.set(sessionId, turn);
+      // Once published, a history provider can reattach instead of replaying. Release
+      // the preparation lock so callers already queued behind it can do that too.
+      releaseSession();
+      releaseSession = undefined;
       this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.InProgress);
 
-      const turnState = { needsInput: false };
+      const turnState: { needsInput: boolean; disconnected?: Error } = { needsInput: false };
+      const getDisconnectError = (): Error | undefined => turnState.disconnected;
       const liveAdapter = new LiveStreamAdapter(
         this.browserRenderer,
         sessionId,
@@ -227,10 +241,20 @@ export class AgyChatParticipant implements vscode.Disposable {
         this.attachmentDir,
       );
 
+      let resetDrainTimer: (() => void) | undefined;
+      let rejectDrain: ((error: Error) => void) | undefined;
+      const backendSubscription = this.backend.onDidChangeBackendState((event) => {
+        if (!event.ready) {
+          const error = new Error('ACP backend disconnected while running the conversation.');
+          turnState.disconnected = error;
+          rejectDrain?.(error);
+        }
+      });
       const updateSubscription = this.backend.onDidChangeUpdate((event) => {
-        if (event.sessionId !== sessionId) {
+        if (event.sessionId !== sessionId || turnState.disconnected !== undefined) {
           return;
         }
+        resetDrainTimer?.();
         if (
           event.update.sessionUpdate === 'current_mode_update' &&
           'currentModeId' in event.update &&
@@ -264,18 +288,78 @@ export class AgyChatParticipant implements vscode.Disposable {
         }
       });
 
+      const fileWriteSubscription = this.backend.registerFileWriteHandler?.(sessionId, async (uri, write) => {
+        await turn.externalEdit(uri, write, () => {
+          liveAdapter.markExternalEdit(uri);
+        });
+      });
+
       const cancelSubscription = token.onCancellationRequested(() => {
         turn.stopRequestStream(stream);
       });
 
+      this.activeDisposables.add(backendSubscription);
       this.activeDisposables.add(updateSubscription);
       this.activeDisposables.add(cancelSubscription);
       if (permissionSubscription !== undefined) {
         this.activeDisposables.add(permissionSubscription);
       }
+      if (fileWriteSubscription !== undefined) {
+        this.activeDisposables.add(fileWriteSubscription);
+      }
 
       try {
-        const promptResult = await this.backend.prompt(sessionId, contentBlocks);
+        const promptResult = await this.backend.prompt(sessionId, contentBlocks, turn.stopToken);
+        if (!turn.stopToken.isCancellationRequested && promptResult.stopReason !== 'cancelled') {
+          const promptDisconnect = getDisconnectError();
+          if (promptDisconnect !== undefined) {
+            throw promptDisconnect;
+          }
+          await this.backend.waitForConversationFullyIdle(sessionId, turn.stopToken);
+          const idleDisconnect = getDisconnectError();
+          if (idleDisconnect !== undefined) {
+            throw idleDisconnect;
+          }
+          await new Promise<void>((resolve, reject) => {
+            let quietTimer: ReturnType<typeof setTimeout> | undefined;
+            const cleanup = (): void => {
+              clearTimeout(quietTimer);
+              clearTimeout(maximumTimer);
+              cancellation?.dispose();
+              resetDrainTimer = undefined;
+              rejectDrain = undefined;
+            };
+            const finish = (): void => {
+              cleanup();
+              resolve();
+            };
+            const fail = (error: Error): void => {
+              cleanup();
+              reject(error);
+            };
+            const maximumTimer = setTimeout(() => {
+              fail(new Error('Timed out draining conversation updates after the backend became idle.'));
+            }, LIVE_UPDATE_MAX_DRAIN_MS);
+            let cancellation: vscode.Disposable | undefined;
+            rejectDrain = fail;
+            cancellation = turn.stopToken.onCancellationRequested(() => {
+              fail(new vscode.CancellationError());
+            });
+            resetDrainTimer = (): void => {
+              clearTimeout(quietTimer);
+              quietTimer = setTimeout(finish, LIVE_UPDATE_QUIET_MS);
+            };
+            if (turn.stopToken.isCancellationRequested) {
+              fail(new vscode.CancellationError());
+            } else {
+              resetDrainTimer();
+            }
+          });
+          const drainDisconnect = getDisconnectError();
+          if (drainDisconnect !== undefined || !this.backend.isReady) {
+            throw drainDisconnect ?? new Error('ACP backend disconnected while draining conversation updates.');
+          }
+        }
         if (!turnState.needsInput || turn.stopToken.isCancellationRequested) {
           this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
         }
@@ -289,19 +373,27 @@ export class AgyChatParticipant implements vscode.Disposable {
         try {
           liveAdapter.flush();
         } finally {
+          backendSubscription.dispose();
           updateSubscription.dispose();
           cancelSubscription.dispose();
           if (permissionSubscription !== undefined) {
             permissionSubscription.dispose();
             this.activeDisposables.delete(permissionSubscription);
           }
+          if (fileWriteSubscription !== undefined) {
+            fileWriteSubscription.dispose();
+            this.activeDisposables.delete(fileWriteSubscription);
+          }
+          this.activeDisposables.delete(backendSubscription);
           this.activeDisposables.delete(updateSubscription);
           this.activeDisposables.delete(cancelSubscription);
         }
       }
     } catch (error: unknown) {
       if ((activeTurn?.stopToken.isCancellationRequested ?? isTokenCancelled(token)) && !isAuthenticationRequiredError(error)) {
-        this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
+        if (activeTurn !== undefined) {
+          this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
+        }
         return {};
       }
 
@@ -336,6 +428,7 @@ export class AgyChatParticipant implements vscode.Disposable {
           this.activeTurns.delete(sessionId);
         }
       }
+      releaseSession?.();
       try {
         await this.quotaService.refresh(true);
       } catch (refreshError: unknown) {

@@ -208,6 +208,7 @@ function createMockBackend(internalHttpPort?: number, csrfToken = 'csrf-token-12
     newSession: async () => ({ sessionId: '' }),
     setConfigOption: async () => undefined,
     prompt: async () => ({}),
+    waitForConversationFullyIdle: async () => undefined,
     cancel: async () => undefined,
     logout: async () => undefined,
     restart: async () => undefined,

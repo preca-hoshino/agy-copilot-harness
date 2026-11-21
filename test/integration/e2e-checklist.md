@@ -89,8 +89,11 @@ Target environment: **VS Code 1.147.0** (`8a14f0cc1b`) + **Antigravity CLI (`agy
   - Start a multi-step turn, return to the Agents session list without pressing **Stop**, then reopen the running session.
   - Expected: The row remains in progress and the same response resumes streaming without `session/load`, `session/cancel`, or a second `session/prompt`. Press **Stop** after reopening and verify it sends one `session/cancel` for that turn.
 - [ ] **Session replay (`session/load`)**
-  - Click an existing multi-turn session.
-  - Expected: User prompts, thinking blocks, tool cards, and responses reconstruct accurately.
+  - Hover over and then open an existing multi-turn session; repeat after cancelling an in-progress load.
+  - Expected: User prompts, thinking blocks, tools, and responses reconstruct through the final message, with no duplicated or mixed updates. If ACP disconnects mid-replay, opening fails rather than returning partial history.
+- [ ] **Background work after `session/prompt`**
+  - In a test session, start a background command or subagent that finishes after the first assistant response.
+  - Expected: The turn stays active and streams the follow-up before completing; if the backend disconnects, the turn reports failure instead of successful completion.
 - [ ] **Keep existing Antigravity sessions on Antigravity**
   - Select Antigravity in a new chat, send a prompt, then reopen the session from the list in Workbench and the Agents window.
   - Expected: No agent switcher appears below the input. Send a follow-up and verify it goes to the same Antigravity session. The model, effort, and ACP mode pickers still work.
@@ -119,7 +122,8 @@ Target environment: **VS Code 1.147.0** (`8a14f0cc1b`) + **Antigravity CLI (`agy
   - Expected: Renders a native expandable terminal card showing the command line, output stream, exit code, and duration, without a redundant `Run` label between the command and its output.
 - [ ] **File read links & Diff statistics (`read_file`, `edit_file`, `write_file`)**
   - Ask the agent to read and edit a file in the workspace.
-  - Expected: Read tool displays clickable file link with line range; edits emit `ChatResponseTextEditPart` and update `ChatSessionItem.changes` (`+X -Y`), opening a native Diff view on click.
+  - Expected: Reads show clickable file links with line ranges. Successful historical edits show native **Edited** file pills; reopening without an edit checkpoint does not invent diff counts.
+  - Expected: Live writes routed through ACP's client file API appear as native edits with Diff and undo when the VS Code API is available. Backend-direct writes retain the file link and reported statistics. Neither path overwrites a dirty editor buffer through the client API.
 - [ ] **Browser Subagent (`invoke_subagent` with `TypeName: "browser"`)**
   - Trigger a browser automation task (e.g., open a web page and capture/inspect UI).
   - Expected:

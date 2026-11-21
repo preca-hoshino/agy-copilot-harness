@@ -208,6 +208,57 @@ describe.skipIf(!HAS_AGY_BINARY)('Live Antigravity ACP Backend Integration', () 
     expect(modelConfigs.length).toBeGreaterThan(0);
   }, 30_000);
 
+  it.skipIf(process.env.AGY_LIVE_EDIT_TEST !== '1')('observes write notifications and fully-idle timing in an isolated session', async () => {
+    expect(backend).toBeDefined();
+    if (backend === undefined) {
+      throw new Error('Backend was not initialized');
+    }
+    const workspace = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'agy-live-edit-'));
+    const file = path.join(workspace, 'probe.txt');
+    const events: Array<{ event: string; elapsed: number; exists: boolean }> = [];
+    const start = Date.now();
+    const created = await backend.newSession(workspace);
+    const sessionId = created.sessionId;
+    const record = (event: string): void => {
+      events.push({ event, elapsed: Date.now() - start, exists: fs.existsSync(file) });
+    };
+    const subscription = backend.onDidChangeUpdate((entry) => {
+      if (entry.sessionId !== sessionId) {
+        return;
+      }
+      const update = entry.update;
+      if (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') {
+        record(`${update.name ?? 'update'}:${update.status ?? 'unknown'}`);
+      } else if (update.sessionUpdate === 'agent_message_chunk') {
+        const content = update.content;
+        const text = typeof content === 'object' && content !== null && 'text' in content && typeof content.text === 'string'
+          ? content.text.slice(0, 200)
+          : '';
+        record(`agent_message_chunk:${text}`);
+      }
+    });
+    const cancellation: import('vscode').CancellationToken = {
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose: () => undefined }),
+    };
+    try {
+      await backend.setConfigOption(sessionId, 'mode', 'auto');
+      record('prompt_start');
+      const result = await backend.prompt(sessionId, [{ type: 'text', text:
+        `Use the write_file tool to create ${file} with exactly the text "agy integration probe". Do not use a terminal. Then reply done.`,
+      }], cancellation);
+      record(`prompt_response:${result.stopReason ?? 'unknown'}`);
+      await backend.waitForConversationFullyIdle(sessionId, cancellation);
+      record('fully_idle');
+      console.log('[isolated edit probe]', JSON.stringify(events));
+      expect(fs.existsSync(file)).toBe(true);
+      expect(await fsPromises.readFile(file, 'utf8')).toContain('agy integration probe');
+    } finally {
+      subscription.dispose();
+      await fsPromises.rm(workspace, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  }, 180_000);
+
   it('loads an existing session via session/load and emits replay session/update events', async () => {
     expect(backend).toBeDefined();
     if (backend === undefined || sessions.length === 0) {
