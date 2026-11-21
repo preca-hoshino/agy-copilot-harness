@@ -921,4 +921,49 @@ describe('TurnConverter', () => {
     const lastPart = responseTurn.response[responseTurn.response.length - 1] as vscode.ChatResponseMarkdownPart;
     expect(lastPart.value.value).toBe('<!--AGY_USAGE:{"used":34500,"size":1048576}-->');
   });
+
+  it('hides completed live edit tool invocations and emits native VS Code edit pill parts', () => {
+    const renderer = new BrowserSubagentRenderer('D:\\unused');
+    const pushed: unknown[] = [];
+    const changes: vscode.ChatSessionFileChange[] = [];
+    const adapter = new LiveStreamAdapter(
+      renderer,
+      'session-live-edit-pill',
+      {
+        push: (part: unknown) => {
+          pushed.push(part);
+        },
+      } as unknown as vscode.ChatResponseStream,
+      (change) => {
+        changes.push(change);
+      },
+    );
+
+    adapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'edit-1',
+      kind: 'edit',
+      name: 'replace_file_content',
+      status: 'in_progress',
+      rawInput: { TargetFile: 'D:\\repo\\src\\app.ts' },
+    });
+    expect(pushed).toHaveLength(1);
+    expect((pushed[0] as vscode.ChatToolInvocationPart).presentation).toBeUndefined();
+
+    adapter.handleUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'edit-1',
+      status: 'completed',
+      rawInput: { TargetFile: 'D:\\repo\\src\\app.ts', TargetContent: 'a', ReplacementContent: 'b\nc' },
+    });
+
+    expect((pushed[0] as vscode.ChatToolInvocationPart).presentation).toBe('hidden');
+    expect(pushed).toHaveLength(7);
+    expect(pushed[2]).toBeInstanceOf(vscode.ChatResponseMarkdownPart);
+    expect(pushed[3]).toBeInstanceOf(vscode.ChatResponseCodeblockUriPart);
+    expect((pushed[3] as vscode.ChatResponseCodeblockUriPart).isEdit).toBe(true);
+    expect(pushed[4]).toBeInstanceOf(vscode.ChatResponseTextEditPart);
+    expect((pushed[5] as vscode.ChatResponseTextEditPart).isDone).toBe(true);
+    expect(changes).toHaveLength(1);
+  });
 });

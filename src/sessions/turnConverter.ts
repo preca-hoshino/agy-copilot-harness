@@ -424,6 +424,7 @@ export class LiveStreamAdapter {
   private readonly liveToolParts = new Map<string, vscode.ChatToolInvocationPart>();
   private readonly reportedEditToolIds = new Set<string>();
   private readonly externallyTrackedToolIds = new Set<string>();
+  private readonly emittedNativeEditToolIds = new Set<string>();
   private livePlanPart: vscode.ChatToolInvocationPart | undefined;
 
   public constructor(
@@ -578,13 +579,26 @@ export class LiveStreamAdapter {
     const existingPart = this.liveToolParts.get(merged.toolCallId);
     const part = buildToolInvocationPart(merged, false, existingPart);
     part.enablePartialUpdate = true;
-    if (this.externallyTrackedToolIds.has(merged.toolCallId)) {
+    const category = classifyToolCall(merged, this.browserRenderer);
+    const shouldEmitNativeEditPill =
+      category === 'edit' &&
+      merged.status === 'completed' &&
+      !this.externallyTrackedToolIds.has(merged.toolCallId) &&
+      !this.emittedNativeEditToolIds.has(merged.toolCallId);
+    const nativeEditParts = shouldEmitNativeEditPill ? buildReplayEditParts(merged) : [];
+    if (this.externallyTrackedToolIds.has(merged.toolCallId) || nativeEditParts.length > 0) {
       part.presentation = 'hidden';
     }
     this.liveToolParts.set(merged.toolCallId, part);
     this.stream.push(part as unknown as vscode.ChatResponsePart);
 
-    const category = classifyToolCall(merged, this.browserRenderer);
+    if (nativeEditParts.length > 0) {
+      this.emittedNativeEditToolIds.add(merged.toolCallId);
+      for (const editPart of nativeEditParts) {
+        this.stream.push(editPart as unknown as vscode.ChatResponsePart);
+      }
+    }
+
     if (category === 'edit' && merged.status === 'completed' && !this.reportedEditToolIds.has(merged.toolCallId)) {
       const changes = extractFileChangesFromToolCall(merged);
       if (changes.length > 0) {
