@@ -10,6 +10,7 @@ export class ActiveAgyTurn {
   private stream: vscode.ChatResponseStream | undefined;
   private requestStream: vscode.ChatResponseStream | undefined;
   private interruptionToken: vscode.CancellationToken | undefined;
+  private lastUsage: vscode.ChatResponseUsage | undefined;
   private finished = false;
 
   public constructor(
@@ -37,6 +38,11 @@ export class ActiveAgyTurn {
     // Tool and plan updates reuse mutable part objects; replay each once in its original position.
     this.parts.add(part);
     this.send(part);
+  }
+
+  public usage(usage: vscode.ChatResponseUsage): void {
+    this.lastUsage = usage;
+    this.sendUsage(usage);
   }
 
   public async externalEdit(uri: vscode.Uri, write: () => Promise<void>, onTracked: () => void): Promise<void> {
@@ -70,7 +76,10 @@ export class ActiveAgyTurn {
   }
 
   private rememberExternalEdit(uri: vscode.Uri, undoStopId: string, source: vscode.ChatResponseStream): void {
-    if (typeof vscode.ChatResponseCodeblockUriPart !== 'function' || typeof vscode.ChatResponseTextEditPart !== 'function') {
+    if (
+      typeof vscode.ChatResponseCodeblockUriPart !== 'function' ||
+      typeof vscode.ChatResponseTextEditPart !== 'function'
+    ) {
       return;
     }
     const replayParts = [
@@ -99,6 +108,9 @@ export class ActiveAgyTurn {
     this.stream = stream;
     for (const part of this.parts) {
       this.send(part);
+    }
+    if (this.lastUsage !== undefined) {
+      this.sendUsage(this.lastUsage);
     }
     if (this.finished) {
       this.stream = undefined;
@@ -154,6 +166,17 @@ export class ActiveAgyTurn {
   private send(part: ChatPart): void {
     try {
       this.stream?.push(part);
+    } catch {
+      // A closed UI stream must not prevent ACP progress or file-change tracking.
+      this.stream = undefined;
+      this.requestStream = undefined;
+      this.switchedView.resolve();
+    }
+  }
+
+  private sendUsage(usage: vscode.ChatResponseUsage): void {
+    try {
+      this.stream?.usage(usage);
     } catch {
       // A closed UI stream must not prevent ACP progress or file-change tracking.
       this.stream = undefined;

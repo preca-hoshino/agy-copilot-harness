@@ -207,12 +207,30 @@ vi.mock('vscode', () => {
     ChatResponseMarkdownPart: class {
       public constructor(public readonly value: unknown) {}
     },
+    ChatToolInvocationPart: class {
+      public isComplete = false;
+      public isError = false;
+      public isConfirmed?: boolean;
+      public enablePartialUpdate = false;
+      public invocationMessage?: string | { value: string };
+      public pastTenseMessage?: string | { value: string };
+      public toolSpecificData?: Record<string, unknown>;
+      public constructor(public readonly toolName: string, public readonly toolCallId: string, public readonly errorMessage?: string) {}
+    },
     MarkdownString: class {
       public constructor(public readonly value = '') {}
       public appendCodeblock(): this { return this; }
+      public appendMarkdown(): this { return this; }
       public appendText(): this { return this; }
     },
+    LanguageModelTextPart: class {
+      public constructor(public readonly value: string) {}
+    },
+    LanguageModelToolResult: class {
+      public constructor(public readonly content: unknown[]) {}
+    },
     ChatQuestionType: { SingleSelect: 2 },
+    lm: { invokeTool: vi.fn() },
     window: { showQuickPick: vi.fn() },
     CancellationToken: { None: { isCancellationRequested: false } },
     chat: {
@@ -992,5 +1010,683 @@ describe('AgySessionController inputState & workspace filtering', () => {
 
     controller.dispose();
     disposeBackend();
+  });
+
+  it('uses built-in Copilot SDK confirmation tools for single, concurrent, and non-terminal permissions, with carousel fallback', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'perm-sess', cwd: 'D:\\repo', title: 'Perm Session' },
+    ]);
+    const finish = Promise.withResolvers<AcpSessionPromptResult>();
+    backend.prompt = vi.fn(() => finish.promise);
+    backend.waitForConversationFullyIdle = vi.fn(async () => {});
+    let ask: PermissionPrompt | undefined;
+    backend.registerPermissionPrompt = (_id, handler) => {
+      ask = handler;
+      return { dispose: () => { ask = undefined; } };
+    };
+
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(
+      backend,
+      controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn() } as unknown as BrowserSubagentRenderer,
+      createFakeOutputChannel(),
+    );
+
+    const invokeToolMock = vi.mocked(vscode.lm.invokeTool);
+    invokeToolMock.mockReset();
+
+    const source = new vscode.CancellationTokenSource();
+    const resource = buildSessionResource('perm-sess');
+    const token = { token: 'tool-token-1' } as unknown as vscode.ChatParticipantToolToken;
+    const questionCarousel = vi.fn<NonNullable<vscode.ChatResponseStream['questionCarousel']>>(async () => ({}));
+    const running = participant.createHandler()(
+      { prompt: 'Run checks', references: [], toolReferences: [], toolInvocationToken: token } as unknown as vscode.ChatRequest,
+      { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Perm Session' }, isUntitled: false } },
+      { push: vi.fn(), questionCarousel } as unknown as vscode.ChatResponseStream,
+      source.token,
+    );
+
+    try {
+      await vi.waitFor(() => expect(ask).toBeDefined());
+
+      const firstResolver = Promise.withResolvers<vscode.LanguageModelToolResult>();
+      const secondResolver = Promise.withResolvers<vscode.LanguageModelToolResult>();
+      invokeToolMock
+        .mockReturnValueOnce(firstResolver.promise)
+        .mockReturnValueOnce(secondResolver.promise)
+        .mockResolvedValueOnce(new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart('no')]))
+        .mockRejectedValueOnce(new Error('Tool vscode_get_terminal_confirmation was not contributed'));
+
+      const p1 = ask?.({
+        sessionId: 'perm-sess',
+        toolCall: { toolCallId: 'cmd-1', kind: 'execute', name: 'run_command', title: 'Run git status', rawInput: { CommandLine: 'git status', Cwd: 'D:\\repo' } },
+        options: [
+          { optionId: 'allow-1', kind: 'allow_once', name: 'Allow' },
+          { optionId: 'reject-1', kind: 'reject_once', name: 'Reject' },
+        ],
+      });
+      const p2 = ask?.({
+        sessionId: 'perm-sess',
+        toolCall: { toolCallId: 'cmd-2', kind: 'execute', name: 'run_command', title: 'Run npm test', rawInput: { CommandLine: 'npm test', Cwd: 'D:\\repo' } },
+        options: [
+          { optionId: 'allow-2', kind: 'allow_once', name: 'Allow' },
+          { optionId: 'reject-2', kind: 'reject_once', name: 'Reject' },
+        ],
+      });
+
+      expect(invokeToolMock).toHaveBeenCalledTimes(2);
+      expect(invokeToolMock).toHaveBeenNthCalledWith(
+        1,
+        'vscode_get_terminal_confirmation',
+        expect.objectContaining({
+          toolInvocationToken: token,
+          input: expect.objectContaining({ command: 'git status', mode: 'sync', isBackground: false }),
+        }),
+        expect.anything(),
+      );
+      expect(invokeToolMock).toHaveBeenNthCalledWith(
+        2,
+        'vscode_get_terminal_confirmation',
+        expect.objectContaining({
+          toolInvocationToken: token,
+          input: expect.objectContaining({ command: 'npm test', mode: 'sync', isBackground: false }),
+        }),
+        expect.anything(),
+      );
+
+      firstResolver.resolve(new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart('yes')]));
+      secondResolver.resolve(new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart('no')]));
+      await expect(p1).resolves.toBe('allow-1');
+      await expect(p2).resolves.toBe('reject-2');
+
+      const p3 = ask?.({
+        sessionId: 'perm-sess',
+        toolCall: { toolCallId: 'edit-1', kind: 'edit', name: 'write_file', title: 'Write config.json' },
+        options: [
+          { optionId: 'allow-3', kind: 'allow_once', name: 'Allow' },
+          { optionId: 'reject-3', kind: 'reject_once', name: 'Reject' },
+        ],
+      });
+      await expect(p3).resolves.toBe('reject-3');
+      expect(invokeToolMock).toHaveBeenNthCalledWith(
+        3,
+        'vscode_get_confirmation',
+        expect.objectContaining({
+          toolInvocationToken: token,
+          input: expect.objectContaining({ title: 'Write config.json', confirmationType: 'basic' }),
+        }),
+        expect.anything(),
+      );
+
+      questionCarousel.mockImplementationOnce(async (questions: readonly vscode.ChatQuestion[]) => {
+        const qId = questions[0]?.id ?? '';
+        return { [qId]: 'allow-4' };
+      });
+      const p4 = ask?.({
+        sessionId: 'perm-sess',
+        toolCall: { toolCallId: 'cmd-4', kind: 'execute', name: 'run_command', rawInput: { CommandLine: 'dir' } },
+        options: [
+          { optionId: 'allow-4', kind: 'allow_once', name: 'Allow' },
+          { optionId: 'reject-4', kind: 'reject_once', name: 'Reject' },
+        ],
+      });
+      await expect(p4).resolves.toBe('allow-4');
+      expect(questionCarousel).toHaveBeenCalledOnce();
+    } finally {
+      finish.resolve({ stopReason: 'end_turn' });
+      await running;
+      source.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('steers a concurrent request into a running or reattached session without rejecting', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'steer-sess', cwd: 'D:\\repo', title: 'Steer Session' },
+    ]);
+    const firstFinish = Promise.withResolvers<AcpSessionPromptResult>();
+    const secondFinish = Promise.withResolvers<AcpSessionPromptResult>();
+    const prompt = vi.spyOn(backend, 'prompt')
+      .mockReturnValueOnce(firstFinish.promise)
+      .mockReturnValueOnce(secondFinish.promise);
+    const cancel = vi.spyOn(backend, 'cancel');
+    vi.spyOn(backend, 'waitForConversationFullyIdle').mockResolvedValue();
+    const updates = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
+    Object.assign(backend, { onDidChangeUpdate: updates.event });
+
+    const output = createFakeOutputChannel();
+    const controller = new AgySessionController(backend, output, nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const browser = { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer;
+    const participant = new AgyChatParticipant(
+      backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      browser, output,
+    );
+    const provider = new AgySessionContentProvider(
+      backend, controller, browser, output, undefined, (id) => participant.getActiveSession(id),
+    );
+    const resource = buildSessionResource('steer-sess');
+    const source1 = new vscode.CancellationTokenSource();
+    const source2 = new vscode.CancellationTokenSource();
+    const historyToken = new vscode.CancellationTokenSource();
+    const stop1 = new vscode.CancellationTokenSource();
+    const stream1 = { push: vi.fn() } as unknown as vscode.ChatResponseStream;
+    const reopened1 = { push: vi.fn() } as unknown as vscode.ChatResponseStream;
+    const stream2 = { push: vi.fn() } as unknown as vscode.ChatResponseStream;
+    const inputState = controller.controller.createChatSessionInputState([]);
+
+    const turn1 = participant.createHandler()(
+      { prompt: 'First task', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+      { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Steer Session' }, isUntitled: false } },
+      stream1, source1.token,
+    );
+    let turn2: vscode.ProviderResult<void | vscode.ChatResult>;
+    let attached1: Thenable<void> | void;
+
+    try {
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+      const content = await provider.provideChatSessionContent(resource, historyToken.token, { inputState });
+      attached1 = content.activeResponseCallback?.(reopened1, stop1.token);
+
+      updates.fire({
+        sessionId: 'steer-sess',
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tool-cmd-1',
+          kind: 'execute',
+          name: 'run_command',
+          title: 'Run build',
+          rawInput: { CommandLine: 'npm run build' },
+          status: 'in_progress',
+        },
+      });
+      expect(reopened1.push).toHaveBeenCalledTimes(1);
+
+      turn2 = participant.createHandler()(
+        { prompt: 'Follow up steer', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Steer Session' }, isUntitled: false } },
+        stream2, source2.token,
+      );
+
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+      expect(cancel).not.toHaveBeenCalled();
+      await attached1;
+
+      updates.fire({
+        sessionId: 'steer-sess',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'after steer' } },
+      });
+      updates.fire({
+        sessionId: 'steer-sess',
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tool-cmd-1',
+          status: 'completed',
+          rawOutput: { exitCode: 0 },
+        },
+      });
+
+      expect(reopened1.push).toHaveBeenCalledTimes(1);
+      expect(stream2.push).toHaveBeenNthCalledWith(1, expect.objectContaining({ value: { value: 'after steer' } }));
+      expect(stream2.push).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        toolCallId: 'tool-cmd-1',
+        isComplete: true,
+        toolSpecificData: expect.objectContaining({
+          commandLine: expect.objectContaining({ original: 'npm run build' }),
+        }),
+      }));
+
+      // Superseded turn1 settling early must not mark the still-running session Completed.
+      firstFinish.resolve({ stopReason: 'end_turn' });
+      const res1 = await turn1;
+      expect(res1?.errorDetails).toBeUndefined();
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.InProgress);
+
+      secondFinish.resolve({ stopReason: 'end_turn' });
+      const res2 = await turn2;
+      expect(res2?.errorDetails).toBeUndefined();
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.Completed);
+      expect(participant.getActiveSession('steer-sess')).toBeUndefined();
+    } finally {
+      firstFinish.resolve({ stopReason: 'end_turn' });
+      secondFinish.resolve({ stopReason: 'end_turn' });
+      await turn1;
+      await turn2;
+      source1.dispose();
+      source2.dispose();
+      historyToken.dispose();
+      stop1.dispose();
+      updates.dispose();
+      provider.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('yields cleanly on context.yieldRequested once permissions clear and buffers gap updates for the next turn', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'yield-sess', cwd: 'D:\\repo', title: 'Yield Session' },
+    ]);
+    const firstFinish = Promise.withResolvers<AcpSessionPromptResult>();
+    const secondFinish = Promise.withResolvers<AcpSessionPromptResult>();
+    const prompt = vi.spyOn(backend, 'prompt')
+      .mockReturnValueOnce(firstFinish.promise)
+      .mockReturnValueOnce(secondFinish.promise);
+    const cancel = vi.spyOn(backend, 'cancel');
+    vi.spyOn(backend, 'waitForConversationFullyIdle').mockResolvedValue();
+    const updates = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
+    Object.assign(backend, { onDidChangeUpdate: updates.event });
+    let ask: PermissionPrompt | undefined;
+    backend.registerPermissionPrompt = (_id, handler) => {
+      ask = handler;
+      return { dispose: () => { ask = undefined; } };
+    };
+
+    const output = createFakeOutputChannel();
+    const controller = new AgySessionController(backend, output, nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(
+      backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer, output,
+    );
+
+    const resource = buildSessionResource('yield-sess');
+    const source1 = new vscode.CancellationTokenSource();
+    const source2 = new vscode.CancellationTokenSource();
+    let carouselId = '';
+    const carousel = Promise.withResolvers<Record<string, unknown> | undefined>();
+    const stream1 = {
+      push: vi.fn(),
+      questionCarousel: vi.fn((questions: readonly vscode.ChatQuestion[]) => {
+        carouselId = questions[0]?.id ?? '';
+        return carousel.promise;
+      }),
+    } as unknown as vscode.ChatResponseStream;
+    const stream2 = { push: vi.fn() } as unknown as vscode.ChatResponseStream;
+
+    let yieldFlag = false;
+    const context1 = {
+      history: [],
+      chatSessionContext: { chatSessionItem: { resource, label: 'Yield Session' }, isUntitled: false },
+      get yieldRequested(): boolean { return yieldFlag; },
+    };
+
+    const turn1 = participant.createHandler()(
+      { prompt: 'Run long task', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+      context1, stream1, source1.token,
+    );
+    let turn2: vscode.ProviderResult<void | vscode.ChatResult>;
+
+    try {
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(ask).toBeDefined());
+
+      const permPromise = ask?.({
+        sessionId: 'yield-sess',
+        toolCall: { toolCallId: 'cmd-y1', kind: 'execute', name: 'run_command', rawInput: { CommandLine: 'npm test' } },
+        options: [{ optionId: 'allow-1', kind: 'allow_once', name: 'Allow' }],
+      });
+      await vi.waitFor(() => expect(stream1.questionCarousel).toHaveBeenCalledOnce());
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.NeedsInput);
+
+      yieldFlag = true;
+      let yieldedEarly = false;
+      void Promise.resolve(turn1).then(() => { yieldedEarly = true; });
+      await new Promise((resolve) => setTimeout(resolve, 130));
+      expect(yieldedEarly).toBe(false);
+
+      carousel.resolve({ [carouselId]: 'allow-1' });
+      await expect(permPromise).resolves.toBe('allow-1');
+
+      const res1 = await turn1;
+      expect(res1?.metadata).toMatchObject({ sessionId: 'yield-sess', yielded: true });
+      expect(cancel).not.toHaveBeenCalled();
+
+      // Gap update after yield must be buffered rather than pushed to turn1's finished stream.
+      updates.fire({
+        sessionId: 'yield-sess',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'during gap' } },
+      });
+      expect(stream1.push).not.toHaveBeenCalled();
+
+      turn2 = participant.createHandler()(
+        { prompt: 'Steer now', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Yield Session' }, isUntitled: false } },
+        stream2, source2.token,
+      );
+
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+      updates.fire({
+        sessionId: 'yield-sess',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'after handoff' } },
+      });
+
+      expect(stream2.push).toHaveBeenNthCalledWith(1, expect.objectContaining({ value: { value: 'during gap' } }));
+      expect(stream2.push).toHaveBeenNthCalledWith(2, expect.objectContaining({ value: { value: 'after handoff' } }));
+
+      firstFinish.resolve({ stopReason: 'end_turn' });
+      secondFinish.resolve({ stopReason: 'end_turn' });
+      const res2 = await turn2;
+      expect(res2?.errorDetails).toBeUndefined();
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.Completed);
+    } finally {
+      carousel.resolve(undefined);
+      firstFinish.resolve({ stopReason: 'end_turn' });
+      secondFinish.resolve({ stopReason: 'end_turn' });
+      await turn1;
+      await turn2;
+      source1.dispose();
+      source2.dispose();
+      updates.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('waits while a stopping turn is cancelling and aborts cleanly if the waiting request is cancelled', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'cancel-wait-sess', cwd: 'D:\\repo', title: 'Cancel Wait' },
+    ]);
+    const firstFinish = Promise.withResolvers<AcpSessionPromptResult>();
+    const secondFinish = Promise.withResolvers<AcpSessionPromptResult>();
+    const prompt = vi.spyOn(backend, 'prompt')
+      .mockReturnValueOnce(firstFinish.promise)
+      .mockReturnValueOnce(secondFinish.promise);
+    const cancel = vi.spyOn(backend, 'cancel');
+    vi.spyOn(backend, 'waitForConversationFullyIdle').mockResolvedValue();
+
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(
+      backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer,
+      createFakeOutputChannel(),
+    );
+
+    const resource = buildSessionResource('cancel-wait-sess');
+    const source1 = new vscode.CancellationTokenSource();
+    const source2a = new vscode.CancellationTokenSource();
+    const source2b = new vscode.CancellationTokenSource();
+    const turn1 = participant.createHandler()(
+      { prompt: 'First', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+      { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Cancel Wait' }, isUntitled: false } },
+      { push: vi.fn() } as unknown as vscode.ChatResponseStream, source1.token,
+    );
+    let turn2a: vscode.ProviderResult<void | vscode.ChatResult>;
+    let turn2b: vscode.ProviderResult<void | vscode.ChatResult>;
+
+    try {
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+      source1.cancel();
+      expect(cancel).toHaveBeenCalledExactlyOnceWith('cancel-wait-sess');
+
+      turn2a = participant.createHandler()(
+        { prompt: 'Waiter A', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Cancel Wait' }, isUntitled: false } },
+        { push: vi.fn() } as unknown as vscode.ChatResponseStream, source2a.token,
+      );
+      turn2b = participant.createHandler()(
+        { prompt: 'Waiter B', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Cancel Wait' }, isUntitled: false } },
+        { push: vi.fn() } as unknown as vscode.ChatResponseStream, source2b.token,
+      );
+
+      await Promise.resolve();
+      expect(prompt).toHaveBeenCalledTimes(1);
+
+      source2a.cancel();
+      const res2a = await turn2a;
+      expect(res2a).toEqual({});
+      expect(prompt).toHaveBeenCalledTimes(1);
+
+      firstFinish.resolve({ stopReason: 'cancelled' });
+      await turn1;
+
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+      secondFinish.resolve({ stopReason: 'end_turn' });
+      const res2b = await turn2b;
+      expect(res2b?.errorDetails).toBeUndefined();
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.Completed);
+    } finally {
+      firstFinish.resolve({ stopReason: 'cancelled' });
+      secondFinish.resolve({ stopReason: 'end_turn' });
+      await turn1;
+      await turn2a;
+      await turn2b;
+      source1.dispose();
+      source2a.dispose();
+      source2b.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('waits while a turn has an active permission prompt before steering the follow-up prompt', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'perm-wait-sess', cwd: 'D:\\repo', title: 'Perm Wait' },
+    ]);
+    const firstFinish = Promise.withResolvers<AcpSessionPromptResult>();
+    const secondFinish = Promise.withResolvers<AcpSessionPromptResult>();
+    const prompt = vi.spyOn(backend, 'prompt')
+      .mockReturnValueOnce(firstFinish.promise)
+      .mockReturnValueOnce(secondFinish.promise);
+    vi.spyOn(backend, 'waitForConversationFullyIdle').mockResolvedValue();
+    let ask: PermissionPrompt | undefined;
+    backend.registerPermissionPrompt = (_id, handler) => {
+      ask = handler;
+      return { dispose: () => { ask = undefined; } };
+    };
+
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(
+      backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer,
+      createFakeOutputChannel(),
+    );
+
+    const resource = buildSessionResource('perm-wait-sess');
+    const source1 = new vscode.CancellationTokenSource();
+    const source2 = new vscode.CancellationTokenSource();
+    let carouselId = '';
+    const carousel = Promise.withResolvers<Record<string, unknown> | undefined>();
+    const stream1 = {
+      push: vi.fn(),
+      questionCarousel: vi.fn((questions: readonly vscode.ChatQuestion[]) => {
+        carouselId = questions[0]?.id ?? '';
+        return carousel.promise;
+      }),
+    } as unknown as vscode.ChatResponseStream;
+    const turn1 = participant.createHandler()(
+      { prompt: 'Run tool', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+      { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Perm Wait' }, isUntitled: false } },
+      stream1, source1.token,
+    );
+    let turn2: vscode.ProviderResult<void | vscode.ChatResult>;
+
+    try {
+      await vi.waitFor(() => expect(ask).toBeDefined());
+      const permPromise = ask?.({
+        sessionId: 'perm-wait-sess',
+        toolCall: { toolCallId: 'cmd-p1', kind: 'execute', name: 'run_command', rawInput: { CommandLine: 'npm check' } },
+        options: [{ optionId: 'allow-1', kind: 'allow_once', name: 'Allow' }],
+      });
+      await vi.waitFor(() => expect(stream1.questionCarousel).toHaveBeenCalledOnce());
+
+      turn2 = participant.createHandler()(
+        { prompt: 'Follow-up', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Perm Wait' }, isUntitled: false } },
+        { push: vi.fn() } as unknown as vscode.ChatResponseStream, source2.token,
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(prompt).toHaveBeenCalledTimes(1);
+
+      carousel.resolve({ [carouselId]: 'allow-1' });
+      await expect(permPromise).resolves.toBe('allow-1');
+
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+      firstFinish.resolve({ stopReason: 'end_turn' });
+      secondFinish.resolve({ stopReason: 'end_turn' });
+      const res2 = await turn2;
+      expect(res2?.errorDetails).toBeUndefined();
+      await turn1;
+    } finally {
+      carousel.resolve(undefined);
+      firstFinish.resolve({ stopReason: 'end_turn' });
+      secondFinish.resolve({ stopReason: 'end_turn' });
+      await turn1;
+      await turn2;
+      source1.dispose();
+      source2.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('retries prompt when backend reports the previous prompt is still being cancelled', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'retry-sess', cwd: 'D:\\repo', title: 'Retry' },
+    ]);
+    const prompt = vi.spyOn(backend, 'prompt')
+      .mockRejectedValueOnce(new Error('the running prompt is being cancelled; wait for it to finish, then send this prompt again'))
+      .mockResolvedValueOnce({ stopReason: 'end_turn' });
+    vi.spyOn(backend, 'waitForConversationFullyIdle').mockResolvedValue();
+
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(
+      backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer,
+      createFakeOutputChannel(),
+    );
+
+    const resource = buildSessionResource('retry-sess');
+    const source = new vscode.CancellationTokenSource();
+    vi.useFakeTimers();
+    try {
+      const pending = participant.createHandler()(
+        { prompt: 'Retry prompt', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Retry' }, isUntitled: false } },
+        { push: vi.fn() } as unknown as vscode.ChatResponseStream, source.token,
+      );
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+      await vi.advanceTimersByTimeAsync(300);
+      const res = await pending;
+      expect(res?.errorDetails).toBeUndefined();
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.Completed);
+    } finally {
+      vi.useRealTimers();
+      source.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('aborts an active idle wait without cancelling the backend when a follow-up request steers in', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'idle-steer-sess', cwd: 'D:\\repo', title: 'Idle Steer' },
+    ]);
+    const idle1 = Promise.withResolvers<void>();
+    const secondPrompt = Promise.withResolvers<AcpSessionPromptResult>();
+    const prompt = vi.spyOn(backend, 'prompt')
+      .mockResolvedValueOnce({ stopReason: 'end_turn' })
+      .mockReturnValueOnce(secondPrompt.promise);
+    const waitForIdle = vi.spyOn(backend, 'waitForConversationFullyIdle')
+      .mockReturnValueOnce(idle1.promise)
+      .mockResolvedValueOnce();
+    const cancel = vi.spyOn(backend, 'cancel');
+
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(
+      backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer,
+      createFakeOutputChannel(),
+    );
+
+    const resource = buildSessionResource('idle-steer-sess');
+    const source1 = new vscode.CancellationTokenSource();
+    const source2 = new vscode.CancellationTokenSource();
+    const turn1 = participant.createHandler()(
+      { prompt: 'Background start', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+      { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Idle Steer' }, isUntitled: false } },
+      { push: vi.fn() } as unknown as vscode.ChatResponseStream, source1.token,
+    );
+    let turn2: vscode.ProviderResult<void | vscode.ChatResult>;
+
+    try {
+      await vi.waitFor(() => expect(waitForIdle).toHaveBeenCalledTimes(1));
+      const idleToken = waitForIdle.mock.calls[0]?.[1];
+      expect(idleToken?.isCancellationRequested).toBe(false);
+
+      turn2 = participant.createHandler()(
+        { prompt: 'Steer during idle', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Idle Steer' }, isUntitled: false } },
+        { push: vi.fn() } as unknown as vscode.ChatResponseStream, source2.token,
+      );
+
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+      expect(cancel).not.toHaveBeenCalled();
+      expect(idleToken?.isCancellationRequested).toBe(true);
+
+      idle1.reject(new Error('Idle wait cancelled'));
+      const res1 = await turn1;
+      expect(res1?.errorDetails).toBeUndefined();
+
+      secondPrompt.resolve({ stopReason: 'end_turn' });
+      const res2 = await turn2;
+      expect(res2?.errorDetails).toBeUndefined();
+      expect(controller.controller.items.get(resource)?.status).toBe(vscode.ChatSessionStatus.Completed);
+    } finally {
+      idle1.resolve();
+      secondPrompt.resolve({ stopReason: 'end_turn' });
+      await turn1;
+      await turn2;
+      source1.dispose();
+      source2.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
   });
 });

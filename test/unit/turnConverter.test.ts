@@ -84,6 +84,9 @@ vi.mock('vscode', () => {
     public readonly references: unknown[];
     public readonly participant: string;
     public readonly toolReferences: readonly unknown[];
+    public readonly editedFileEvents?: readonly unknown[] | undefined;
+    public readonly id?: string | undefined;
+    public readonly modelId?: string | undefined;
 
     public constructor(
       prompt: string,
@@ -91,12 +94,18 @@ vi.mock('vscode', () => {
       references: unknown[] = [],
       participant = '',
       toolReferences: readonly unknown[] = [],
+      editedFileEvents?: readonly unknown[],
+      id?: string,
+      modelId?: string,
     ) {
       this.prompt = prompt;
       this.command = command;
       this.references = references;
       this.participant = participant;
       this.toolReferences = toolReferences;
+      this.editedFileEvents = editedFileEvents;
+      this.id = id;
+      this.modelId = modelId;
     }
   }
 
@@ -737,6 +746,7 @@ describe('TurnConverter', () => {
       reference: vi.fn(),
       questionCarousel: vi.fn(async () => undefined),
       externalEdit: vi.fn(async (_uri, callback) => { await callback(); return 'undo'; }),
+      usage: vi.fn(),
       push: (part: vscode.ChatResponsePart) => {
         pushedParts.push(part);
       },
@@ -869,5 +879,46 @@ describe('TurnConverter', () => {
     openMediaPreviewPanel('D:\\temp\\shot.png');
     expect(createPanelSpy).toHaveBeenCalledTimes(2);
     expect(fakePanel.webview.html).toContain('<img src=');
+  });
+
+  it('forwards valid usage_update events to stream.usage and onUsageUpdate in LiveStreamAdapter', () => {
+    const renderer = new BrowserSubagentRenderer('D:\\unused');
+    const usage = vi.fn();
+    const onUsageUpdate = vi.fn();
+    const adapter = new LiveStreamAdapter(
+      renderer,
+      'session-live-usage',
+      { push: vi.fn(), usage } as unknown as vscode.ChatResponseStream,
+      () => {},
+      undefined,
+      undefined,
+      onUsageUpdate,
+    );
+
+    adapter.handleUpdate({ sessionUpdate: 'usage_update', used: 12_345, size: 200_000 });
+    adapter.handleUpdate({ sessionUpdate: 'usage_update', used: -1, size: 200_000 });
+    adapter.handleUpdate({ sessionUpdate: 'usage_update', used: Number.NaN, size: 200_000 });
+
+    expect(usage).toHaveBeenCalledTimes(1);
+    expect(usage).toHaveBeenCalledWith({ promptTokens: 12_345, completionTokens: 0 });
+    expect(onUsageUpdate).toHaveBeenCalledTimes(1);
+    expect(onUsageUpdate).toHaveBeenCalledWith({ sessionUpdate: 'usage_update', used: 12_345, size: 200_000 });
+  });
+
+  it('captures usage_update and loaded modelId in TurnConverter.finalizeHistory', () => {
+    const renderer = new BrowserSubagentRenderer('D:\\unused');
+    const converter = new TurnConverter(renderer, 'session-replay-usage');
+
+    converter.processUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Inspect files' } });
+    converter.processUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Done.' } });
+    converter.processUpdate({ sessionUpdate: 'usage_update', used: 34_500, size: 1_048_576 });
+
+    const history = converter.finalizeHistory('antigravity/gemini-pro');
+    expect(history.usage).toEqual({ used: 34_500, size: 1_048_576 });
+    expect(history.turns).toHaveLength(2);
+    expect((history.turns[0] as vscode.ChatRequestTurn2).modelId).toBe('antigravity/gemini-pro');
+    const responseTurn = history.turns[1] as vscode.ChatResponseTurn2;
+    const lastPart = responseTurn.response[responseTurn.response.length - 1] as vscode.ChatResponseMarkdownPart;
+    expect(lastPart.value.value).toBe('<!--AGY_USAGE:{"used":34500,"size":1048576}-->');
   });
 });

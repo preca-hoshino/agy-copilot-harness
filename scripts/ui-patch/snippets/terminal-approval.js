@@ -16,6 +16,7 @@ function createTerminalApproval(progress, requestId, response, Invocation, sourc
     return [{ id: entry.id, label: entry.label, kind: option.kind.startsWith('allow_') ? 'approve' : 'deny', scope: option.kind }];
   }) ?? [];
   const skip = options.find((option) => option.scope === 'reject_once');
+  const allowDefault = options.find((option) => option.scope === 'allow_once') ?? options.find((option) => option.kind === 'approve');
   if (!options.length) return;
   const customOptions = skip ? options : [...options, { id: '', label: 'Skip', kind: 'deny' }];
   const toolId = 'antigravity_terminal_confirmation';
@@ -45,8 +46,10 @@ function createTerminalApproval(progress, requestId, response, Invocation, sourc
     settled = true;
     subscription.dispose();
     const selected = reason.type === 4
-      ? options.find((option) => option.id === reason.selectedButton)
-      : reason.type === 0 ? skip : undefined;
+      ? (reason.selectedButton !== undefined
+          ? options.find((option) => option.id === reason.selectedButton)
+          : allowDefault)
+      : (reason.type === 5 || reason.type === 0) ? skip : undefined;
     if (selected?.kind === 'approve') {
       confirm(reason);
       void invocation.didExecuteTool({ content: [] });

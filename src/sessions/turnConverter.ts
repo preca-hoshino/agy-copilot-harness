@@ -9,6 +9,7 @@ import type {
   AcpToolCallContentDiff,
   AcpToolCallContentItem,
   AcpToolCallUpdatePayload,
+  AcpUsageUpdatePayload,
 } from '../acp/acpTypes.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
 
@@ -16,6 +17,7 @@ export interface ConvertedHistory {
   readonly title?: string | undefined;
   readonly turns: Array<vscode.ChatRequestTurn2 | vscode.ChatResponseTurn2>;
   readonly changes: vscode.ChatSessionFileChange[];
+  readonly usage?: { readonly used: number; readonly size: number } | undefined;
 }
 
 type ToolCallCategory = 'browser' | 'execute' | 'read' | 'edit' | 'generic';
@@ -87,6 +89,7 @@ export class TurnConverter {
   private markdownBuffer = '';
   private currentTurnSlots: ResponseTurnSlot[] = [];
   private readonly currentTurnToolIds = new Set<string>();
+  private latestUsage: { readonly used: number; readonly size: number } | undefined;
 
   public constructor(
     browserRenderer: BrowserSubagentRenderer,
@@ -132,14 +135,59 @@ export class TurnConverter {
         }
         break;
       }
+      case 'usage_update': {
+        if (isUsageUpdatePayload(update)) {
+          this.latestUsage = {
+            used: update.used,
+            size: typeof update.size === 'number' && Number.isFinite(update.size) && update.size > 0 ? update.size : 0,
+          };
+        }
+        break;
+      }
       default:
         break;
     }
   }
 
-  public finalizeHistory(): ConvertedHistory {
+  public finalizeHistory(modelId?: string): ConvertedHistory {
     this.flushPendingUserTurn();
     this.flushCurrentResponseTurn();
+
+    const turns = [...this.turns];
+    if (modelId !== undefined && modelId.length > 0) {
+      for (let i = turns.length - 1; i >= 0; i -= 1) {
+        const turn = turns[i];
+        if (turn instanceof vscode.ChatRequestTurn2) {
+          turns[i] = new vscode.ChatRequestTurn2(
+            turn.prompt,
+            turn.command,
+            turn.references,
+            turn.participant,
+            turn.toolReferences,
+            turn.editedFileEvents,
+            turn.id,
+            modelId,
+          );
+          break;
+        }
+      }
+    }
+
+    if (this.latestUsage !== undefined && turns.length > 0) {
+      const lastIndex = turns.length - 1;
+      const lastTurn = turns[lastIndex];
+      if (lastTurn instanceof vscode.ChatResponseTurn2) {
+        const usagePart = new vscode.ChatResponseMarkdownPart(
+          new vscode.MarkdownString(`<!--AGY_USAGE:${JSON.stringify(this.latestUsage)}-->`),
+        );
+        turns[lastIndex] = new vscode.ChatResponseTurn2(
+          [...lastTurn.response, usagePart],
+          lastTurn.result,
+          lastTurn.participant,
+          lastTurn.command,
+        );
+      }
+    }
 
     const aggregatedChanges = new Map<string, MutableFileChange>();
     for (const toolCallId of this.orderedToolCallIds) {
@@ -168,8 +216,9 @@ export class TurnConverter {
 
     return {
       title: this.title,
-      turns: [...this.turns],
+      turns,
       changes,
+      ...(this.latestUsage !== undefined ? { usage: this.latestUsage } : {}),
     };
   }
 
@@ -318,9 +367,10 @@ export class TurnConverter {
           }
         } else {
           const toolPart = buildToolInvocationPart(merged, true);
-          const edits = merged.status === 'completed' && classifyToolCategoryWithoutBrowser(merged) === 'edit'
-            ? buildReplayEditParts(merged)
-            : [];
+          const edits =
+            merged.status === 'completed' && classifyToolCategoryWithoutBrowser(merged) === 'edit'
+              ? buildReplayEditParts(merged)
+              : [];
           if (edits.length > 0) {
             toolPart.presentation = 'hidden';
           }
@@ -338,7 +388,10 @@ export class TurnConverter {
 }
 
 function buildReplayEditParts(merged: AcpToolCallUpdatePayload): ReplayPart[] {
-  if (typeof vscode.ChatResponseCodeblockUriPart !== 'function' || typeof vscode.ChatResponseTextEditPart !== 'function') {
+  if (
+    typeof vscode.ChatResponseCodeblockUriPart !== 'function' ||
+    typeof vscode.ChatResponseTextEditPart !== 'function'
+  ) {
     return [];
   }
   const parts: ReplayPart[] = [];
@@ -356,10 +409,14 @@ function buildReplayEditParts(merged: AcpToolCallUpdatePayload): ReplayPart[] {
   return parts;
 }
 
+type LiveResponseStream = Pick<vscode.ChatResponseStream, 'push'> & {
+  usage?: (usage: vscode.ChatResponseUsage) => unknown;
+};
+
 export class LiveStreamAdapter {
   private readonly browserRenderer: BrowserSubagentRenderer;
   private readonly sessionId: string;
-  private readonly stream: Pick<vscode.ChatResponseStream, 'push'>;
+  private readonly stream: LiveResponseStream;
   private readonly onFileChange: (change: vscode.ChatSessionFileChange) => void;
   private readonly onNeedsInput: ((reason: string) => void) | undefined;
 
@@ -372,10 +429,11 @@ export class LiveStreamAdapter {
   public constructor(
     browserRenderer: BrowserSubagentRenderer,
     sessionId: string,
-    stream: Pick<vscode.ChatResponseStream, 'push'>,
+    stream: LiveResponseStream,
     onFileChange: (change: vscode.ChatSessionFileChange) => void,
     onNeedsInput?: (reason: string) => void,
     private readonly attachmentDir?: string,
+    private readonly onUsageUpdate?: (usage: AcpUsageUpdatePayload) => void,
   ) {
     this.browserRenderer = browserRenderer;
     this.sessionId = sessionId;
@@ -428,8 +486,40 @@ export class LiveStreamAdapter {
         }
         break;
       }
+      case 'usage_update': {
+        if (isUsageUpdatePayload(update)) {
+          this.onUsageUpdate?.(update);
+          if (typeof this.stream.usage === 'function') {
+            this.stream.usage({
+              promptTokens: update.used,
+              completionTokens: 0,
+            });
+          }
+        }
+        break;
+      }
       default:
         break;
+    }
+  }
+
+  public getToolCallsSnapshot(): ReadonlyMap<string, AcpToolCallUpdatePayload> {
+    return new Map(this.toolCallsById);
+  }
+
+  public seedToolCalls(snapshot: ReadonlyMap<string, AcpToolCallUpdatePayload>): void {
+    for (const [toolCallId, payload] of snapshot) {
+      if (this.toolCallsById.has(toolCallId)) {
+        continue;
+      }
+      this.toolCallsById.set(toolCallId, payload);
+      if (
+        payload.status === 'completed' &&
+        classifyToolCall(payload, this.browserRenderer) === 'edit' &&
+        extractFileChangesFromToolCall(payload).length > 0
+      ) {
+        this.reportedEditToolIds.add(toolCallId);
+      }
     }
   }
 
@@ -454,7 +544,7 @@ export class LiveStreamAdapter {
     }
   }
 
-  public flush(): void {
+  public flush(options?: { readonly preserveBrowserSession?: boolean }): void {
     for (const [toolCallId, merged] of this.toolCallsById.entries()) {
       if (this.reportedEditToolIds.has(toolCallId)) {
         continue;
@@ -470,7 +560,9 @@ export class LiveStreamAdapter {
         }
       }
     }
-    this.browserRenderer.disposeSession(this.sessionId);
+    if (options?.preserveBrowserSession !== true) {
+      this.browserRenderer.disposeSession(this.sessionId);
+    }
   }
 
   private handleLiveToolUpdate(update: AcpToolCallUpdatePayload): void {
@@ -670,7 +762,17 @@ function populateExecutePart(
 function populateReadPart(part: vscode.ChatToolInvocationPart, merged: AcpToolCallUpdatePayload): void {
   const args = merged.args ?? {};
   const rawInput = merged.rawInput ?? {};
-  const pathKeys = ['Path', 'path', 'AbsolutePath', 'absolutePath', 'filePath', 'file_path', 'TargetFile', 'file', 'uri'];
+  const pathKeys = [
+    'Path',
+    'path',
+    'AbsolutePath',
+    'absolutePath',
+    'filePath',
+    'file_path',
+    'TargetFile',
+    'file',
+    'uri',
+  ];
   const filePath = getFirstString(args, pathKeys) ?? getFirstString(rawInput, pathKeys) ?? merged.locations?.[0]?.path;
 
   if (filePath === undefined || filePath.length === 0) {
@@ -685,7 +787,9 @@ function populateReadPart(part: vscode.ChatToolInvocationPart, merged: AcpToolCa
   const location = merged.locations?.find((entry) => parseUriSafe(entry.path).toString() === fileUri);
   const startKeys = ['StartLine', 'startLine', 'start_line', 'line'];
   const endKeys = ['EndLine', 'endLine', 'end_line'];
-  const startLine = [getFirstNumber(args, startKeys), getFirstNumber(rawInput, startKeys), location?.line].find(isReadLine);
+  const startLine = [getFirstNumber(args, startKeys), getFirstNumber(rawInput, startKeys), location?.line].find(
+    isReadLine,
+  );
   const endLine = [getFirstNumber(args, endKeys), getFirstNumber(rawInput, endKeys)].find(isReadLine);
   const target = startLine === undefined ? uri : `${uri}#${startLine}-${startLine}`;
   let range = '';
@@ -694,7 +798,9 @@ function populateReadPart(part: vscode.ChatToolInvocationPart, merged: AcpToolCa
   }
   const link = `[](${target})${range}`;
   part.invocationMessage = new vscode.MarkdownString(`Reading ${link}`);
-  part.pastTenseMessage = new vscode.MarkdownString(`${merged.status === 'failed' ? 'Failed to read' : 'Read'} ${link}`);
+  part.pastTenseMessage = new vscode.MarkdownString(
+    `${merged.status === 'failed' ? 'Failed to read' : 'Read'} ${link}`,
+  );
 }
 
 function isReadLine(line: number | undefined): line is number {
@@ -1079,11 +1185,19 @@ function resolveMessageAttachment(
 
   const data = block.type === 'image' ? block.data : block.resource?.blob;
   const text = block.resource?.text;
-  const bytes = data !== undefined && data.length > 0 && data.length <= 24_000_000 && (block.type === 'resource' || imageExtension !== undefined)
-    ? Buffer.from(data, 'base64')
-    : uri === undefined && text !== undefined && text.length <= 6_000_000 ? Buffer.from(text) : undefined;
+  const bytes =
+    data !== undefined &&
+    data.length > 0 &&
+    data.length <= 24_000_000 &&
+    (block.type === 'resource' || imageExtension !== undefined)
+      ? Buffer.from(data, 'base64')
+      : uri === undefined && text !== undefined && text.length <= 6_000_000
+        ? Buffer.from(text)
+        : undefined;
   if (directory !== undefined && directory.length > 0 && bytes !== undefined && bytes.length > 0) {
-    const extension = imageExtension ?? (mimeType === 'application/pdf' ? 'pdf' : data !== undefined && data.length > 0 ? 'bin' : 'txt');
+    const extension =
+      imageExtension ??
+      (mimeType === 'application/pdf' ? 'pdf' : data !== undefined && data.length > 0 ? 'bin' : 'txt');
     const filename = path.join(directory, `${createHash('sha256').update(bytes).digest('hex')}.${extension}`);
     try {
       fs.mkdirSync(directory, { recursive: true });
@@ -1099,7 +1213,9 @@ function resolveMessageAttachment(
     return undefined;
   }
   const sourceName = rawUri !== undefined && rawUri.length > 0 ? getPathBasename(rawUri.split(/[?#]/, 1)[0] ?? '') : '';
-  const name = block.name ?? (sourceName || (imageExtension !== undefined ? `Image.${imageExtension}` : getPathBasename(uri.path)));
+  const name =
+    block.name ??
+    (sourceName || (imageExtension !== undefined ? `Image.${imageExtension}` : getPathBasename(uri.path)));
   const image = uri.scheme === 'file' && /\.(png|jpe?g|gif|webp|bmp)$/i.test(uri.path);
   return { id: uri.toString(), name, uri, image };
 }
@@ -1178,6 +1294,16 @@ function isToolCallUpdatePayload(update: AcpSessionUpdate): update is AcpToolCal
     isRecord(update) &&
     (update.sessionUpdate === 'tool_call' || update.sessionUpdate === 'tool_call_update') &&
     typeof update.toolCallId === 'string'
+  );
+}
+
+function isUsageUpdatePayload(update: AcpSessionUpdate): update is AcpUsageUpdatePayload {
+  return (
+    isRecord(update) &&
+    update.sessionUpdate === 'usage_update' &&
+    typeof update.used === 'number' &&
+    Number.isFinite(update.used) &&
+    update.used >= 0
   );
 }
 

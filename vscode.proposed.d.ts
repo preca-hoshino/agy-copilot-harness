@@ -14,8 +14,17 @@ declare module 'vscode' {
     defaultValue?: string | string[];
   }
 
+  export interface ChatResponseUsage {
+    promptTokens: number;
+    completionTokens: number;
+    outputBuffer?: number;
+    copilotCredits?: number;
+    promptTokenDetails?: readonly unknown[];
+  }
+
   export interface ChatResponseStream {
     push(part: ChatResponsePart | ChatResponseWarningPart): void;
+    usage(usage: ChatResponseUsage): ChatResponseStream;
     questionCarousel(questions: ChatQuestion[], allowSkip?: boolean): Thenable<Record<string, unknown> | undefined>;
     externalEdit(uri: Uri | readonly Uri[], callback: () => Thenable<void>): Thenable<string>;
   }
@@ -183,6 +192,7 @@ declare module 'vscode' {
 
   export interface ChatContext {
     readonly chatSessionContext?: ChatSessionContext;
+    readonly yieldRequested?: boolean;
   }
 
   export interface ChatRequest {

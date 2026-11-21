@@ -110,6 +110,7 @@ if (require.main === module) {
   const { PATCH_START, PATCH_END, inspectPatch, stripPatchMarkers } = require('./ui-patch/markers');
   const { patchSessions, patchWorkbench } = require('./ui-patch/patch-bundles');
   const { renderQuotaGroups, renderQuotaRow } = require('./ui-patch/snippets/quota-rendering');
+  const { extractHistoryUsageParts } = require('./ui-patch/snippets/session-usage');
   const { createTerminalApproval } = require('./ui-patch/snippets/terminal-approval');
 
   module.exports = {
@@ -118,6 +119,7 @@ if (require.main === module) {
     detectVsCodeOutDir,
     stripPatchMarkers,
     createTerminalApproval,
+    extractHistoryUsageParts,
     renderQuotaRow,
     renderQuotaGroups,
     patchSessionsContent: (content) => patchSessions(inspectPatch(content)),

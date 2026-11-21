@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { QuotaPoolSummary } from '../../src/shared/contracts.js';
 
 const requireFromProject = createRequire(`${process.cwd()}/package.json`);
-const { createTerminalApproval, renderQuotaGroups, renderQuotaRow } = requireFromProject('./scripts/patch-sessions-ui.js');
+const { createTerminalApproval, extractHistoryUsageParts, renderQuotaGroups, renderQuotaRow } = requireFromProject('./scripts/patch-sessions-ui.js');
 const { buildSessionsPanelSnippet } = requireFromProject('./scripts/ui-patch/snippets/sessions-panel.js');
 
 class FakeInvocation {
@@ -71,6 +71,54 @@ describe('native terminal approval', () => {
     invocation.confirmation.confirm({ type: 4, selectedButton: 'yes' });
     expect(invocation.didCancelTool).toHaveBeenCalledTimes(1);
     expect(send).not.toHaveBeenCalled();
+  });
+
+  it('approves with allow_once when confirmed without selectedButton and rejects on Dismiss/Skip All', () => {
+    const allowed = createApproval();
+    allowed.invocation.confirmation.confirm({ type: 4 });
+    expect(allowed.send).toHaveBeenCalledExactlyOnceWith('request-1', 'resolve-1', { [allowed.id]: 'yes' });
+    expect(allowed.invocation.didExecuteTool).toHaveBeenCalledTimes(1);
+
+    const dismissed = createApproval();
+    dismissed.invocation.confirmation.confirm({ type: 5 });
+    expect(dismissed.send).toHaveBeenCalledExactlyOnceWith('request-1', 'resolve-1', { [dismissed.id]: 'no' });
+    expect(dismissed.invocation.didExecuteTool).not.toHaveBeenCalled();
+  });
+});
+
+describe('historical session usage extraction', () => {
+  it('converts AGY_USAGE markers into native usage parts only for antigravity sessions', () => {
+    const agyHistory = [
+      { type: 'request', prompt: 'hi' },
+      {
+        type: 'response',
+        parts: [
+          { kind: 'markdownContent', content: { value: 'Hello' } },
+          { kind: 'markdownContent', content: { value: '<!--AGY_USAGE:{"used":42000,"size":1048576}-->' } },
+        ],
+      },
+    ];
+    extractHistoryUsageParts(agyHistory, { scheme: 'antigravity' });
+    expect(agyHistory[1]?.parts).toEqual([
+      { kind: 'markdownContent', content: { value: 'Hello' } },
+      {
+        kind: 'usage',
+        promptTokens: 42000,
+        completionTokens: 0,
+        contextUsage: { currentTokens: 42000, tokenLimit: 1048576 },
+      },
+    ]);
+
+    const otherHistory = [
+      {
+        type: 'response',
+        parts: [{ kind: 'markdownContent', content: { value: '<!--AGY_USAGE:{"used":42000,"size":1048576}-->' } }],
+      },
+    ];
+    extractHistoryUsageParts(otherHistory, { scheme: 'copilotcli' });
+    expect(otherHistory[0]?.parts).toEqual([
+      { kind: 'markdownContent', content: { value: '<!--AGY_USAGE:{"used":42000,"size":1048576}-->' } },
+    ]);
   });
 });
 

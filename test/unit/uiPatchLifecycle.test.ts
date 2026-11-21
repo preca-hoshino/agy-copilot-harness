@@ -21,6 +21,7 @@ function commonBundle() {
     'class ChatSessionsService{constructor(contributions){this._contributions=contributions}supportsDelegationForSessionType($type){return this._contributions.get($type)?.contribution?.supportsDelegation!==!1}}',
     'function external(e){let n={id:e.toolName,source:$source.External,displayName:e.toolName,modelDescription:e.toolName},r=new $invocation({invocationMessage:e.invocationMessage,pastTenseMessage:e.pastTenseMessage,toolSpecificData:e.toolSpecificData},n);return r}',
     'class Agent{answer(e){this._proxy.$handleQuestionCarouselAnswer(e)}async $handleProgressChunk(e,t){let i=this._pendingProgress.get(e);let{progress:n,chatSession:r,isSubagent:a}=i,c=[],l=r?.getRequests().find(u=>u.id===e)?.response;for(let u of t){let[p,h]=Array.isArray(u)?u:[u];if(p.kind==="externalEdits")continue;c.push(p)}n(c)}}',
+    'class RemoteSession{async _doInitializeContent(e,t){let i=await this._proxy.$provideChatSessionContent();this.history.length=0;this.history.push(...i.history.map(c=>{if(c.type==="request")return c;return{type:"response",parts:c.parts.map(l=>$revive(l)),participant:c.participant,details:c.details}})),i.hasActiveResponseCallback&&void 0}}',
   ].join('\r\n');
 }
 

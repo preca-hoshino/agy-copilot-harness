@@ -2,6 +2,7 @@ const { SESSIONS_ANCHORS, WORKBENCH_ANCHORS, resolveAnchors } = require('./ancho
 const { markSnippet, reattachFooter } = require('./markers');
 const { buildTrustedAuthAccessSnippet, buildWorkbenchAccountsOrderSnippet } = require('./snippets/accounts');
 const { buildSessionsPanelSnippet, buildSessionsSkipContributedSnippet } = require('./snippets/sessions-panel');
+const { buildSessionHistoryUsageSnippet } = require('./snippets/session-usage');
 const { buildStatusBarTooltipSnippet } = require('./snippets/status-tooltip');
 const { buildTerminalApprovalSnippet } = require('./snippets/terminal-approval');
 
@@ -26,6 +27,7 @@ function commonInsertions(matches) {
     [sessionHarnessIcon.end, 'session-harness-icon', `if(${session}.providerType==="antigravity")${icon}={id:"antigravity-logo"};`],
     // Use VS Code's native delegation gate; canDelegate still allows starting new Antigravity sessions.
     [sessionDelegation.end, 'session-delegation', `if(${type}==="antigravity")return false;`],
+    [matches.sessionHistoryUsage.end, 'session-history-usage', buildSessionHistoryUsageSnippet()],
   ];
 }
 

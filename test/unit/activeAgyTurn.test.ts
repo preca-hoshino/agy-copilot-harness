@@ -106,4 +106,26 @@ describe('ActiveAgyTurn external edits', () => {
     expect(write).toHaveBeenCalledOnce();
     turn.finish();
   });
+
+  it('forwards token usage updates and replays the latest usage on attach', async () => {
+    const stream = {
+      push: vi.fn(),
+      usage: vi.fn(),
+    } as unknown as vscode.ChatResponseStream;
+    const turn = new ActiveAgyTurn([], stream, () => {});
+    turn.usage({ promptTokens: 1200, completionTokens: 0 });
+    turn.usage({ promptTokens: 4500, completionTokens: 0 });
+    expect(stream.usage).toHaveBeenCalledTimes(2);
+    expect(stream.usage).toHaveBeenLastCalledWith({ promptTokens: 4500, completionTokens: 0 });
+
+    const reopened = { push: vi.fn(), usage: vi.fn() } as unknown as vscode.ChatResponseStream;
+    const source = new vscode.CancellationTokenSource();
+    const attached = turn.attach(reopened, source.token);
+    expect(reopened.usage).toHaveBeenCalledOnce();
+    expect(reopened.usage).toHaveBeenCalledWith({ promptTokens: 4500, completionTokens: 0 });
+
+    turn.finish();
+    await attached;
+    source.dispose();
+  });
 });

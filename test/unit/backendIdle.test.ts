@@ -1,4 +1,14 @@
+import { EventEmitter } from 'node:events';
+import type * as http from 'node:http';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const { httpRequestMock } = vi.hoisted(() => ({
+  httpRequestMock: vi.fn(),
+}));
+
+vi.mock('node:http', () => ({
+  request: httpRequestMock,
+}));
 
 vi.mock('vscode', () => {
   class EventEmitter<T> {
@@ -55,28 +65,58 @@ async function prompt(backend: AgyBackendManager, token: vscode.CancellationToke
   await backend.prompt('session-1', [{ type: 'text', text: 'test' }], token);
 }
 
+function stubHttpResponse(statusCode: number, body: string): void {
+  httpRequestMock.mockImplementation((_options: http.RequestOptions, cb: (res: http.IncomingMessage) => void) => {
+    const req = new EventEmitter() as EventEmitter & {
+      setTimeout: ReturnType<typeof vi.fn>;
+      end: ReturnType<typeof vi.fn>;
+      destroy: ReturnType<typeof vi.fn>;
+    };
+    req.setTimeout = vi.fn(() => req);
+    req.destroy = vi.fn();
+    req.end = vi.fn(() => {
+      queueMicrotask(() => {
+        const res = new EventEmitter() as http.IncomingMessage;
+        res.statusCode = statusCode;
+        cb(res);
+        if (body.length > 0) {
+          res.emit('data', Buffer.from(body, 'utf8'));
+        }
+        res.emit('end');
+      });
+    });
+    return req as unknown as http.ClientRequest;
+  });
+}
+
 describe('backend fully-idle waiting', () => {
   afterEach(() => {
-    vi.unstubAllGlobals();
+    httpRequestMock.mockReset();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
-  it('sends the session ID and CSRF token to the current backend', async () => {
-    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }));
-    vi.stubGlobal('fetch', fetchMock);
+  it('sends the session ID and CSRF token to the current backend with no socket timeout', async () => {
+    stubHttpResponse(200, '{}');
     const backend = createBackend();
     const source = new vscode.CancellationTokenSource();
     try {
       await prompt(backend, source.token);
       await backend.waitForConversationFullyIdle('session-1', source.token);
-      expect(fetchMock).toHaveBeenCalledWith(
-        'http://127.0.0.1:43210/exa.language_server_pb.LanguageServerService/WaitForConversationFullyIdle',
+      expect(httpRequestMock).toHaveBeenCalledWith(
         expect.objectContaining({
-          method: 'POST', body: JSON.stringify({ conversationId: 'session-1' }),
+          hostname: '127.0.0.1',
+          port: 43210,
+          path: '/exa.language_server_pb.LanguageServerService/WaitForConversationFullyIdle',
+          method: 'POST',
+          agent: false,
           headers: expect.objectContaining({ 'x-codeium-csrf-token': backend.csrfToken }),
         }),
+        expect.any(Function),
       );
+      const req = httpRequestMock.mock.results[0]?.value as { setTimeout: ReturnType<typeof vi.fn>; end: ReturnType<typeof vi.fn> };
+      expect(req.setTimeout).toHaveBeenCalledWith(0);
+      expect(req.end).toHaveBeenCalledWith(JSON.stringify({ conversationId: 'session-1' }));
     } finally {
       source.dispose();
       backend.dispose();
@@ -88,7 +128,7 @@ describe('backend fully-idle waiting', () => {
     { status: 200, body: '{"unexpected":true}', message: 'unexpected response' },
     { status: 200, body: 'invalid', message: 'Cannot confirm conversation is fully idle' },
   ])('rejects invalid HTTP response $status', async ({ status, body, message }) => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, { status })));
+    stubHttpResponse(status, body);
     const backend = createBackend();
     const source = new vscode.CancellationTokenSource();
     try {
@@ -102,17 +142,24 @@ describe('backend fully-idle waiting', () => {
 
   it.each(['cancel', 'dispose', 'timeout'] as const)('aborts a pending HTTP wait on %s', async (action) => {
     vi.useFakeTimers();
-    const fetchMock = vi.fn((_url: string, options: RequestInit) => new Promise<Response>((_resolve, reject) => {
-      options.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true });
-    }));
-    vi.stubGlobal('fetch', fetchMock);
+    httpRequestMock.mockImplementation(() => {
+      const req = new EventEmitter() as EventEmitter & {
+        setTimeout: ReturnType<typeof vi.fn>;
+        end: ReturnType<typeof vi.fn>;
+        destroy: ReturnType<typeof vi.fn>;
+      };
+      req.setTimeout = vi.fn(() => req);
+      req.destroy = vi.fn();
+      req.end = vi.fn();
+      return req as unknown as http.ClientRequest;
+    });
     const backend = createBackend();
     const source = new vscode.CancellationTokenSource();
     try {
       await prompt(backend, source.token);
       const waiting = backend.waitForConversationFullyIdle('session-1', source.token);
       const outcome = expect(waiting).rejects.toThrow(/cancelled|disconnected|Timed out/i);
-      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(httpRequestMock).toHaveBeenCalledOnce();
       if (action === 'cancel') source.cancel();
       if (action === 'dispose') backend.dispose();
       if (action === 'timeout') await vi.advanceTimersByTimeAsync(10 * 60_000);
@@ -187,6 +234,43 @@ describe('backend fully-idle waiting', () => {
       expect(state.transport.sendRequest).not.toHaveBeenCalled();
     } finally {
       gate.resolve();
+      source.dispose();
+      backend.dispose();
+    }
+  });
+
+  it('does not let an earlier superseded prompt overwrite promptOwners for a newer prompt', async () => {
+    stubHttpResponse(200, '{}');
+    const backend = createBackend();
+    const source = new vscode.CancellationTokenSource();
+    const firstPrompt = Promise.withResolvers<{ stopReason: string }>();
+    const secondPrompt = Promise.withResolvers<{ stopReason: string }>();
+    const state = backend as unknown as {
+      transport: { sendRequest: ReturnType<typeof vi.fn> };
+      promptOwners: Map<string, unknown>;
+    };
+    state.transport.sendRequest
+      .mockReturnValueOnce(firstPrompt.promise)
+      .mockReturnValueOnce(secondPrompt.promise);
+    try {
+      const p1 = backend.prompt('session-1', [{ type: 'text', text: 'first' }], source.token);
+      await Promise.resolve();
+      const p2 = backend.prompt('session-1', [{ type: 'text', text: 'second' }], source.token);
+      await vi.waitFor(() => expect(state.transport.sendRequest).toHaveBeenCalledTimes(2));
+
+      secondPrompt.resolve({ stopReason: 'end_turn' });
+      await p2;
+      expect(state.promptOwners.has('session-1')).toBe(true);
+
+      await backend.waitForConversationFullyIdle('session-1', source.token);
+      expect(state.promptOwners.has('session-1')).toBe(false);
+
+      firstPrompt.resolve({ stopReason: 'end_turn' });
+      await p1;
+      expect(state.promptOwners.has('session-1')).toBe(false);
+    } finally {
+      firstPrompt.resolve({ stopReason: 'end_turn' });
+      secondPrompt.resolve({ stopReason: 'end_turn' });
       source.dispose();
       backend.dispose();
     }

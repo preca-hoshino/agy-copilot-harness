@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
+import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -56,6 +57,71 @@ function isExistingFile(filePath: string): boolean {
 async function delay(ms: number): Promise<void> {
   await new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
+  });
+}
+
+async function postLocalJson(
+  port: number,
+  requestPath: string,
+  headers: Readonly<Record<string, string>>,
+  body: string,
+  signal: AbortSignal,
+): Promise<{ readonly statusCode: number; readonly body: string }> {
+  if (signal.aborted) {
+    throw new Error(toErrorMessage(signal.reason));
+  }
+  return await new Promise<{ readonly statusCode: number; readonly body: string }>((resolve, reject) => {
+    let settled = false;
+    const finishReject = (err: unknown): void => {
+      if (!settled) {
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        reject(err instanceof Error ? err : new Error(toErrorMessage(err)));
+      }
+    };
+    const finishResolve = (result: { readonly statusCode: number; readonly body: string }): void => {
+      if (!settled) {
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        resolve(result);
+      }
+    };
+    const req = http.request(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path: requestPath,
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Length': String(Buffer.byteLength(body, 'utf8')),
+        },
+        agent: false,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer | string) => {
+          chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk);
+        });
+        res.on('end', () => {
+          finishResolve({
+            statusCode: res.statusCode ?? 0,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+        res.on('error', finishReject);
+      },
+    );
+    const onAbort = (): void => {
+      req.destroy();
+      finishReject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    // WaitForConversationFullyIdle holds the response open until background work finishes;
+    // avoid undici fetch's 5-minute headersTimeout so IDLE_WAIT_TIMEOUT_MS governs the wait.
+    req.setTimeout(0);
+    req.on('error', finishReject);
+    req.end(body);
   });
 }
 
@@ -134,6 +200,7 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
   private spawnCounter = 0;
   private stderrBuffer = '';
   private readonly promptOwners = new Map<string, ChildProcessWithoutNullStreams>();
+  private readonly promptGenerations = new Map<string, number>();
   private readonly idleWaits = new Set<AbortController>();
 
   public constructor(storagePath: string, outputChannel: vscode.OutputChannel) {
@@ -199,7 +266,10 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
         const seenCursors = new Set<string>();
         let cursor: string | undefined;
         do {
-          const page = await transport.sendRequest<AcpSessionListResult>('session/list', cursor === undefined ? {} : { cursor });
+          const page = await transport.sendRequest<AcpSessionListResult>(
+            'session/list',
+            cursor === undefined ? {} : { cursor },
+          );
           sessions.push(...page.sessions);
           cursor = page.nextCursor ?? undefined;
           if (cursor !== undefined) {
@@ -214,7 +284,11 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
     });
   }
 
-  public async loadSession(sessionId: string, cwd: string, token?: vscode.CancellationToken): Promise<AcpSessionLoadResult> {
+  public async loadSession(
+    sessionId: string,
+    cwd: string,
+    token?: vscode.CancellationToken,
+  ): Promise<AcpSessionLoadResult> {
     await this.ensureStarted();
     const owner = this.process;
     return await this.runSerializedBootOp(async () => {
@@ -296,16 +370,24 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
     return updatedOptions;
   }
 
-  public async prompt(sessionId: string, content: AcpContentBlock[], token?: vscode.CancellationToken): Promise<AcpSessionPromptResult> {
+  public async prompt(
+    sessionId: string,
+    content: AcpContentBlock[],
+    token?: vscode.CancellationToken,
+  ): Promise<AcpSessionPromptResult> {
     await this.ensureStarted();
     const owner = this.process;
+    const generation = (this.promptGenerations.get(sessionId) ?? 0) + 1;
+    this.promptGenerations.set(sessionId, generation);
     return await this.runSerializedBootOp(async () => {
-      this.promptOwners.delete(sessionId);
       if (token?.isCancellationRequested) {
         throw new Error('Prompt cancelled before it was sent.');
       }
       if (owner === undefined || owner !== this.process || !this._isReady) {
         throw new Error('ACP backend disconnected or restarted before prompt was sent.');
+      }
+      if (this.promptGenerations.get(sessionId) === generation) {
+        this.promptOwners.delete(sessionId);
       }
       const result = await this.requireTransport().sendRequest<AcpSessionPromptResult>(
         'session/prompt',
@@ -315,7 +397,11 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
         },
         0,
       );
-      if (result.stopReason !== 'cancelled' && !token?.isCancellationRequested) {
+      if (
+        result.stopReason !== 'cancelled' &&
+        !token?.isCancellationRequested &&
+        this.promptGenerations.get(sessionId) === generation
+      ) {
         this.promptOwners.set(sessionId, owner);
       }
       return result;
@@ -350,24 +436,32 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
           throw new Error('Cannot confirm conversation is idle: local HTTP port was not detected.');
         }
         await new Promise<void>((resolve, reject) => {
-          const onAbort = (): void => { clearTimeout(timer); reject(new Error(toErrorMessage(controller.signal.reason))); };
-          const timer = setTimeout(() => { controller.signal.removeEventListener('abort', onAbort); resolve(); }, LOG_POLL_INTERVAL_MS);
+          const onAbort = (): void => {
+            clearTimeout(timer);
+            reject(new Error(toErrorMessage(controller.signal.reason)));
+          };
+          const timer = setTimeout(() => {
+            controller.signal.removeEventListener('abort', onAbort);
+            resolve();
+          }, LOG_POLL_INTERVAL_MS);
           controller.signal.addEventListener('abort', onAbort, { once: true });
         });
       }
-      const response = await fetch(
-        `http://127.0.0.1:${this._internalHttpPort}/exa.language_server_pb.LanguageServerService/WaitForConversationFullyIdle`,
+      const response = await postLocalJson(
+        this._internalHttpPort,
+        '/exa.language_server_pb.LanguageServerService/WaitForConversationFullyIdle',
         {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1', 'x-codeium-csrf-token': this.csrfToken },
-          body: JSON.stringify({ conversationId: sessionId }),
-          signal: controller.signal,
+          'Content-Type': 'application/json',
+          'Connect-Protocol-Version': '1',
+          'x-codeium-csrf-token': this.csrfToken,
         },
+        JSON.stringify({ conversationId: sessionId }),
+        controller.signal,
       );
-      if (!response.ok) {
-        throw new Error(`WaitForConversationFullyIdle returned HTTP ${response.status}.`);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw new Error(`WaitForConversationFullyIdle returned HTTP ${response.statusCode}.`);
       }
-      const payload: unknown = await response.json();
+      const payload: unknown = JSON.parse(response.body);
       if (!isRecord(payload) || Object.keys(payload).length !== 0) {
         throw new Error('WaitForConversationFullyIdle returned an unexpected response.');
       }
@@ -917,6 +1011,7 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
       controller.abort(new Error('ACP backend disconnected or restarted.'));
     }
     this.promptOwners.clear();
+    this.promptGenerations.clear();
   }
 
   private clearUptimeResetTimer(): void {

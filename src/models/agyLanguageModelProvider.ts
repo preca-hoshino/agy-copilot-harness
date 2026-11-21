@@ -35,6 +35,7 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
   private readonly quotaService: QuotaServiceInterface;
   private readonly onDidChangeEmitter = new vscode.EventEmitter<void>();
   private readonly disposables: vscode.Disposable[] = [];
+  private readonly reportedContextWindows = new Map<string, number>();
 
   public readonly onDidChangeLanguageModelChatInformation: vscode.Event<void> = this.onDidChangeEmitter.event;
 
@@ -95,7 +96,8 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
           id: groupId ?? model.value,
           name: group?.name ?? model.name,
           description: quotaInfo?.description ?? model.description,
-          isDefault: choice.value === currentModelValue || variants.some((variant) => variant.model.value === currentModelValue),
+          isDefault:
+            choice.value === currentModelValue || variants.some((variant) => variant.model.value === currentModelValue),
           quotaInfo,
           thoughtConfig,
           currentThoughtLevel: defaultVariant?.effort ?? currentThoughtLevel,
@@ -161,6 +163,45 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
     };
   }
 
+  public recordContextWindow(modelId: string | undefined, size: number): void {
+    if (modelId === undefined || !Number.isFinite(size) || size <= 0) {
+      return;
+    }
+
+    const normalized = stripVendorPrefix(modelId).trim().toLowerCase();
+    if (normalized.length === 0) {
+      return;
+    }
+
+    const configOptions = this.backend.getLastKnownConfigOptions();
+    const modelConfig = findConfigOption(configOptions, 'model');
+    const modelOptions = getModelChoices(modelConfig, this.quotaService.latestSnapshot.models);
+    const groups = getModelVariantGroups(modelOptions);
+    const keys = new Set<string>([normalized]);
+    for (const [groupId, group] of groups.entries()) {
+      if (
+        groupId.toLowerCase() === normalized ||
+        group.variants.some((variant) => variant.model.value.trim().toLowerCase() === normalized)
+      ) {
+        keys.add(groupId.toLowerCase());
+        for (const variant of group.variants) {
+          keys.add(variant.model.value.trim().toLowerCase());
+        }
+      }
+    }
+
+    let changed = false;
+    for (const key of keys) {
+      if (this.reportedContextWindows.get(key) !== size) {
+        this.reportedContextWindows.set(key, size);
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.onDidChangeEmitter.fire();
+    }
+  }
+
   public dispose(): void {
     for (const disposable of this.disposables) {
       disposable.dispose();
@@ -199,6 +240,14 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
     readonly signedIn: boolean;
   }): vscode.LanguageModelChatInformation {
     const limits = inferTokenLimits(params.id, params.name);
+    const reportedSize =
+      this.reportedContextWindows.get(params.id.toLowerCase()) ??
+      params.effortVariants
+        .map((variant) => this.reportedContextWindows.get(variant.model.value.toLowerCase()))
+        .find((value): value is number => value !== undefined);
+    const maxContextWindowTokens = reportedSize ?? limits.maxContextWindowTokens;
+    const maxInputTokens =
+      reportedSize !== undefined ? Math.min(limits.maxInputTokens, reportedSize) : limits.maxInputTokens;
     const family = inferModelFamily(params.id, params.name);
     const icon = MODEL_FAMILY_ICONS[family];
     const efforts = [...new Set(params.effortVariants.map((variant) => variant.effort))];
@@ -212,9 +261,9 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
       family,
       ...(icon !== undefined && icon.length > 0 ? { statusIcon: new vscode.ThemeIcon(icon) } : {}),
       version: '1.0.0',
-      maxInputTokens: limits.maxInputTokens,
+      maxInputTokens,
       maxOutputTokens: limits.maxOutputTokens,
-      maxContextWindowTokens: limits.maxContextWindowTokens,
+      maxContextWindowTokens,
       tooltip,
       isUserSelectable: true,
       targetChatSessionType: 'antigravity',
@@ -238,7 +287,9 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
             type: 'string',
             title: 'Effort Level',
             enum: efforts.length ? efforts : [...DEFAULT_EFFORT_VALUES],
-            enumItemLabels: efforts.length ? efforts.map((effort) => EFFORT_LABELS[effort]) : [...DEFAULT_EFFORT_LABELS],
+            enumItemLabels: efforts.length
+              ? efforts.map((effort) => EFFORT_LABELS[effort])
+              : [...DEFAULT_EFFORT_LABELS],
             group: 'navigation',
             default: params.currentThoughtLevel,
           },
@@ -248,7 +299,10 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
   }
 }
 
-function getModelChoices(modelConfig: AcpConfigOption | undefined, models: readonly ModelQuotaInfo[]): AcpConfigOptionChoice[] {
+function getModelChoices(
+  modelConfig: AcpConfigOption | undefined,
+  models: readonly ModelQuotaInfo[],
+): AcpConfigOptionChoice[] {
   return modelConfig !== undefined && modelConfig.options.length > 0
     ? modelConfig.options
     : models.map((model) => ({ value: model.modelId, name: model.label, description: model.description }));
@@ -257,7 +311,12 @@ function getModelChoices(modelConfig: AcpConfigOption | undefined, models: reado
 const EFFORT_SUFFIX = /\s+\((low|medium|high|xhigh)\)$/i;
 
 function getModelGroupId(name: string): string {
-  return name.replace(EFFORT_SUFFIX, '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-$/, '');
+  return name
+    .replace(EFFORT_SUFFIX, '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/-$/, '');
 }
 
 function getModelVariantGroups(choices: readonly AcpConfigOptionChoice[]): Map<string, ModelVariantGroup> {
@@ -290,10 +349,12 @@ function selectModelVariant(
   currentModelValue: string | undefined,
   effort?: unknown,
 ): EffortVariant | undefined {
-  return variants.find((variant) => variant.effort === effort)
-    ?? variants.find((variant) => variant.model.value === currentModelValue)
-    ?? variants.find((variant) => variant.effort === 'medium')
-    ?? variants[0];
+  return (
+    variants.find((variant) => variant.effort === effort) ??
+    variants.find((variant) => variant.model.value === currentModelValue) ??
+    variants.find((variant) => variant.effort === 'medium') ??
+    variants[0]
+  );
 }
 
 function findConfigOption(options: readonly AcpConfigOption[], id: string): AcpConfigOption | undefined {
@@ -420,7 +481,12 @@ function inferModelFamily(id: string, name: string): string {
 
 function inferTokenLimits(id: string, name: string): TokenLimits {
   const combined = `${id} ${name}`.toLowerCase();
-  if (combined.includes('gemini') || combined.includes('argon') || combined.includes('neon')) {
+  if (
+    combined.includes('gemini') ||
+    combined.includes('argon') ||
+    combined.includes('neon') ||
+    combined.includes('hydrogen')
+  ) {
     return {
       maxInputTokens: 1_000_000,
       maxOutputTokens: 65_536,

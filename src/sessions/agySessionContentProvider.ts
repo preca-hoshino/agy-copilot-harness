@@ -206,7 +206,8 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
       throw createCancellationError();
     }
 
-    const converted = converter.finalizeHistory();
+    const loadedModelId = extractModelIdFromLoadResult(loadResult);
+    const converted = converter.finalizeHistory(loadedModelId);
 
     const loadedMode = extractModeFromLoadResult(loadResult);
     if (loadedMode !== undefined && loadedMode.length > 0) {
@@ -301,6 +302,22 @@ function extractModeFromLoadResult(result: AcpSessionLoadResult): string | undef
   }
 
   return undefined;
+}
+
+function extractModelIdFromLoadResult(result: AcpSessionLoadResult): string | undefined {
+  const modelFromModels = result.models?.currentModelId.trim();
+  const rawModelId =
+    modelFromModels !== undefined && modelFromModels.length > 0
+      ? modelFromModels
+      : findConfigOption(result.configOptions, 'model')?.currentValue.trim();
+
+  if (rawModelId === undefined || rawModelId.length === 0) {
+    return undefined;
+  }
+  if (rawModelId.startsWith('antigravity/') || rawModelId.startsWith('antigravity:')) {
+    return rawModelId;
+  }
+  return `antigravity/${rawModelId}`;
 }
 
 function findConfigOption(

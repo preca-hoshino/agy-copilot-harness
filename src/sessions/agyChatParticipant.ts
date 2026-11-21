@@ -1,9 +1,15 @@
 import * as crypto from 'node:crypto';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import type { AcpContentBlock, AcpRequestPermissionParams } from '../acp/acpTypes.js';
+import type {
+  AcpContentBlock,
+  AcpRequestPermissionParams,
+  AcpSessionPromptResult,
+  AcpSessionUpdate,
+  AcpToolCallUpdatePayload,
+} from '../acp/acpTypes.js';
 import type { AgyLanguageModelProvider } from '../models/agyLanguageModelProvider.js';
-import type { AcpBackendInterface, QuotaServiceInterface } from '../shared/contracts.js';
+import type { AcpBackendInterface, PermissionPrompt, QuotaServiceInterface } from '../shared/contracts.js';
 import { ActiveAgyTurn } from './activeAgyTurn.js';
 import type { AgySessionController } from './agySessionController.js';
 import { extractSessionIdFromUri } from './agySessionController.js';
@@ -57,6 +63,246 @@ const IMAGE_MIME_BY_EXT: Readonly<Record<string, string>> = {
 const MAX_TITLE_LENGTH = 60;
 const LIVE_UPDATE_QUIET_MS = 250;
 const LIVE_UPDATE_MAX_DRAIN_MS = 10_000;
+const MAX_HANDOFF_BUFFER = 500;
+const YIELD_PERMISSION_DELEGATE_TIMEOUT_MS = 500;
+const YIELD_POLL_INTERVAL_MS = 100;
+const CANCELLING_RETRY_DELAYS_MS: readonly number[] = [100, 200, 350, 500, 750, 1000, 1000, 1500, 2000, 2500];
+
+type TurnPhase = 'prompt' | 'idle-wait' | 'draining' | 'yielded' | 'finished';
+
+interface SupersededTurnHandoff {
+  readonly bufferedUpdates: readonly AcpSessionUpdate[];
+  readonly toolCalls: ReadonlyMap<string, AcpToolCallUpdatePayload>;
+}
+
+class RunningTurnState {
+  public readonly idleWaitCts = new vscode.CancellationTokenSource();
+  public readonly settled: PromiseWithResolvers<void> = Promise.withResolvers<void>();
+
+  private readonly stateChanged = new vscode.EventEmitter<void>();
+  private readonly handoffBuffer: AcpSessionUpdate[] = [];
+  private readonly yieldedPermissionResolvers: Array<(delegate: PermissionPrompt | undefined) => void> = [];
+
+  private phase: TurnPhase = 'prompt';
+  private superseded = false;
+  private pendingPermissions = 0;
+  private needsInput = false;
+  private disconnected: Error | undefined;
+  private detachHandlers: (() => void) | undefined;
+  private stateDisposed = false;
+
+  public constructor(
+    public readonly sessionId: string,
+    public readonly turn: ActiveAgyTurn,
+    public readonly liveAdapter: LiveStreamAdapter,
+  ) {}
+
+  public isTurnSuperseded(): boolean {
+    return this.superseded;
+  }
+
+  public isTurnCancelling(): boolean {
+    return this.turn.stopToken.isCancellationRequested;
+  }
+
+  public isTurnYielded(): boolean {
+    return this.phase === 'yielded';
+  }
+
+  public isTurnFinished(): boolean {
+    return this.phase === 'finished';
+  }
+
+  public hasTurnNeedsInput(): boolean {
+    return this.needsInput;
+  }
+
+  public getDisconnectError(): Error | undefined {
+    return this.disconnected;
+  }
+
+  public setPhase(next: TurnPhase): void {
+    if (this.phase !== 'finished' && !this.superseded) {
+      this.phase = next;
+    }
+  }
+
+  public incrementPermissions(): void {
+    this.pendingPermissions += 1;
+    this.notifyStateChanged();
+  }
+
+  public decrementPermissions(): number {
+    this.pendingPermissions = Math.max(0, this.pendingPermissions - 1);
+    this.notifyStateChanged();
+    return this.pendingPermissions;
+  }
+
+  public markNeedsInput(): void {
+    this.needsInput = true;
+    this.notifyStateChanged();
+  }
+
+  public markDisconnected(error: Error): void {
+    this.disconnected = error;
+    this.notifyStateChanged();
+  }
+
+  public bufferUpdate(update: AcpSessionUpdate): void {
+    if (this.handoffBuffer.length >= MAX_HANDOFF_BUFFER) {
+      this.handoffBuffer.shift();
+    }
+    this.handoffBuffer.push(update);
+  }
+
+  public setDetachHandlers(detach: () => void): void {
+    this.detachHandlers = detach;
+  }
+
+  public canBeSuperseded(): boolean {
+    return (
+      !this.superseded &&
+      !this.isTurnCancelling() &&
+      this.pendingPermissions === 0 &&
+      !this.needsInput &&
+      this.phase !== 'finished'
+    );
+  }
+
+  public notifyStateChanged(): void {
+    if (!this.stateDisposed) {
+      this.stateChanged.fire();
+    }
+  }
+
+  public async waitUntilSteerableOrSettled(token: vscode.CancellationToken): Promise<void> {
+    if (this.phase === 'finished' || this.superseded || this.canBeSuperseded()) {
+      return;
+    }
+    if (isTokenCancelled(token)) {
+      throw createCancellationError();
+    }
+    let stateSub: vscode.Disposable | undefined;
+    let cancelSub: vscode.Disposable | undefined;
+    try {
+      await Promise.race([
+        this.settled.promise,
+        new Promise<void>((resolve) => {
+          stateSub = this.stateChanged.event(() => {
+            if (this.phase === 'finished' || this.superseded || this.canBeSuperseded()) {
+              resolve();
+            }
+          });
+        }),
+        ...(typeof token.onCancellationRequested === 'function'
+          ? [
+              new Promise<never>((_, reject) => {
+                cancelSub = token.onCancellationRequested(() => {
+                  reject(createCancellationError());
+                });
+              }),
+            ]
+          : []),
+      ]);
+    } finally {
+      stateSub?.dispose();
+      cancelSub?.dispose();
+    }
+  }
+
+  public yieldToSteering(detachCancelSubscription: () => void): void {
+    if (this.phase === 'finished' || this.phase === 'yielded' || this.superseded) {
+      return;
+    }
+    this.phase = 'yielded';
+    detachCancelSubscription();
+    if (!this.idleWaitCts.token.isCancellationRequested) {
+      this.idleWaitCts.cancel();
+    }
+    this.liveAdapter.flush({ preserveBrowserSession: true });
+    this.notifyStateChanged();
+  }
+
+  public async waitForSuccessorPermission(timeoutMs: number): Promise<PermissionPrompt | undefined> {
+    if (this.phase !== 'yielded' || this.superseded) {
+      return undefined;
+    }
+    return await new Promise<PermissionPrompt | undefined>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (delegate: PermissionPrompt | undefined): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+        const idx = this.yieldedPermissionResolvers.indexOf(finish);
+        if (idx !== -1) {
+          this.yieldedPermissionResolvers.splice(idx, 1);
+        }
+        resolve(delegate);
+      };
+      this.yieldedPermissionResolvers.push(finish);
+      timer = setTimeout(() => {
+        finish(undefined);
+      }, timeoutMs);
+    });
+  }
+
+  public supersede(delegatePermission?: PermissionPrompt): SupersededTurnHandoff {
+    this.superseded = true;
+    this.phase = 'finished';
+    this.resolveYieldedPermissions(delegatePermission);
+    this.runDetachHandlers();
+    if (!this.idleWaitCts.token.isCancellationRequested) {
+      this.idleWaitCts.cancel();
+    }
+    this.idleWaitCts.dispose();
+    this.liveAdapter.flush({ preserveBrowserSession: true });
+    this.turn.finish();
+    this.notifyStateChanged();
+    this.disposeStateChanged();
+    return {
+      bufferedUpdates: [...this.handoffBuffer],
+      toolCalls: this.liveAdapter.getToolCallsSnapshot(),
+    };
+  }
+
+  public finalize(): void {
+    this.phase = 'finished';
+    this.resolveYieldedPermissions(undefined);
+    this.runDetachHandlers();
+    if (!this.idleWaitCts.token.isCancellationRequested) {
+      this.idleWaitCts.cancel();
+    }
+    this.idleWaitCts.dispose();
+    this.notifyStateChanged();
+    this.disposeStateChanged();
+    this.settled.resolve();
+  }
+
+  private resolveYieldedPermissions(delegate: PermissionPrompt | undefined): void {
+    const resolvers = this.yieldedPermissionResolvers.splice(0);
+    for (const resolve of resolvers) {
+      resolve(delegate);
+    }
+  }
+
+  private runDetachHandlers(): void {
+    const detach = this.detachHandlers;
+    this.detachHandlers = undefined;
+    detach?.();
+  }
+
+  private disposeStateChanged(): void {
+    if (!this.stateDisposed) {
+      this.stateDisposed = true;
+      this.stateChanged.dispose();
+    }
+  }
+}
 
 export interface ActiveAgySession {
   readonly history: vscode.ChatSession['history'];
@@ -75,6 +321,9 @@ export class AgyChatParticipant implements vscode.Disposable {
   private readonly syncedConfigs = new Map<string, SyncedSessionConfig>();
   private readonly activeDisposables = new Set<vscode.Disposable>();
   private readonly activeTurns = new Map<string, ActiveAgyTurn>();
+  private readonly runningTurns = new Map<string, RunningTurnState>();
+  private readonly pendingCreations = new Map<string, Promise<string>>();
+  private disposed = false;
 
   public constructor(
     backend: AcpBackendInterface,
@@ -112,6 +361,12 @@ export class AgyChatParticipant implements vscode.Disposable {
   }
 
   public dispose(): void {
+    this.disposed = true;
+    for (const running of this.runningTurns.values()) {
+      running.finalize();
+    }
+    this.runningTurns.clear();
+    this.pendingCreations.clear();
     for (const turn of this.activeTurns.values()) {
       turn.finish();
     }
@@ -123,12 +378,20 @@ export class AgyChatParticipant implements vscode.Disposable {
     this.syncedConfigs.clear();
   }
 
+  private isDisposed(): boolean {
+    return this.disposed;
+  }
+
   private async handleRequest(
     request: vscode.ChatRequest,
     context: vscode.ChatContext,
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken,
   ): Promise<vscode.ChatResult> {
+    if (this.isDisposed()) {
+      return {};
+    }
+
     const sessionItem = context.chatSessionContext?.chatSessionItem;
     const rawSessionId =
       sessionItem !== undefined ? extractSessionIdFromUri(sessionItem.resource) : `untitled-${crypto.randomUUID()}`;
@@ -139,11 +402,6 @@ export class AgyChatParticipant implements vscode.Disposable {
 
     let sessionId = this.controller.resolveSessionId(rawSessionId);
 
-    const existingTurnMessage = { errorDetails: { message: 'Antigravity is still running a request in this session.' } };
-    if (this.activeTurns.has(sessionId)) {
-      return existingTurnMessage;
-    }
-
     let activeTurn: ActiveAgyTurn | undefined;
     let releaseSession: (() => void) | undefined;
     try {
@@ -153,19 +411,36 @@ export class AgyChatParticipant implements vscode.Disposable {
       }
 
       if (this.controller.isNewSession(rawSessionId)) {
-        const created = await this.backend.newSession(cwd);
-        sessionId = created.sessionId;
-        this.controller.markSessionRealized(rawSessionId, sessionId);
-
-        const derivedTitle = deriveSessionTitle(request.prompt);
-        this.controller.updateSessionMetadata(sessionId, {
-          ...(derivedTitle !== undefined ? { title: derivedTitle } : {}),
-        });
+        sessionId = await this.realizeNewSession(rawSessionId, cwd, request.prompt);
       }
 
-      releaseSession = await acquireSessionOperation(this.backend, sessionId, token);
-      if (this.activeTurns.has(sessionId)) {
-        return existingTurnMessage;
+      const contentBlocks = await buildPromptBlocks(request, this.outputChannel);
+      if (isTokenCancelled(token)) {
+        if (!this.runningTurns.has(sessionId)) {
+          this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
+        }
+        return {};
+      }
+
+      let predecessor: RunningTurnState | undefined;
+      for (;;) {
+        if (this.isDisposed() || isTokenCancelled(token)) {
+          return {};
+        }
+        const existing = this.runningTurns.get(sessionId);
+        if (existing !== undefined && !existing.canBeSuperseded()) {
+          await existing.waitUntilSteerableOrSettled(token);
+          continue;
+        }
+        releaseSession = await acquireSessionOperation(this.backend, sessionId, token);
+        const current = this.runningTurns.get(sessionId);
+        if (current !== undefined && !current.canBeSuperseded()) {
+          releaseSession();
+          releaseSession = undefined;
+          continue;
+        }
+        predecessor = current;
+        break;
       }
 
       const effectiveMode = request.command === 'plan' ? 'plan' : this.controller.getSessionMode(sessionId);
@@ -198,13 +473,10 @@ export class AgyChatParticipant implements vscode.Disposable {
         mode: this.controller.getSessionMode(sessionId),
       });
 
-      const contentBlocks = await buildPromptBlocks(request, this.outputChannel);
-
-      if (this.activeTurns.has(sessionId)) {
-        return existingTurnMessage;
-      }
-      if (isTokenCancelled(token)) {
-        this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
+      if (this.isDisposed() || isTokenCancelled(token)) {
+        if (!this.runningTurns.has(sessionId)) {
+          this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
+        }
         return {};
       }
 
@@ -216,16 +488,8 @@ export class AgyChatParticipant implements vscode.Disposable {
           );
         });
       });
-      activeTurn = turn;
-      this.activeTurns.set(sessionId, turn);
-      // Once published, a history provider can reattach instead of replaying. Release
-      // the preparation lock so callers already queued behind it can do that too.
-      releaseSession();
-      releaseSession = undefined;
-      this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.InProgress);
 
-      const turnState: { needsInput: boolean; disconnected?: Error } = { needsInput: false };
-      const getDisconnectError = (): Error | undefined => turnState.disconnected;
+      let runningRef: RunningTurnState | undefined;
       const liveAdapter = new LiveStreamAdapter(
         this.browserRenderer,
         sessionId,
@@ -234,24 +498,116 @@ export class AgyChatParticipant implements vscode.Disposable {
           this.controller.recordFileChange(sessionId, change);
         },
         (reason: string): void => {
-          turnState.needsInput = true;
+          runningRef?.markNeedsInput();
           this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.NeedsInput);
           this.outputChannel.appendLine(`[AgyChatParticipant] Session ${sessionId} needs input: ${reason}`);
         },
         this.attachmentDir,
+        (usage): void => {
+          if (typeof usage.size === 'number' && Number.isFinite(usage.size) && usage.size > 0) {
+            this.lmProvider.recordContextWindow(selectedModelId ?? resolvedModel.modelValue, usage.size);
+          }
+        },
       );
+      const running = new RunningTurnState(sessionId, turn, liveAdapter);
+      runningRef = running;
 
       let resetDrainTimer: (() => void) | undefined;
       let rejectDrain: ((error: Error) => void) | undefined;
+      let yieldPollTimer: ReturnType<typeof setInterval> | undefined;
+      let promptDispatched = false;
+      const yielded = Promise.withResolvers<void>();
+
+      const stopYieldPolling = (): void => {
+        if (yieldPollTimer !== undefined) {
+          clearInterval(yieldPollTimer);
+          yieldPollTimer = undefined;
+        }
+      };
+
+      const permissionHandler: PermissionPrompt = async (permission): Promise<string | undefined> => {
+        if (running.isTurnSuperseded() || running.isTurnFinished()) {
+          return undefined;
+        }
+        if (running.isTurnYielded()) {
+          const delegate = await running.waitForSuccessorPermission(YIELD_PERMISSION_DELEGATE_TIMEOUT_MS);
+          if (delegate !== undefined) {
+            return await delegate(permission);
+          }
+          if (running.isTurnSuperseded() || running.isTurnFinished()) {
+            return undefined;
+          }
+        }
+        running.incrementPermissions();
+        this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.NeedsInput);
+        try {
+          return await askTurnPermission(turn, permission, request.toolInvocationToken, this.outputChannel);
+        } catch (error: unknown) {
+          this.outputChannel.appendLine(`[AgyChatParticipant] Permission prompt failed: ${formatError(error)}`);
+          return undefined;
+        } finally {
+          const remaining = running.decrementPermissions();
+          if (
+            remaining === 0 &&
+            !running.isTurnSuperseded() &&
+            !running.hasTurnNeedsInput() &&
+            !isTokenCancelled(turn.stopToken) &&
+            this.backend.isReady
+          ) {
+            this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.InProgress);
+          }
+          maybeYield();
+        }
+      };
+
+      let cancelSubscription: vscode.Disposable | undefined;
+      const maybeYield = (): void => {
+        if (
+          !promptDispatched ||
+          context.yieldRequested !== true ||
+          !running.canBeSuperseded() ||
+          running.getDisconnectError() !== undefined ||
+          !this.backend.isReady
+        ) {
+          return;
+        }
+        stopYieldPolling();
+        running.yieldToSteering(() => {
+          if (cancelSubscription !== undefined) {
+            cancelSubscription.dispose();
+            this.activeDisposables.delete(cancelSubscription);
+            cancelSubscription = undefined;
+          }
+        });
+        yielded.resolve();
+      };
+
+      const handoff =
+        predecessor !== undefined && !predecessor.isTurnFinished()
+          ? predecessor.supersede(permissionHandler)
+          : undefined;
+      if (handoff !== undefined) {
+        liveAdapter.seedToolCalls(handoff.toolCalls);
+      }
+
+      activeTurn = turn;
+      this.activeTurns.set(sessionId, turn);
+      this.runningTurns.set(sessionId, running);
+      // Once published, a history provider can reattach instead of replaying. Release
+      // the preparation lock so callers already queued behind it can do that too.
+      releaseSession();
+      releaseSession = undefined;
+      this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.InProgress);
+
       const backendSubscription = this.backend.onDidChangeBackendState((event) => {
         if (!event.ready) {
           const error = new Error('ACP backend disconnected while running the conversation.');
-          turnState.disconnected = error;
+          running.markDisconnected(error);
           rejectDrain?.(error);
         }
       });
       const updateSubscription = this.backend.onDidChangeUpdate((event) => {
-        if (event.sessionId !== sessionId || turnState.disconnected !== undefined) {
+        if (event.sessionId !== sessionId || running.getDisconnectError() !== undefined || running.isTurnSuperseded()) {
           return;
         }
         resetDrainTimer?.();
@@ -263,30 +619,15 @@ export class AgyChatParticipant implements vscode.Disposable {
           this.controller.setSessionMode(sessionId, event.update.currentModeId);
           this.setSessionModeHook?.(sessionId, event.update.currentModeId);
         }
-        liveAdapter.handleUpdate(event.update);
+        if (running.isTurnYielded()) {
+          running.bufferUpdate(event.update);
+        } else {
+          liveAdapter.handleUpdate(event.update);
+        }
+        maybeYield();
       });
 
-      let pendingPermissions = 0;
-      const permissionSubscription = this.backend.registerPermissionPrompt?.(sessionId, async (permission) => {
-        pendingPermissions++;
-        this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.NeedsInput);
-        try {
-          return await askTurnPermission(turn, permission);
-        } catch (error: unknown) {
-          this.outputChannel.appendLine(`[AgyChatParticipant] Permission prompt failed: ${formatError(error)}`);
-          return undefined;
-        } finally {
-          pendingPermissions--;
-          if (
-            pendingPermissions === 0 &&
-            !turnState.needsInput &&
-            !isTokenCancelled(turn.stopToken) &&
-            this.backend.isReady
-          ) {
-            this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.InProgress);
-          }
-        }
-      });
+      const permissionSubscription = this.backend.registerPermissionPrompt?.(sessionId, permissionHandler);
 
       const fileWriteSubscription = this.backend.registerFileWriteHandler?.(sessionId, async (uri, write) => {
         await turn.externalEdit(uri, write, () => {
@@ -294,103 +635,233 @@ export class AgyChatParticipant implements vscode.Disposable {
         });
       });
 
-      const cancelSubscription = token.onCancellationRequested(() => {
+      cancelSubscription = token.onCancellationRequested(() => {
         turn.stopRequestStream(stream);
       });
+      const stopSubscription = turn.stopToken.onCancellationRequested(() => {
+        if (!running.idleWaitCts.token.isCancellationRequested) {
+          running.idleWaitCts.cancel();
+        }
+        running.notifyStateChanged();
+      });
 
-      this.activeDisposables.add(backendSubscription);
-      this.activeDisposables.add(updateSubscription);
-      this.activeDisposables.add(cancelSubscription);
+      const turnDisposables: vscode.Disposable[] = [
+        backendSubscription,
+        updateSubscription,
+        cancelSubscription,
+        stopSubscription,
+      ];
       if (permissionSubscription !== undefined) {
-        this.activeDisposables.add(permissionSubscription);
+        turnDisposables.push(permissionSubscription);
       }
       if (fileWriteSubscription !== undefined) {
-        this.activeDisposables.add(fileWriteSubscription);
+        turnDisposables.push(fileWriteSubscription);
+      }
+      for (const disposable of turnDisposables) {
+        this.activeDisposables.add(disposable);
       }
 
-      try {
-        const promptResult = await this.backend.prompt(sessionId, contentBlocks, turn.stopToken);
-        if (!turn.stopToken.isCancellationRequested && promptResult.stopReason !== 'cancelled') {
-          const promptDisconnect = getDisconnectError();
-          if (promptDisconnect !== undefined) {
-            throw promptDisconnect;
-          }
-          await this.backend.waitForConversationFullyIdle(sessionId, turn.stopToken);
-          const idleDisconnect = getDisconnectError();
-          if (idleDisconnect !== undefined) {
-            throw idleDisconnect;
-          }
-          await new Promise<void>((resolve, reject) => {
-            let quietTimer: ReturnType<typeof setTimeout> | undefined;
-            const cleanup = (): void => {
-              clearTimeout(quietTimer);
-              clearTimeout(maximumTimer);
-              cancellation?.dispose();
-              resetDrainTimer = undefined;
-              rejectDrain = undefined;
-            };
-            const finish = (): void => {
-              cleanup();
-              resolve();
-            };
-            const fail = (error: Error): void => {
-              cleanup();
-              reject(error);
-            };
-            const maximumTimer = setTimeout(() => {
-              fail(new Error('Timed out draining conversation updates after the backend became idle.'));
-            }, LIVE_UPDATE_MAX_DRAIN_MS);
-            let cancellation: vscode.Disposable | undefined;
-            rejectDrain = fail;
-            cancellation = turn.stopToken.onCancellationRequested(() => {
-              fail(new vscode.CancellationError());
-            });
-            resetDrainTimer = (): void => {
-              clearTimeout(quietTimer);
-              quietTimer = setTimeout(finish, LIVE_UPDATE_QUIET_MS);
-            };
-            if (turn.stopToken.isCancellationRequested) {
-              fail(new vscode.CancellationError());
-            } else {
-              resetDrainTimer();
-            }
-          });
-          const drainDisconnect = getDisconnectError();
-          if (drainDisconnect !== undefined || !this.backend.isReady) {
-            throw drainDisconnect ?? new Error('ACP backend disconnected while draining conversation updates.');
-          }
+      let handlersDetached = false;
+      const detachHandlers = (): void => {
+        if (handlersDetached) {
+          return;
         }
-        if (!turnState.needsInput || turn.stopToken.isCancellationRequested) {
-          this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
+        handlersDetached = true;
+        stopYieldPolling();
+        for (const disposable of turnDisposables) {
+          disposable.dispose();
+          this.activeDisposables.delete(disposable);
         }
+      };
+      running.setDetachHandlers(detachHandlers);
 
-        const metadata: Record<string, unknown> = {
-          sessionId,
-          ...(promptResult.stopReason !== undefined ? { stopReason: promptResult.stopReason } : {}),
-        };
-        return { metadata };
-      } finally {
+      if (handoff !== undefined) {
+        for (const bufferedUpdate of handoff.bufferedUpdates) {
+          liveAdapter.handleUpdate(bufferedUpdate);
+        }
+      }
+
+      if ('yieldRequested' in context) {
+        yieldPollTimer = setInterval(maybeYield, YIELD_POLL_INTERVAL_MS);
+      }
+
+      const runTurnLifecycle = async (): Promise<vscode.ChatResult> => {
         try {
-          liveAdapter.flush();
+          const promptResult = await this.sendPromptWithTransientRetry(sessionId, contentBlocks, running, () => {
+            promptDispatched = true;
+          });
+          if (running.isTurnSuperseded()) {
+            return { metadata: { sessionId, superseded: true } };
+          }
+          if (
+            !turn.stopToken.isCancellationRequested &&
+            promptResult.stopReason !== 'cancelled' &&
+            !running.isTurnYielded()
+          ) {
+            const promptDisconnect = running.getDisconnectError();
+            if (promptDisconnect !== undefined) {
+              throw promptDisconnect;
+            }
+            running.setPhase('idle-wait');
+            await this.backend.waitForConversationFullyIdle(sessionId, running.idleWaitCts.token);
+            if (running.isTurnSuperseded()) {
+              return { metadata: { sessionId, superseded: true } };
+            }
+            const idleDisconnect = running.getDisconnectError();
+            if (idleDisconnect !== undefined) {
+              throw idleDisconnect;
+            }
+            if (!running.isTurnYielded()) {
+              running.setPhase('draining');
+              await new Promise<void>((resolve, reject) => {
+                let quietTimer: ReturnType<typeof setTimeout> | undefined;
+                let cancellation: vscode.Disposable | undefined;
+                const cleanup = (): void => {
+                  clearTimeout(quietTimer);
+                  clearTimeout(maximumTimer);
+                  cancellation?.dispose();
+                  resetDrainTimer = undefined;
+                  rejectDrain = undefined;
+                };
+                const finish = (): void => {
+                  cleanup();
+                  resolve();
+                };
+                const fail = (error: Error): void => {
+                  cleanup();
+                  reject(error);
+                };
+                const maximumTimer = setTimeout(() => {
+                  fail(new Error('Timed out draining conversation updates after the backend became idle.'));
+                }, LIVE_UPDATE_MAX_DRAIN_MS);
+                rejectDrain = fail;
+                cancellation = running.idleWaitCts.token.onCancellationRequested(() => {
+                  fail(createCancellationError());
+                });
+                resetDrainTimer = (): void => {
+                  clearTimeout(quietTimer);
+                  quietTimer = setTimeout(finish, LIVE_UPDATE_QUIET_MS);
+                };
+                if (running.idleWaitCts.token.isCancellationRequested) {
+                  fail(createCancellationError());
+                } else {
+                  resetDrainTimer();
+                }
+              });
+              if (running.isTurnSuperseded()) {
+                return { metadata: { sessionId, superseded: true } };
+              }
+              const drainDisconnect = running.getDisconnectError();
+              if (drainDisconnect !== undefined || !this.backend.isReady) {
+                throw drainDisconnect ?? new Error('ACP backend disconnected while draining conversation updates.');
+              }
+            }
+          }
+          if (!running.isTurnSuperseded() && (!running.hasTurnNeedsInput() || turn.stopToken.isCancellationRequested)) {
+            this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
+          }
+
+          const metadata: Record<string, unknown> = {
+            sessionId,
+            ...(promptResult.stopReason !== undefined ? { stopReason: promptResult.stopReason } : {}),
+          };
+          return { metadata };
+        } catch (error: unknown) {
+          if (running.isTurnSuperseded()) {
+            return { metadata: { sessionId, superseded: true } };
+          }
+          if (
+            running.isTurnYielded() &&
+            running.idleWaitCts.token.isCancellationRequested &&
+            !turn.stopToken.isCancellationRequested &&
+            running.getDisconnectError() === undefined
+          ) {
+            const currentOwner = this.runningTurns.get(sessionId);
+            if (currentOwner === undefined || currentOwner === running) {
+              this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
+            }
+            return { metadata: { sessionId, yielded: true } };
+          }
+          if (turn.stopToken.isCancellationRequested && !isAuthenticationRequiredError(error)) {
+            this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
+            return {};
+          }
+
+          const errorMessage = formatError(error);
+          this.outputChannel.appendLine(`[AgyChatParticipant] Turn failed for session ${sessionId}: ${errorMessage}`);
+          this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Failed);
+
+          if (isAuthenticationRequiredError(error)) {
+            turn.push(
+              new vscode.ChatResponseMarkdownPart(
+                'Antigravity authentication is required. Please sign in with your Google account to continue.\n\n',
+              ),
+            );
+            turn.push(
+              new vscode.ChatResponseCommandButtonPart({
+                title: 'Sign In with Google',
+                command: 'antigravityHarness.signIn',
+              }),
+            );
+          }
+
+          return {
+            errorDetails: {
+              message: errorMessage,
+            },
+          };
         } finally {
-          backendSubscription.dispose();
-          updateSubscription.dispose();
-          cancelSubscription.dispose();
-          if (permissionSubscription !== undefined) {
-            permissionSubscription.dispose();
-            this.activeDisposables.delete(permissionSubscription);
+          stopYieldPolling();
+          const superseded = running.isTurnSuperseded();
+          if (!superseded) {
+            try {
+              liveAdapter.flush();
+            } finally {
+              turn.finish();
+              if (this.activeTurns.get(sessionId) === turn) {
+                this.activeTurns.delete(sessionId);
+              }
+              if (this.runningTurns.get(sessionId) === running) {
+                this.runningTurns.delete(sessionId);
+              }
+              running.finalize();
+            }
+            try {
+              await this.quotaService.refresh(true);
+            } catch (refreshError: unknown) {
+              this.outputChannel.appendLine(
+                `[AgyChatParticipant] Quota refresh failed after turn: ${formatError(refreshError)}`,
+              );
+            }
+          } else {
+            if (this.activeTurns.get(sessionId) === turn) {
+              this.activeTurns.delete(sessionId);
+            }
+            if (this.runningTurns.get(sessionId) === running) {
+              this.runningTurns.delete(sessionId);
+            }
+            running.settled.resolve();
           }
-          if (fileWriteSubscription !== undefined) {
-            fileWriteSubscription.dispose();
-            this.activeDisposables.delete(fileWriteSubscription);
-          }
-          this.activeDisposables.delete(backendSubscription);
-          this.activeDisposables.delete(updateSubscription);
-          this.activeDisposables.delete(cancelSubscription);
         }
+      };
+
+      const lifecyclePromise = runTurnLifecycle();
+      void lifecyclePromise.catch(() => {
+        /* errors are converted to ChatResult inside runTurnLifecycle */
+      });
+      const outcome = await Promise.race([
+        lifecyclePromise.then((result) => ({ kind: 'done' as const, result })),
+        yielded.promise.then(() => ({ kind: 'yielded' as const })),
+      ]);
+      if (outcome.kind === 'yielded') {
+        return { metadata: { sessionId, yielded: true } };
       }
+      return outcome.result;
     } catch (error: unknown) {
-      if ((activeTurn?.stopToken.isCancellationRequested ?? isTokenCancelled(token)) && !isAuthenticationRequiredError(error)) {
+      if (
+        (activeTurn?.stopToken.isCancellationRequested ?? isTokenCancelled(token)) &&
+        !isAuthenticationRequiredError(error)
+      ) {
         if (activeTurn !== undefined) {
           this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
         }
@@ -399,7 +870,9 @@ export class AgyChatParticipant implements vscode.Disposable {
 
       const errorMessage = formatError(error);
       this.outputChannel.appendLine(`[AgyChatParticipant] Turn failed for session ${sessionId}: ${errorMessage}`);
-      this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Failed);
+      if (activeTurn !== undefined || !this.runningTurns.has(sessionId)) {
+        this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Failed);
+      }
 
       if (isAuthenticationRequiredError(error)) {
         const response = activeTurn ?? stream;
@@ -422,19 +895,61 @@ export class AgyChatParticipant implements vscode.Disposable {
         },
       };
     } finally {
-      if (activeTurn !== undefined) {
-        activeTurn.finish();
-        if (this.activeTurns.get(sessionId) === activeTurn) {
-          this.activeTurns.delete(sessionId);
-        }
-      }
       releaseSession?.();
+    }
+  }
+
+  private async realizeNewSession(rawSessionId: string, cwd: string, promptText: string): Promise<string> {
+    const existingCreation = this.pendingCreations.get(rawSessionId);
+    if (existingCreation !== undefined) {
+      return await existingCreation;
+    }
+    const creation = (async (): Promise<string> => {
+      const created = await this.backend.newSession(cwd);
+      const newSessionId = created.sessionId;
+      this.controller.markSessionRealized(rawSessionId, newSessionId);
+
+      const derivedTitle = deriveSessionTitle(promptText);
+      this.controller.updateSessionMetadata(newSessionId, {
+        ...(derivedTitle !== undefined ? { title: derivedTitle } : {}),
+      });
+      return newSessionId;
+    })();
+    this.pendingCreations.set(rawSessionId, creation);
+    try {
+      return await creation;
+    } finally {
+      if (this.pendingCreations.get(rawSessionId) === creation) {
+        this.pendingCreations.delete(rawSessionId);
+      }
+    }
+  }
+
+  private async sendPromptWithTransientRetry(
+    sessionId: string,
+    contentBlocks: AcpContentBlock[],
+    running: RunningTurnState,
+    onDispatched: () => void,
+  ): Promise<AcpSessionPromptResult> {
+    for (let attempt = 0; ; attempt += 1) {
+      onDispatched();
       try {
-        await this.quotaService.refresh(true);
-      } catch (refreshError: unknown) {
+        return await this.backend.prompt(sessionId, contentBlocks, running.turn.stopToken);
+      } catch (error: unknown) {
+        const retryDelayMs = CANCELLING_RETRY_DELAYS_MS[attempt];
+        if (
+          retryDelayMs === undefined ||
+          !isCancellingPromptRetryableError(error) ||
+          running.isTurnSuperseded() ||
+          running.turn.stopToken.isCancellationRequested ||
+          !this.backend.isReady
+        ) {
+          throw error;
+        }
         this.outputChannel.appendLine(
-          `[AgyChatParticipant] Quota refresh failed after turn: ${formatError(refreshError)}`,
+          `[AgyChatParticipant] Backend still cancelling previous prompt for session ${sessionId}; retrying in ${retryDelayMs}ms`,
         );
+        await waitWithCancellation(retryDelayMs, running.turn.stopToken);
       }
     }
   }
@@ -495,21 +1010,18 @@ function createRequestTurn(request: vscode.ChatRequest): vscode.ChatRequestTurn 
   );
 }
 
-async function askTurnPermission(turn: ActiveAgyTurn, permission: AcpRequestPermissionParams): Promise<string | undefined> {
+async function askTurnPermission(
+  turn: ActiveAgyTurn,
+  permission: AcpRequestPermissionParams,
+  toolInvocationToken: unknown,
+  outputChannel: vscode.OutputChannel,
+): Promise<string | undefined> {
   const tool = permission.toolCall;
   const fields = tool.rawInput ?? {};
   const command = fields.CommandLine ?? fields.commandLine ?? fields.command ?? fields.cmd ?? fields.script;
   const cwd = fields.Cwd ?? fields.cwd ?? fields.WorkingDirectory;
-  const isTerminal = tool.kind === 'execute' || /^(run_command|execute_command|bash|sh|pwsh|powershell|terminal)$/.test(tool.name ?? '');
-  const requestId = crypto.randomUUID();
-  const id = isTerminal && typeof command === 'string' && command.trim().length > 0
-    ? `agy-terminal:${JSON.stringify({
-        requestId,
-        command,
-        cwd: typeof cwd === 'string' ? cwd : undefined,
-        options: permission.options.map(({ optionId, kind }) => ({ optionId, kind })),
-      })}`
-    : requestId;
+  const isTerminal =
+    tool.kind === 'execute' || /^(run_command|execute_command|bash|sh|pwsh|powershell|terminal)$/.test(tool.name ?? '');
   const title = tool.title ?? tool.name ?? tool.toolCallId;
   const message = new vscode.MarkdownString();
   if (typeof command === 'string') {
@@ -521,17 +1033,88 @@ async function askTurnPermission(turn: ActiveAgyTurn, permission: AcpRequestPerm
     message.appendText(`\nWorking directory: ${cwd}`);
   }
 
+  if (
+    toolInvocationToken !== undefined &&
+    typeof (vscode.lm as { invokeTool?: unknown } | undefined)?.invokeTool === 'function'
+  ) {
+    const isTerminalCommand = isTerminal && typeof command === 'string' && command.trim().length > 0;
+    const toolName = isTerminalCommand ? 'vscode_get_terminal_confirmation' : 'vscode_get_confirmation';
+    const explanation =
+      typeof cwd === 'string' && cwd.trim().length > 0
+        ? `Working directory: ${cwd}`
+        : title !== command
+          ? title
+          : 'Execute command in terminal';
+    const input = isTerminalCommand
+      ? {
+          command,
+          message: explanation,
+          explanation,
+          goal: title.length > 0 ? title : 'Run terminal command',
+          mode: 'sync',
+          isBackground: false,
+        }
+      : {
+          title: title.length > 0 ? title : 'Antigravity Permission Request',
+          message: message.value.trim().length > 0 ? message.value : title,
+          confirmationType: 'basic',
+        };
+
+    try {
+      const result = await vscode.lm.invokeTool(
+        toolName,
+        { input, toolInvocationToken: toolInvocationToken as vscode.ChatParticipantToolToken },
+        turn.stopToken,
+      );
+      const responseText = extractToolResultText(result.content);
+      return responseText?.trim().toLowerCase() === 'yes'
+        ? pickApproveOptionId(permission.options)
+        : pickRejectOptionId(permission.options);
+    } catch (error: unknown) {
+      if (turn.stopToken.isCancellationRequested) {
+        return undefined;
+      }
+      if (isToolUnavailableError(error)) {
+        outputChannel.appendLine(
+          `[AgyChatParticipant] Built-in confirmation tool "${toolName}" unavailable, falling back: ${formatError(error)}`,
+        );
+      } else if (isCancellationError(error)) {
+        return pickRejectOptionId(permission.options);
+      } else {
+        outputChannel.appendLine(`[AgyChatParticipant] Confirmation tool "${toolName}" failed: ${formatError(error)}`);
+        return pickRejectOptionId(permission.options);
+      }
+    }
+  }
+
+  const requestId = crypto.randomUUID();
+  const id =
+    isTerminal && typeof command === 'string' && command.trim().length > 0
+      ? `agy-terminal:${JSON.stringify({
+          requestId,
+          command,
+          cwd: typeof cwd === 'string' ? cwd : undefined,
+          options: permission.options.map(({ optionId, kind }) => ({ optionId, kind })),
+        })}`
+      : requestId;
+
   const stream = turn.permissionStream;
   if (typeof stream?.questionCarousel === 'function') {
     const answers = await Promise.race([
-      askInChat(stream, [{
-        id,
-        type: vscode.ChatQuestionType.SingleSelect,
-        title: 'Antigravity: Approve tool execution?',
-        message,
-        options: permission.options.map((option) => ({ id: option.optionId, label: option.name, value: option.optionId })),
-        defaultValue: permission.options.find((option) => option.kind === 'reject_once')?.optionId ?? '',
-      }]),
+      askInChat(stream, [
+        {
+          id,
+          type: vscode.ChatQuestionType.SingleSelect,
+          title: 'Antigravity: Approve tool execution?',
+          message,
+          options: permission.options.map((option) => ({
+            id: option.optionId,
+            label: option.name,
+            value: option.optionId,
+          })),
+          defaultValue: permission.options.find((option) => option.kind === 'reject_once')?.optionId ?? '',
+        },
+      ]),
       turn.onViewSwitched.then(() => undefined),
     ]);
     if (answers !== undefined && turn.permissionStream === stream) {
@@ -544,16 +1127,58 @@ async function askTurnPermission(turn: ActiveAgyTurn, permission: AcpRequestPerm
     return undefined;
   }
   // Restored chat streams cannot answer the original request's carousel; require a fresh, explicit choice.
-  const picked = await vscode.window.showQuickPick(permission.options.map((option) => ({
-    label: option.name,
-    description: option.kind,
-    detail: typeof command === 'string' ? command : title,
-    optionId: option.optionId,
-  })), {
-    placeHolder: `Antigravity permission request: ${title}`,
-    ignoreFocusOut: true,
-  }, turn.stopToken);
+  const picked = await vscode.window.showQuickPick(
+    permission.options.map((option) => ({
+      label: option.name,
+      description: option.kind,
+      detail: typeof command === 'string' ? command : title,
+      optionId: option.optionId,
+    })),
+    {
+      placeHolder: `Antigravity permission request: ${title}`,
+      ignoreFocusOut: true,
+    },
+    turn.stopToken,
+  );
   return isTokenCancelled(turn.stopToken) ? undefined : picked?.optionId;
+}
+
+function pickApproveOptionId(options: readonly AcpRequestPermissionParams['options'][number][]): string | undefined {
+  return (
+    options.find((option) => option.kind === 'allow_once')?.optionId ??
+    options.find((option) => option.kind.startsWith('allow_'))?.optionId
+  );
+}
+
+function pickRejectOptionId(options: readonly AcpRequestPermissionParams['options'][number][]): string | undefined {
+  return (
+    options.find((option) => option.kind === 'reject_once')?.optionId ??
+    options.find((option) => option.kind.startsWith('reject_'))?.optionId
+  );
+}
+
+function extractToolResultText(content: readonly unknown[]): string | undefined {
+  for (const part of content) {
+    if (part instanceof vscode.LanguageModelTextPart) {
+      return part.value;
+    }
+    if (isRecordObject(part) && typeof part.value === 'string') {
+      return part.value;
+    }
+  }
+  return undefined;
+}
+
+function isToolUnavailableError(error: unknown): boolean {
+  const message = formatError(error);
+  return /was not contributed|invalid tool|unknown tool|does not have an implementation/i.test(message);
+}
+
+function isCancellationError(error: unknown): boolean {
+  if (typeof vscode.CancellationError === 'function' && error instanceof vscode.CancellationError) {
+    return true;
+  }
+  return error instanceof Error && (error.name === 'Canceled' || error.message === 'Canceled');
 }
 
 async function askInChat(
@@ -873,6 +1498,49 @@ function extractObjectProperty(target: unknown, key: string): unknown {
 
 function isTokenCancelled(token: vscode.CancellationToken): boolean {
   return token.isCancellationRequested;
+}
+
+function createCancellationError(): Error {
+  if (typeof vscode.CancellationError === 'function') {
+    return new vscode.CancellationError();
+  }
+  const err = new Error('Canceled');
+  err.name = 'Canceled';
+  return err;
+}
+
+function isCancellingPromptRetryableError(error: unknown): boolean {
+  return /the running prompt is being cancelled/i.test(formatError(error));
+}
+
+async function waitWithCancellation(ms: number, token: vscode.CancellationToken): Promise<void> {
+  if (isTokenCancelled(token)) {
+    throw createCancellationError();
+  }
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let subscription: vscode.Disposable | undefined;
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      subscription?.dispose();
+    };
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        resolve();
+      }
+    }, ms);
+    if (typeof token.onCancellationRequested === 'function') {
+      subscription = token.onCancellationRequested(() => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          reject(createCancellationError());
+        }
+      });
+    }
+  });
 }
 
 function formatError(error: unknown): string {

@@ -29,6 +29,10 @@ const COMMON_ANCHORS = {
     'chat session URI type helper',
   ],
   terminalAnswer: ['this._proxy.$handleQuestionCarouselAnswer(', 'question carousel answer handler'],
+  sessionHistoryUsage: [
+    /return\{type:"response",parts:(?<turn>[$\w]+)\.parts\.map\((?<part>[$\w]+)=>(?<revive>[$\w]+)\(\k<part>\)\),participant:\k<turn>\.participant,details:\k<turn>\.details\}\}\)\)(?=,[$\w]+\.hasActiveResponseCallback)/g,
+    'ChatSessions._doInitializeContent history usage',
+  ],
 };
 
 const SESSIONS_ANCHORS = {
