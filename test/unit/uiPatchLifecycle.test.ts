@@ -7,8 +7,8 @@ import { dirname, join } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const require = createRequire(join(process.cwd(), 'package.json'));
-const { runApply }: { runApply: (root: string) => void } = require('./scripts/ui-patch/lifecycle.js');
+const requireFromProject = createRequire(join(process.cwd(), 'package.json'));
+const { runApply }: { runApply: (root: string) => void } = requireFromProject('./scripts/ui-patch/lifecycle.js');
 const cli = join(process.cwd(), 'scripts', 'patch-sessions-ui.js');
 const backgroundFooter = '/*ext-backgroundCover-start*/\n/*ext.backgroundCover.bootstrap.1*/\n;void 0;/*ext-backgroundCover-end*/';
 
@@ -20,8 +20,10 @@ function commonBundle() {
     'class SessionRenderer{renderHarness($row,$template){let $provider=$knownProvider($row.providerType),$icon=$provider?$providerIcon($provider):$row.icon;$template.harnessIcon.className=`agent-session-harness-icon ${$themeIcon.asClassName($icon)}`}}',
     'class ChatSessionsService{constructor(contributions){this._contributions=contributions}supportsDelegationForSessionType($type){return this._contributions.get($type)?.contribution?.supportsDelegation!==!1}}',
     'function external(e){let n={id:e.toolName,source:$source.External,displayName:e.toolName,modelDescription:e.toolName},r=new $invocation({invocationMessage:e.invocationMessage,pastTenseMessage:e.pastTenseMessage,toolSpecificData:e.toolSpecificData},n);return r}',
-    'class Agent{answer(e){this._proxy.$handleQuestionCarouselAnswer(e)}async $handleProgressChunk(e,t){let i=this._pendingProgress.get(e);let{progress:n,chatSession:r,isSubagent:a}=i,c=[],l=r?.getRequests().find(u=>u.id===e)?.response;for(let u of t){let[p,h]=Array.isArray(u)?u:[u];if(p.kind==="externalEdits")continue;c.push(p)}n(c)}}',
-    'class RemoteSession{async _doInitializeContent(e,t){let i=await this._proxy.$provideChatSessionContent();this.history.length=0;this.history.push(...i.history.map(c=>{if(c.type==="request")return c;return{type:"response",parts:c.parts.map(l=>$revive(l)),participant:c.participant,details:c.details}})),i.hasActiveResponseCallback&&void 0}}',
+    'class Agent{answer(e){this._proxy.$handleQuestionCarouselAnswer(e)}async $handleProgressChunk(e,t){let i=this._pendingProgress.get(e);let{progress:n,chatSession:r,isSubagent:a}=i,c=[],l=r?.getRequests().find(u=>u.id===e)?.response;for(let u of t){let[p,h]=Array.isArray(u)?u:[u];if(p.kind==="externalEdits"){if(r?.editingSession&&h!==void 0&&l){let f=p.start?await r.editingSession.startExternalEdits(l,h,$revive(p.resources),p.undoStopId):await r.editingSession.stopExternalEdits(l,h);c.push(...f)}continue}c.push(p)}n(c)}}',
+    'class RemoteSession{async _doInitializeContent(e,t){let i=await this._proxy.$provideChatSessionContent();this.history.length=0;this.history.push(...i.history.map(c=>{if(c.type==="request")return c;return{type:"response",parts:c.parts.map(l=>$revive(l)),participant:c.participant,details:c.details}})),i.hasActiveResponseCallback&&void 0,i.hasForkHandler&&!this.forkSession&&(this.forkSession=async(c,l)=>{let u=await this._proxy.$forkChatSession(this._providerHandle,this.sessionResource,c?this.toRequestDto(c):void 0,l);return $revive(u)})}}',
+    'class EditingWidget{renderChatEditingSessionWithEntries(e,t,i,n){let C=i.read(e),k=n.read(e);return C.concat(k)}}',
+    'class ChatSvc{notifyUserAction(e){if(this._chatServiceTelemetry.notifyUserAction(e),this._onDidPerformUserAction.fire(e),e.action.kind==="chatEditingSessionAction"){let t=this._sessionModels.get(e.sessionResource);t&&t.notifyEditingAction(e.action)}}}',
   ].join('\r\n');
 }
 

@@ -6,6 +6,12 @@ import type { QuotaPoolSummary } from '../../src/shared/contracts.js';
 const requireFromProject = createRequire(`${process.cwd()}/package.json`);
 const { createTerminalApproval, extractHistoryUsageParts, renderQuotaGroups, renderQuotaRow } = requireFromProject('./scripts/patch-sessions-ui.js');
 const { buildSessionsPanelSnippet } = requireFromProject('./scripts/ui-patch/snippets/sessions-panel.js');
+const {
+  buildEditingActionNotifySnippet,
+  buildExternalEditBaselineSnippet,
+  buildSideChatSessionSnippet,
+  buildWorkingSetDedupSnippet,
+} = requireFromProject('./scripts/ui-patch/snippets/working-set.js');
 
 class FakeInvocation {
   public readonly confirm = vi.fn();
@@ -256,5 +262,108 @@ describe('Agents account quota panel', () => {
     const row = usage?.child(`${provider}metric-row secondary`);
     expect(row?.children.map((cell) => cell.textContent)).toEqual(['No quota pools reported yet.']);
     expect(setupDelayedHover).not.toHaveBeenCalled();
+  });
+});
+
+describe('working set, editing action, and side chat UI snippets', () => {
+  it('strips __agy_before and passes baseline snapshot URIs to startExternalEdits', async () => {
+    const snippet = buildExternalEditBaselineSnippet({
+      item: 'p',
+      session: 'r',
+      idx: 'h',
+      reqId: 'l',
+      revive: 'revive',
+      parts: 'c',
+    });
+    const startExternalEdits = vi.fn(async () => ['part-1']);
+    const stopExternalEdits = vi.fn(async () => ['stop-part']);
+
+    class FakeUri {
+      public constructor(public readonly path: string, public readonly query = '') {}
+      public static parse(raw: string): FakeUri {
+        return new FakeUri(raw, '');
+      }
+      public with(change: { query?: string }): FakeUri {
+        return new FakeUri(this.path, change.query ?? this.query);
+      }
+    }
+
+    const runner = runInNewContext(`(async function(p,r,h,l,c,revive){for(const _ of[0]){${snippet}let f=p.start?await r.editingSession.startExternalEdits(l,h,revive(p.resources),p.undoStopId):await r.editingSession.stopExternalEdits(l,h);c.push(...f)}})`);
+    const parts: string[] = [];
+    const target = new FakeUri('/workspace/a.ts', '__agy_before=' + encodeURIComponent('file:///tmp/base.tmp'));
+    await runner(
+      { kind: 'externalEdits', start: true, resources: [target], undoStopId: 'u1' },
+      { editingSession: { startExternalEdits, stopExternalEdits } },
+      0,
+      'req-1',
+      parts,
+      (x: unknown) => x,
+    );
+
+    expect(startExternalEdits).toHaveBeenCalledOnce();
+    const call = startExternalEdits.mock.calls[0] as unknown[];
+    expect((call[2] as FakeUri[])[0]?.query).toBe('');
+    expect((call[4] as FakeUri[])[0]?.path).toBe('file:///tmp/base.tmp');
+    expect(parts).toEqual(['part-1']);
+  });
+
+  it('deduplicates session.changes against live ChatEditingSession entries for antigravity only', () => {
+    const snippet = buildWorkingSetDedupSnippet({ arg1: 't', arg2: 'i', arg3: 'n' });
+    const fn = runInNewContext(`(function(e,t,i,n){${snippet}return{session:i.read(null),live:n.read(null)};})`);
+
+    const agyRes = fn(
+      null,
+      { chatSessionResource: { scheme: 'antigravity' } },
+      { read: () => [{ reference: 'file:///a.ts' }, { reference: 'file:///b.ts' }] },
+      { read: () => [{ reference: 'file:///a.ts' }] },
+    );
+    expect(agyRes.session).toEqual([{ reference: 'file:///b.ts' }]);
+
+    const copilotRes = fn(
+      null,
+      { chatSessionResource: { scheme: 'copilotcli' } },
+      { read: () => [{ reference: 'file:///a.ts' }] },
+      { read: () => [{ reference: 'file:///a.ts' }] },
+    );
+    expect(copilotRes.session).toEqual([{ reference: 'file:///a.ts' }]);
+  });
+
+  it('forwards Keep/Undo actions to antigravityHarness._onEditingAction and bridges createSideChat', async () => {
+    const actionSnippet = buildEditingActionNotifySnippet({ action: 'e' });
+    const executeCommand = vi.fn(async () => undefined);
+    const notifyFn = runInNewContext(`(function(e){if(true){this.noop()${actionSnippet}}})`);
+    notifyFn.call(
+      { noop: () => {}, commandService: { executeCommand } },
+      { sessionResource: { scheme: 'antigravity' }, action: { kind: 'chatEditingSessionAction', outcome: 'accepted' } },
+    );
+    expect(executeCommand).toHaveBeenCalledWith(
+      'antigravityHarness._onEditingAction',
+      { scheme: 'antigravity' },
+      { kind: 'chatEditingSessionAction', outcome: 'accepted' },
+    );
+
+    const sideSnippet = buildSideChatSessionSnippet({ revive: 'Rs' });
+    const forkMock = vi.fn(async (_h: unknown, _r: unknown, dto: { command?: string; prompt?: string }) => ({ dto, resource: 'antigravity:/side-1' }));
+    const sessionObj: Record<string, unknown> = {
+      sessionResource: { scheme: 'antigravity', toString: () => 'antigravity:/main-1' },
+      _providerHandle: 1,
+      _proxy: { $forkChatSession: forkMock },
+      createSideChat: undefined,
+      sideChatOrigin: undefined,
+    };
+    const initFn = runInNewContext(`(function(Rs){globalThis.__agySideChatOrigins=void 0;void 0${sideSnippet}})`);
+    initFn.call(sessionObj, (x: unknown) => x);
+    const created = await (sessionObj.createSideChat as (t: string, tok: unknown, sel: string) => Promise<{ resource: string }>)(
+      'turn-1',
+      null,
+      'selected code',
+    );
+    expect(created.resource).toBe('antigravity:/side-1');
+    expect(forkMock).toHaveBeenCalledWith(
+      1,
+      sessionObj.sessionResource,
+      expect.objectContaining({ command: 'btw', participant: 'antigravity.agent' }),
+      null,
+    );
   });
 });

@@ -5,6 +5,12 @@ const { buildSessionsPanelSnippet, buildSessionsSkipContributedSnippet } = requi
 const { buildSessionHistoryUsageSnippet } = require('./snippets/session-usage');
 const { buildStatusBarTooltipSnippet } = require('./snippets/status-tooltip');
 const { buildTerminalApprovalSnippet } = require('./snippets/terminal-approval');
+const {
+  buildEditingActionNotifySnippet,
+  buildExternalEditBaselineSnippet,
+  buildSideChatSessionSnippet,
+  buildWorkingSetDedupSnippet,
+} = require('./snippets/working-set');
 
 function insertSnippets(patch, insertions) {
   // Apply from right to left so the original anchor offsets stay valid.
@@ -28,6 +34,10 @@ function commonInsertions(matches) {
     // Use VS Code's native delegation gate; canDelegate still allows starting new Antigravity sessions.
     [sessionDelegation.end, 'session-delegation', `if(${type}==="antigravity")return false;`],
     [matches.sessionHistoryUsage.end, 'session-history-usage', buildSessionHistoryUsageSnippet()],
+    [matches.externalEditBaseline.end, 'external-edit-baseline', buildExternalEditBaselineSnippet(matches.externalEditBaseline.groups)],
+    [matches.workingSetDedup.end, 'working-set-dedup', buildWorkingSetDedupSnippet(matches.workingSetDedup.groups)],
+    [matches.editingActionNotify.end, 'editing-action-notify', buildEditingActionNotifySnippet(matches.editingActionNotify.groups)],
+    [matches.sideChatSession.end, 'side-chat-session', buildSideChatSessionSnippet(matches.sideChatSession.groups)],
   ];
 }
 

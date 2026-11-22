@@ -33,6 +33,22 @@ const COMMON_ANCHORS = {
     /return\{type:"response",parts:(?<turn>[$\w]+)\.parts\.map\((?<part>[$\w]+)=>(?<revive>[$\w]+)\(\k<part>\)\),participant:\k<turn>\.participant,details:\k<turn>\.details\}\}\)\)(?=,[$\w]+\.hasActiveResponseCallback)/g,
     'ChatSessions._doInitializeContent history usage',
   ],
+  externalEditBaseline: [
+    /if\((?<item>[A-Za-z_$][\w$]*)\.kind==="externalEdits"\)\{(?=if\((?<session>[A-Za-z_$][\w$]*)\?\.editingSession&&(?<idx>[A-Za-z_$][\w$]*)!==void 0&&(?<reqId>[A-Za-z_$][\w$]*)\)\{let [A-Za-z_$][\w$]*=\k<item>\.start\?await \k<session>\.editingSession\.startExternalEdits\(\k<reqId>,\k<idx>,(?<revive>[A-Za-z_$][\w$]*)\(\k<item>\.resources\),\k<item>\.undoStopId\):await \k<session>\.editingSession\.stopExternalEdits\(\k<reqId>,\k<idx>\);(?<parts>[A-Za-z_$][\w$]*)\.push\()/g,
+    'MainThreadChatAgents2.$handleProgressChunk externalEdits baseline',
+  ],
+  workingSetDedup: [
+    /\brenderChatEditingSessionWithEntries\((?<arg0>[A-Za-z_$][\w$]*),(?<arg1>[A-Za-z_$][\w$]*),(?<arg2>[A-Za-z_$][\w$]*),(?<arg3>[A-Za-z_$][\w$]*)\)\{/g,
+    'renderChatEditingSessionWithEntries deduplication',
+  ],
+  editingActionNotify: [
+    /\bnotifyUserAction\((?<action>[A-Za-z_$][\w$]*)\)\{if\(this\._chatServiceTelemetry\.notifyUserAction\(\k<action>\),this\._onDidPerformUserAction\.fire\(\k<action>\),\k<action>\.action\.kind==="chatEditingSessionAction"\)\{let (?<model>[A-Za-z_$][\w$]*)=this\._sessionModels\.get\(\k<action>\.sessionResource\);\k<model>&&\k<model>\.notifyEditingAction\(\k<action>\.action\)(?=\}\})/g,
+    'ChatService.notifyUserAction editing action sync',
+  ],
+  sideChatSession: [
+    /(?<dto>[A-Za-z_$][\w$]*)\.hasForkHandler&&!this\.forkSession&&\(this\.forkSession=async\((?<c>[A-Za-z_$][\w$]*),(?<l>[A-Za-z_$][\w$]*)\)=>\{let (?<u>[A-Za-z_$][\w$]*)=await this\._proxy\.\$forkChatSession\(this\._providerHandle,this\.sessionResource,\k<c>\?this\.toRequestDto\(\k<c>\):void 0,\k<l>\);return (?<revive>[A-Za-z_$][\w$]*)\(\k<u>\)\}\)/g,
+    'RemoteSession sideChat and fork bridge',
+  ],
 };
 
 const SESSIONS_ANCHORS = {
