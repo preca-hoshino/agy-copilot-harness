@@ -28,13 +28,22 @@ vi.mock('vscode', () => {
     public readonly authority: string;
     public readonly path: string;
     public readonly fsPath: string;
+    public readonly query: string;
     private readonly serialized: string;
 
-    private constructor(scheme: string, authority: string, uriPath: string, fsPath: string, serialized: string) {
+    private constructor(
+      scheme: string,
+      authority: string,
+      uriPath: string,
+      fsPath: string,
+      serialized: string,
+      query = '',
+    ) {
       this.scheme = scheme;
       this.authority = authority;
       this.path = uriPath;
       this.fsPath = fsPath;
+      this.query = query;
       this.serialized = serialized;
     }
 
@@ -42,7 +51,7 @@ vi.mock('vscode', () => {
       const normalized = filePath.replace(/\\/g, '/');
       const uriPath = normalized.startsWith('/') ? normalized : `/${normalized}`;
       const serialized = `file://${encodeURI(uriPath)}`;
-      return new MockUri('file', '', uriPath, filePath, serialized);
+      return new MockUri('file', '', uriPath, filePath, serialized, '');
     }
 
     public static parse(raw: string): MockUri {
@@ -51,14 +60,21 @@ vi.mock('vscode', () => {
           const url = new URL(raw);
           const decodedPath = decodeURIComponent(url.pathname);
           const fsPath = /^\/[a-zA-Z]:\//.test(decodedPath) ? decodedPath.slice(1) : decodedPath;
-          return new MockUri('file', url.host, decodedPath, fsPath, raw);
+          return new MockUri('file', url.host, decodedPath, fsPath, raw, url.search.replace(/^\?/, ''));
         } catch {
-          return new MockUri('file', '', raw.slice('file://'.length), raw.slice('file://'.length), raw);
+          return new MockUri('file', '', raw.slice('file://'.length), raw.slice('file://'.length), raw, '');
         }
       }
       const colonIdx = raw.indexOf(':');
       const scheme = colonIdx > 0 ? raw.slice(0, colonIdx) : 'file';
-      return new MockUri(scheme, '', raw, raw, raw);
+      return new MockUri(scheme, '', raw, raw, raw, '');
+    }
+
+    public with(change: { query?: string }): MockUri {
+      const nextQuery = change.query ?? this.query;
+      const base = this.serialized.split('?')[0] ?? this.serialized;
+      const nextSerialized = nextQuery.length > 0 ? `${base}?${nextQuery}` : base;
+      return new MockUri(this.scheme, this.authority, this.path, this.fsPath, nextSerialized, nextQuery);
     }
 
     public toString(): string {
@@ -237,6 +253,7 @@ vi.mock('vscode', () => {
 
 import * as vscode from 'vscode';
 import type { AcpSessionUpdate } from '../../src/acp/acpTypes.js';
+import { AgyEditTracker } from '../../src/sessions/agyEditTracker.js';
 import { BrowserSubagentRenderer, openMediaPreviewPanel } from '../../src/sessions/browserSubagentRenderer.js';
 import { LiveStreamAdapter, TurnConverter } from '../../src/sessions/turnConverter.js';
 
@@ -460,7 +477,7 @@ describe('TurnConverter', () => {
     if (responseTurn instanceof vscode.ChatResponseTurn2) {
       expect(responseTurn.participant).toBe('antigravity');
       const parts = responseTurn.response;
-      expect(parts).toHaveLength(11);
+      expect(parts).toHaveLength(6);
 
       const thoughtPart = parts[0];
       expect(thoughtPart).toBeInstanceOf(vscode.ChatResponseThinkingProgressPart);
@@ -509,17 +526,12 @@ describe('TurnConverter', () => {
       expect(writePart).toBeInstanceOf(vscode.ChatToolInvocationPart);
       if (writePart instanceof vscode.ChatToolInvocationPart) {
         expect(writePart.isComplete).toBe(true);
-        expect(writePart.presentation).toBe('hidden');
+        expect(writePart.presentation).toBeUndefined();
         expect(writePart.invocationMessage).toBeInstanceOf(vscode.MarkdownString);
         expect((writePart.invocationMessage as vscode.MarkdownString).value).toContain('Write [app.ts (+2 -1)]');
       }
 
-      expect(parts[5]).toMatchObject({ value: { value: '\n````\n' } });
-      expect(parts[6]).toMatchObject({ isEdit: true, value: { fsPath: 'D:\\repo\\src\\app.ts' } });
-      expect(parts[7]).toMatchObject({ edits: [], isDone: false });
-      expect(parts[8]).toMatchObject({ edits: [], isDone: true });
-      expect(parts[9]).toMatchObject({ value: { value: '\n````\n' } });
-      const mdPart = parts[10];
+      const mdPart = parts[5];
       expect(mdPart).toBeInstanceOf(vscode.ChatResponseMarkdownPart);
       if (mdPart instanceof vscode.ChatResponseMarkdownPart) {
         expect(mdPart.value.value).toBe('All done!');
@@ -533,7 +545,7 @@ describe('TurnConverter', () => {
     expect(history.changes[0]?.uri.toString()).toBe(history.changes[0]?.modifiedUri.toString());
   });
 
-  it('creates one native history edit pill per file and preserves an existing empty original', () => {
+  it('keeps replayed multi-file edits as a clean tool invocation without +0 -0 pills and preserves original URIs', () => {
     const renderer = new BrowserSubagentRenderer(nodePath.join(os.tmpdir(), 'non-existent-brain'));
     const converter = new TurnConverter(renderer, 'multi-edit');
     converter.processUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Edit files' } });
@@ -544,10 +556,9 @@ describe('TurnConverter', () => {
       ] });
     const result = converter.finalizeHistory();
     const response = result.turns[1] as vscode.ChatResponseTurn2;
-    expect(response.response).toHaveLength(11);
-    expect(response.response[0]).toMatchObject({ presentation: 'hidden' });
-    expect(response.response[2]).toMatchObject({ isEdit: true, value: { fsPath: 'D:\\repo\\empty.txt' } });
-    expect(response.response[7]).toMatchObject({ isEdit: true, value: { fsPath: 'D:\\repo\\created.txt' } });
+    expect(response.response).toHaveLength(1);
+    expect(response.response[0]).toBeInstanceOf(vscode.ChatToolInvocationPart);
+    expect(response.response[0]).toMatchObject({ presentation: undefined });
     expect(result.changes[0]?.originalUri?.toString()).toBe(result.changes[0]?.uri.toString());
     expect(result.changes[1]?.originalUri).toBeUndefined();
   });
@@ -922,10 +933,22 @@ describe('TurnConverter', () => {
     expect(lastPart.value.value).toBe('<!--AGY_USAGE:{"used":34500,"size":1048576}-->');
   });
 
-  it('hides completed live edit tool invocations and emits native VS Code edit pill parts', () => {
+  it('hides workspace live edits from the initial in_progress update and keeps brain artifacts as single tool steps', async () => {
     const renderer = new BrowserSubagentRenderer('D:\\unused');
     const pushed: unknown[] = [];
     const changes: vscode.ChatSessionFileChange[] = [];
+    const externalEdits: vscode.Uri[] = [];
+    const workspaceRoot = await makeTempBrainDir();
+    const editTracker = new AgyEditTracker({
+      sessionId: 'session-live-edit-pill',
+      sessionCwd: workspaceRoot,
+      workspaceFolderPaths: [workspaceRoot],
+      startExternalEdit: async (uri, write, onTracked) => {
+        externalEdits.push(uri);
+        await write();
+        onTracked();
+      },
+    });
     const adapter = new LiveStreamAdapter(
       renderer,
       'session-live-edit-pill',
@@ -937,7 +960,15 @@ describe('TurnConverter', () => {
       (change) => {
         changes.push(change);
       },
+      undefined,
+      undefined,
+      undefined,
+      editTracker,
     );
+
+    const workspaceFile = nodePath.join(workspaceRoot, 'src', 'app.ts');
+    await fs.mkdir(nodePath.dirname(workspaceFile), { recursive: true });
+    await fs.writeFile(workspaceFile, 'b\nc', 'utf8');
 
     adapter.handleUpdate({
       sessionUpdate: 'tool_call',
@@ -945,25 +976,112 @@ describe('TurnConverter', () => {
       kind: 'edit',
       name: 'replace_file_content',
       status: 'in_progress',
-      rawInput: { TargetFile: 'D:\\repo\\src\\app.ts' },
+      rawInput: { TargetFile: workspaceFile },
     });
     expect(pushed).toHaveLength(1);
-    expect((pushed[0] as vscode.ChatToolInvocationPart).presentation).toBeUndefined();
+    expect((pushed[0] as vscode.ChatToolInvocationPart).presentation).toBe('hidden');
 
     adapter.handleUpdate({
       sessionUpdate: 'tool_call_update',
       toolCallId: 'edit-1',
       status: 'completed',
-      rawInput: { TargetFile: 'D:\\repo\\src\\app.ts', TargetContent: 'a', ReplacementContent: 'b\nc' },
+      rawInput: { TargetFile: workspaceFile, TargetContent: 'a', ReplacementContent: 'b\nc' },
     });
+    await editTracker.flush();
 
     expect((pushed[0] as vscode.ChatToolInvocationPart).presentation).toBe('hidden');
-    expect(pushed).toHaveLength(7);
-    expect(pushed[2]).toBeInstanceOf(vscode.ChatResponseMarkdownPart);
-    expect(pushed[3]).toBeInstanceOf(vscode.ChatResponseCodeblockUriPart);
-    expect((pushed[3] as vscode.ChatResponseCodeblockUriPart).isEdit).toBe(true);
-    expect(pushed[4]).toBeInstanceOf(vscode.ChatResponseTextEditPart);
-    expect((pushed[5] as vscode.ChatResponseTextEditPart).isDone).toBe(true);
+    expect(pushed.some((part) => part instanceof vscode.ChatResponseTextEditPart)).toBe(false);
     expect(changes).toHaveLength(1);
+    expect(externalEdits).toHaveLength(1);
+
+    const pushedBrain: unknown[] = [];
+    const brainChanges: vscode.ChatSessionFileChange[] = [];
+    const brainAdapter = new LiveStreamAdapter(
+      renderer,
+      'session-brain-edit',
+      {
+        push: (part: unknown) => {
+          pushedBrain.push(part);
+        },
+      } as unknown as vscode.ChatResponseStream,
+      (change) => {
+        brainChanges.push(change);
+      },
+      undefined,
+      undefined,
+      undefined,
+      editTracker,
+    );
+    const brainPlanPath = nodePath.join(os.homedir(), '.gemini', 'antigravity', 'brain', 'conv-1', 'implementation_plan.md');
+    brainAdapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'brain-write-1',
+      kind: 'edit',
+      name: 'write_file',
+      status: 'completed',
+      rawInput: { TargetFile: brainPlanPath, CodeContent: 'line 1\nline 2\n' },
+    });
+
+    expect(pushedBrain).toHaveLength(1);
+    const brainPart = pushedBrain[0] as vscode.ChatToolInvocationPart;
+    expect(brainPart.presentation).toBeUndefined();
+    expect((brainPart.pastTenseMessage as { value?: string } | undefined)?.value).toContain('Write [implementation_plan.md (+2 -0)]');
+    expect(brainChanges).toHaveLength(0);
+  });
+
+  it('displays skill name with vscodeLinkType=skill when reading SKILL.md', async () => {
+    const tmpRoot = await makeTempBrainDir();
+    const skillDir = nodePath.join(tmpRoot, 'skills', 'antigravity_guide');
+    await fs.mkdir(skillDir, { recursive: true });
+    const skillPath = nodePath.join(skillDir, 'SKILL.md');
+    await fs.writeFile(skillPath, '---\nname: antigravity-guide\ndescription: Test skill\n---\n# Guide\n', 'utf8');
+
+    const fallbackDir = nodePath.join(tmpRoot, 'skills', 'custom-dir-skill');
+    await fs.mkdir(fallbackDir, { recursive: true });
+    const fallbackPath = nodePath.join(fallbackDir, 'SKILL.md');
+    await fs.writeFile(fallbackPath, '# No Frontmatter\n', 'utf8');
+
+    const renderer = new BrowserSubagentRenderer(tmpRoot);
+    const pushed: unknown[] = [];
+    const adapter = new LiveStreamAdapter(
+      renderer,
+      'session-skill-read',
+      {
+        push: (part: unknown) => {
+          pushed.push(part);
+        },
+      } as unknown as vscode.ChatResponseStream,
+      vi.fn(),
+    );
+
+    adapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'read-skill-1',
+      kind: 'read',
+      name: 'read_file',
+      status: 'in_progress',
+      rawInput: { AbsolutePath: skillPath, StartLine: 1, EndLine: 25 },
+    });
+    const part = pushed[0] as vscode.ChatToolInvocationPart;
+    expect((part.invocationMessage as { value: string }).value).toContain('Reading skill [antigravity-guide](');
+    expect((part.invocationMessage as { value: string }).value).toContain('SKILL.md?vscodeLinkType=skill#1-1), lines 1 to 25');
+
+    adapter.handleUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'read-skill-1',
+      status: 'completed',
+    });
+    expect((part.pastTenseMessage as { value: string }).value).toContain('Read skill [antigravity-guide](');
+
+    adapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'read-skill-2',
+      kind: 'read',
+      name: 'read_file',
+      status: 'completed',
+      rawInput: { AbsolutePath: fallbackPath },
+    });
+    const fallbackPart = pushed[2] as vscode.ChatToolInvocationPart;
+    expect((fallbackPart.pastTenseMessage as { value: string }).value).toContain('Read skill [custom-dir-skill](');
   });
 });

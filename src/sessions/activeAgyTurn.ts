@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { stripAgyBeforeQuery } from './agyEditTracker.js';
 
 type ChatPart = Parameters<vscode.ChatResponseStream['push']>[0];
 
@@ -66,7 +67,7 @@ export class ActiveAgyTurn {
       await writeOnce();
       if (state.started) {
         onTracked();
-        this.rememberExternalEdit(uri, undoStopId, stream);
+        this.rememberExternalEdit(stripAgyBeforeQuery(uri), undoStopId, stream);
       }
     } catch {
       // If the UI failed before or after the callback, reuse the same write. A

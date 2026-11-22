@@ -11,6 +11,12 @@ import type {
   AcpToolCallUpdatePayload,
   AcpUsageUpdatePayload,
 } from '../acp/acpTypes.js';
+import {
+  formatSkillReadMarkdownLink,
+  isSkillMarkdownPath,
+  resolveSkillDisplayNameSync,
+} from './agyCustomizationProvider.js';
+import { type AgyEditTracker, extractEditTargetPaths, isInternalAntigravityPath } from './agyEditTracker.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
 
 export interface ConvertedHistory {
@@ -367,15 +373,7 @@ export class TurnConverter {
           }
         } else {
           const toolPart = buildToolInvocationPart(merged, true);
-          const edits =
-            merged.status === 'completed' && classifyToolCategoryWithoutBrowser(merged) === 'edit'
-              ? buildReplayEditParts(merged)
-              : [];
-          if (edits.length > 0) {
-            toolPart.presentation = 'hidden';
-          }
           parts.push(toolPart as unknown as vscode.ChatResponsePart);
-          parts.push(...edits);
         }
       }
     }
@@ -385,28 +383,6 @@ export class TurnConverter {
 
     this.turns.push(new vscode.ChatResponseTurn2(parts, {}, this.participantId));
   }
-}
-
-function buildReplayEditParts(merged: AcpToolCallUpdatePayload): ReplayPart[] {
-  if (
-    typeof vscode.ChatResponseCodeblockUriPart !== 'function' ||
-    typeof vscode.ChatResponseTextEditPart !== 'function'
-  ) {
-    return [];
-  }
-  const parts: ReplayPart[] = [];
-  for (const change of extractFileChangesFromToolCall(merged)) {
-    const uri = change.modifiedUri;
-    // Match VS Code's history representation without inventing an undo stop or snapshots.
-    parts.push(
-      new vscode.ChatResponseMarkdownPart('\n````\n'),
-      new vscode.ChatResponseCodeblockUriPart(uri, true),
-      new vscode.ChatResponseTextEditPart(uri, []),
-      new vscode.ChatResponseTextEditPart(uri, true),
-      new vscode.ChatResponseMarkdownPart('\n````\n'),
-    );
-  }
-  return parts;
 }
 
 type LiveResponseStream = Pick<vscode.ChatResponseStream, 'push'> & {
@@ -424,7 +400,7 @@ export class LiveStreamAdapter {
   private readonly liveToolParts = new Map<string, vscode.ChatToolInvocationPart>();
   private readonly reportedEditToolIds = new Set<string>();
   private readonly externallyTrackedToolIds = new Set<string>();
-  private readonly emittedNativeEditToolIds = new Set<string>();
+  private readonly accumulatedMessageChunks: string[] = [];
   private livePlanPart: vscode.ChatToolInvocationPart | undefined;
 
   public constructor(
@@ -435,12 +411,17 @@ export class LiveStreamAdapter {
     onNeedsInput?: (reason: string) => void,
     private readonly attachmentDir?: string,
     private readonly onUsageUpdate?: (usage: AcpUsageUpdatePayload) => void,
+    private readonly editTracker?: AgyEditTracker | undefined,
   ) {
     this.browserRenderer = browserRenderer;
     this.sessionId = sessionId;
     this.stream = stream;
     this.onFileChange = onFileChange;
     this.onNeedsInput = onNeedsInput;
+  }
+
+  public getAccumulatedMessageText(): string {
+    return this.accumulatedMessageChunks.join('');
   }
 
   public handleUpdate(update: AcpSessionUpdate): void {
@@ -464,6 +445,7 @@ export class LiveStreamAdapter {
           }
           const text = extractContentBlockText(update.content);
           if (text.length > 0) {
+            this.accumulatedMessageChunks.push(text);
             const mdPart = new vscode.ChatResponseMarkdownPart(new vscode.MarkdownString(text));
             this.stream.push(mdPart);
           }
@@ -580,31 +562,39 @@ export class LiveStreamAdapter {
     const part = buildToolInvocationPart(merged, false, existingPart);
     part.enablePartialUpdate = true;
     const category = classifyToolCall(merged, this.browserRenderer);
-    const shouldEmitNativeEditPill =
+    const targetPaths = category === 'edit' ? extractEditTargetPaths(merged) : [];
+    const isWorkspaceTracked =
       category === 'edit' &&
-      merged.status === 'completed' &&
-      !this.externallyTrackedToolIds.has(merged.toolCallId) &&
-      !this.emittedNativeEditToolIds.has(merged.toolCallId);
-    const nativeEditParts = shouldEmitNativeEditPill ? buildReplayEditParts(merged) : [];
-    if (this.externallyTrackedToolIds.has(merged.toolCallId) || nativeEditParts.length > 0) {
+      this.editTracker !== undefined &&
+      targetPaths.some((targetPath) => this.editTracker?.shouldTrackInWorkingSet(targetPath) === true);
+
+    if (category === 'edit' && this.editTracker !== undefined && isWorkspaceTracked) {
+      // Mark hidden from the very first update so VS Code's externalToolInvocationUpdate
+      // (which omits presentation) never leaves a duplicate tool card behind.
+      this.externallyTrackedToolIds.add(merged.toolCallId);
+      this.editTracker.handleToolCallUpdate(merged);
+    }
+
+    if (this.externallyTrackedToolIds.has(merged.toolCallId)) {
       part.presentation = 'hidden';
     }
     this.liveToolParts.set(merged.toolCallId, part);
     this.stream.push(part as unknown as vscode.ChatResponsePart);
 
-    if (nativeEditParts.length > 0) {
-      this.emittedNativeEditToolIds.add(merged.toolCallId);
-      for (const editPart of nativeEditParts) {
-        this.stream.push(editPart as unknown as vscode.ChatResponsePart);
-      }
-    }
-
     if (category === 'edit' && merged.status === 'completed' && !this.reportedEditToolIds.has(merged.toolCallId)) {
-      const changes = extractFileChangesFromToolCall(merged);
-      if (changes.length > 0) {
-        this.reportedEditToolIds.add(merged.toolCallId);
-        for (const change of changes) {
-          this.onFileChange(change);
+      const hasOnlyInternalPaths =
+        targetPaths.length > 0 && targetPaths.every((targetPath) => isInternalAntigravityPath(targetPath));
+      const allowChangeReport =
+        this.editTracker !== undefined
+          ? targetPaths.some((targetPath) => this.editTracker?.shouldTrackInWorkingSet(targetPath) === true)
+          : !hasOnlyInternalPaths;
+      if (allowChangeReport) {
+        const changes = extractFileChangesFromToolCall(merged);
+        if (changes.length > 0) {
+          this.reportedEditToolIds.add(merged.toolCallId);
+          for (const change of changes) {
+            this.onFileChange(change);
+          }
         }
       }
     }
@@ -805,6 +795,17 @@ function populateReadPart(part: vscode.ChatToolInvocationPart, merged: AcpToolCa
     isReadLine,
   );
   const endLine = [getFirstNumber(args, endKeys), getFirstNumber(rawInput, endKeys)].find(isReadLine);
+
+  if (isSkillMarkdownPath(filePath)) {
+    const skillName = resolveSkillDisplayNameSync(filePath);
+    const skillLink = formatSkillReadMarkdownLink(filePath, skillName, startLine, endLine);
+    part.invocationMessage = new vscode.MarkdownString(`Reading skill ${skillLink}`);
+    part.pastTenseMessage = new vscode.MarkdownString(
+      `${merged.status === 'failed' ? 'Failed to read skill' : 'Read skill'} ${skillLink}`,
+    );
+    return;
+  }
+
   const target = startLine === undefined ? uri : `${uri}#${startLine}-${startLine}`;
   let range = '';
   if (startLine !== undefined) {
