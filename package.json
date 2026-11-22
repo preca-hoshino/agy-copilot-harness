@@ -28,6 +28,7 @@
   "main": "./dist/extension.js",
   "enabledApiProposals": [
     "chatSessionsProvider",
+    "chatSessionCustomizationProvider",
     "chatParticipantAdditions",
     "chatProvider",
     "languageModelCapabilities",
@@ -72,6 +73,10 @@
           {
             "name": "plan",
             "description": "Switch Antigravity session to Plan mode for this prompt"
+          },
+          {
+            "name": "compact",
+            "description": "Compact and summarize the current Antigravity conversation context"
           }
         ]
       }

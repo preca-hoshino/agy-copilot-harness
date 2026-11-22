@@ -199,6 +199,19 @@ export interface AcpConfigOptionUpdatePayload {
   configOptions: AcpConfigOption[];
 }
 
+export interface AcpAvailableCommand {
+  name: string;
+  description?: string;
+  input?: {
+    hint?: string;
+  } | null;
+}
+
+export interface AcpAvailableCommandsUpdatePayload {
+  sessionUpdate: 'available_commands_update';
+  availableCommands: AcpAvailableCommand[];
+}
+
 export type AcpSessionUpdate =
   | AcpMessageChunkPayload
   | AcpToolCallUpdatePayload
@@ -206,6 +219,7 @@ export type AcpSessionUpdate =
   | AcpUsageUpdatePayload
   | AcpModeUpdatePayload
   | AcpConfigOptionUpdatePayload
+  | AcpAvailableCommandsUpdatePayload
   | { sessionUpdate: string; [key: string]: unknown };
 
 export interface AcpSessionUpdateNotification {

@@ -71,6 +71,7 @@ declare module 'vscode' {
     icon?: ThemeIcon;
     locked?: boolean;
     default?: boolean;
+    slashCommand?: string;
   }
 
   export interface ChatSessionProviderOptionGroup {
@@ -382,6 +383,49 @@ declare module 'vscode' {
     ): Thenable<number>;
   }
 
+  export interface ChatSessionCustomizationType {
+    readonly id: string;
+  }
+
+  export const ChatSessionCustomizationType: {
+    readonly Agent: ChatSessionCustomizationType;
+    readonly Skill: ChatSessionCustomizationType;
+    readonly Instructions: ChatSessionCustomizationType;
+    readonly Prompt: ChatSessionCustomizationType;
+    readonly Hook: ChatSessionCustomizationType;
+    readonly Plugins: ChatSessionCustomizationType;
+    new (id: string): ChatSessionCustomizationType;
+  };
+
+  export interface ChatSessionCustomizationItem {
+    uri: Uri;
+    type: ChatSessionCustomizationType;
+    name: string;
+    description?: string;
+    source?: string;
+    groupKey?: string;
+    badge?: string;
+    badgeTooltip?: string;
+    extensionId?: string;
+    pluginUri?: Uri;
+    pluginLabel?: string;
+    userInvocable?: boolean;
+  }
+
+  export interface ChatSessionCustomizationProviderMetadata {
+    label: string;
+    iconId?: string;
+    supportedTypes?: ChatSessionCustomizationType[];
+  }
+
+  export interface ChatSessionCustomizationProvider {
+    readonly onDidChange?: Event<void>;
+    provideChatSessionCustomizations(
+      sessionResource: Uri,
+      token: CancellationToken,
+    ): ProviderResult<ChatSessionCustomizationItem[]>;
+  }
+
   export namespace chat {
     export function createChatSessionItemController(
       id: string,
@@ -392,6 +436,11 @@ declare module 'vscode' {
       provider: ChatSessionContentProvider,
       defaultChatParticipant: ChatParticipant,
       capabilities?: ChatSessionCapabilities
+    ): Disposable;
+    export function registerChatSessionCustomizationProvider(
+      chatSessionType: string,
+      metadata: ChatSessionCustomizationProviderMetadata,
+      provider: ChatSessionCustomizationProvider
     ): Disposable;
   }
 

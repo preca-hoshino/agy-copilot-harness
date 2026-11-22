@@ -188,8 +188,14 @@ function parsePermissionOptions(rawOptions: unknown): AcpPermissionOption[] {
   const options: AcpPermissionOption[] = [];
   const ids = new Set<string>();
   for (const item of rawOptions) {
-    if (isRecord(item) && typeof item.optionId === 'string' && item.optionId.length > 0 &&
-      typeof item.name === 'string' && typeof item.kind === 'string' && PERMISSION_KINDS.has(item.kind)) {
+    if (
+      isRecord(item) &&
+      typeof item.optionId === 'string' &&
+      item.optionId.length > 0 &&
+      typeof item.name === 'string' &&
+      typeof item.kind === 'string' &&
+      PERMISSION_KINDS.has(item.kind)
+    ) {
       if (ids.has(item.optionId)) {
         throw new JsonRpcError(-32602, 'Invalid params: duplicate permission option ID');
       }
@@ -222,8 +228,11 @@ function parseRequestPermissionParams(params: unknown): AcpRequestPermissionPara
       title: typeof toolCallRecord.title === 'string' ? toolCallRecord.title : undefined,
       name: typeof toolCallRecord.name === 'string' ? toolCallRecord.name : undefined,
       kind: typeof toolCallRecord.kind === 'string' ? toolCallRecord.kind : undefined,
-      rawInput: isRecord(toolCallRecord.rawInput) ? toolCallRecord.rawInput :
-        isRecord(toolCallRecord.args) ? toolCallRecord.args : undefined,
+      rawInput: isRecord(toolCallRecord.rawInput)
+        ? toolCallRecord.rawInput
+        : isRecord(toolCallRecord.args)
+          ? toolCallRecord.args
+          : undefined,
     },
     options: parsePermissionOptions(params.options),
   };
@@ -600,7 +609,11 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
     const prompt = this.permissionPrompts.get(req.sessionId);
     if (prompt !== undefined) {
       const optionId = await prompt(req);
-      if (this.permissionPrompts.get(req.sessionId) === prompt && req.options.some((option) => option.optionId === optionId) && optionId !== undefined) {
+      if (
+        this.permissionPrompts.get(req.sessionId) === prompt &&
+        req.options.some((option) => option.optionId === optionId) &&
+        optionId !== undefined
+      ) {
         return { outcome: { outcome: 'selected', optionId } };
       }
       return { outcome: { outcome: 'cancelled' } };

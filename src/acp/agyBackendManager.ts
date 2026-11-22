@@ -7,7 +7,14 @@ import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import type { AcpBackendInterface, FileWriteHandler, PermissionPrompt } from '../shared/contracts.js';
+import type {
+  AcpBackendInterface,
+  AgyForkConversationResult,
+  AgySlashCommandDescriptor,
+  AgyTurnFileDiff,
+  FileWriteHandler,
+  PermissionPrompt,
+} from '../shared/contracts.js';
 import type {
   AcpConfigOption,
   AcpContentBlock,
@@ -173,6 +180,7 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
   private readonly capabilitiesHandler: ClientCapabilitiesHandler;
   private readonly updateEmitter = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
   private readonly backendStateEmitter = new vscode.EventEmitter<{ ready: boolean; error?: string | undefined }>();
+  private readonly availableCommandsEmitter = new vscode.EventEmitter<void>();
 
   public readonly onDidChangeUpdate: vscode.Event<{ sessionId: string; update: AcpSessionUpdate }> =
     this.updateEmitter.event;
@@ -202,6 +210,8 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
   private readonly promptOwners = new Map<string, ChildProcessWithoutNullStreams>();
   private readonly promptGenerations = new Map<string, number>();
   private readonly idleWaits = new Set<AbortController>();
+  private readonly availableCommandsBySession = new Map<string, AgySlashCommandDescriptor[]>();
+  private latestAvailableCommands: AgySlashCommandDescriptor[] = [];
 
   public constructor(storagePath: string, outputChannel: vscode.OutputChannel) {
     this.storagePath = storagePath;
@@ -519,6 +529,198 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
     this.capabilitiesHandler.dispose();
     this.updateEmitter.dispose();
     this.backendStateEmitter.dispose();
+    this.availableCommandsEmitter.dispose();
+  }
+
+  public getAvailableCommands(sessionId?: string): AgySlashCommandDescriptor[] {
+    if (sessionId !== undefined) {
+      const scoped = this.availableCommandsBySession.get(sessionId);
+      if (scoped !== undefined) {
+        return [...scoped];
+      }
+    }
+    return [...this.latestAvailableCommands];
+  }
+
+  public onDidChangeAvailableCommands(listener: () => void): vscode.Disposable {
+    return this.availableCommandsEmitter.event(listener);
+  }
+
+  public async fetchSlashCommands(workspaceUris?: string[], sessionId?: string): Promise<AgySlashCommandDescriptor[]> {
+    const body: Record<string, unknown> = {};
+    if (sessionId !== undefined && sessionId.length > 0) {
+      body.cascadeId = sessionId;
+    }
+    if (workspaceUris !== undefined && workspaceUris.length > 0) {
+      body.workspaceUris = workspaceUris;
+    }
+    const payload = await this.callLanguageServerJson(
+      '/exa.language_server_pb.LanguageServerService/GetSlashCommands',
+      body,
+    );
+    const merged = new Map<string, AgySlashCommandDescriptor>();
+    for (const cmd of this.getAvailableCommands(sessionId)) {
+      merged.set(cmd.name, cmd);
+    }
+    if (payload !== undefined && Array.isArray(payload.commands)) {
+      for (const raw of payload.commands) {
+        if (!isRecord(raw) || typeof raw.name !== 'string') {
+          continue;
+        }
+        const trimmedName = raw.name.replace(/^\/+/, '').trim();
+        if (trimmedName.length === 0 || merged.has(trimmedName)) {
+          continue;
+        }
+        const desc =
+          typeof raw.description === 'string' && raw.description.trim().length > 0 ? raw.description.trim() : undefined;
+        merged.set(trimmedName, {
+          name: trimmedName,
+          ...(desc !== undefined ? { description: desc } : {}),
+          source: 'ls',
+        });
+      }
+    }
+    return Array.from(merged.values());
+  }
+
+  public async forkConversation(
+    sourceCascadeId: string,
+    forkAtStepIndex?: number,
+  ): Promise<AgyForkConversationResult | undefined> {
+    if (sourceCascadeId.trim().length === 0) {
+      return undefined;
+    }
+    const body: Record<string, unknown> = { sourceCascadeId };
+    if (forkAtStepIndex !== undefined) {
+      body.forkAtStepIndex = forkAtStepIndex;
+    }
+    const payload = await this.callLanguageServerJson(
+      '/exa.language_server_pb.LanguageServerService/ForkConversation',
+      body,
+      5000,
+    );
+    if (payload !== undefined && typeof payload.newCascadeId === 'string' && payload.newCascadeId.length > 0) {
+      return { newCascadeId: payload.newCascadeId };
+    }
+    return undefined;
+  }
+
+  public async getTurnFileDiff(
+    conversationId: string,
+    fileUri: string,
+    stepIndex?: number,
+  ): Promise<AgyTurnFileDiff | undefined> {
+    if (conversationId.trim().length === 0 || fileUri.trim().length === 0) {
+      return undefined;
+    }
+    const body: Record<string, unknown> = {
+      conversationId,
+      fileUris: [fileUri],
+      statsOnly: false,
+    };
+    if (stepIndex !== undefined) {
+      body.stepIndex = stepIndex;
+    }
+    const payload = await this.callLanguageServerJson(
+      '/exa.language_server_pb.LanguageServerService/GetTurnDiff',
+      body,
+    );
+    if (payload === undefined) {
+      return undefined;
+    }
+    const fileDiffs = payload.fileDiffs;
+    let entry: Record<string, unknown> | undefined;
+    if (isRecord(fileDiffs)) {
+      const direct = fileDiffs[fileUri];
+      if (isRecord(direct)) {
+        entry = direct;
+      } else {
+        for (const candidate of Object.values(fileDiffs)) {
+          if (isRecord(candidate)) {
+            entry = candidate;
+            break;
+          }
+        }
+      }
+    } else if (Array.isArray(fileDiffs)) {
+      for (const item of fileDiffs) {
+        if (isRecord(item)) {
+          entry = isRecord(item.value) ? item.value : item;
+          break;
+        }
+      }
+    }
+    if (entry === undefined) {
+      return undefined;
+    }
+    const originalContent =
+      typeof entry.originalContent === 'string'
+        ? entry.originalContent
+        : typeof entry.beforeContent === 'string'
+          ? entry.beforeContent
+          : typeof entry.oldContent === 'string'
+            ? entry.oldContent
+            : undefined;
+    const modifiedContent =
+      typeof entry.modifiedContent === 'string'
+        ? entry.modifiedContent
+        : typeof entry.afterContent === 'string'
+          ? entry.afterContent
+          : typeof entry.newContent === 'string'
+            ? entry.newContent
+            : undefined;
+    return { originalContent, modifiedContent };
+  }
+
+  public async acknowledgeCodeEdit(
+    cascadeId: string,
+    absoluteUri: string,
+    contents: string,
+    accept: boolean,
+  ): Promise<boolean> {
+    if (cascadeId.trim().length === 0 || absoluteUri.trim().length === 0) {
+      return false;
+    }
+    const payload = await this.callLanguageServerJson(
+      '/exa.language_server_pb.LanguageServerService/AcknowledgeCascadeCodeEdit',
+      {
+        cascadeId,
+        absoluteUri,
+        contents,
+        accept,
+      },
+    );
+    return payload !== undefined;
+  }
+
+  private async callLanguageServerJson(
+    methodPath: string,
+    body: Record<string, unknown>,
+    timeoutMs = 4000,
+  ): Promise<Record<string, unknown> | undefined> {
+    if (this.disposed || this._internalHttpPort === undefined || this.csrfToken.length === 0) {
+      return undefined;
+    }
+    try {
+      const response = await postLocalJson(
+        this._internalHttpPort,
+        methodPath,
+        {
+          'Content-Type': 'application/json',
+          'Connect-Protocol-Version': '1',
+          'x-codeium-csrf-token': this.csrfToken,
+        },
+        JSON.stringify(body),
+        AbortSignal.timeout(timeoutMs),
+      );
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return undefined;
+      }
+      const parsed: unknown = JSON.parse(response.body);
+      return isRecord(parsed) ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async doStart(): Promise<void> {
@@ -779,6 +981,35 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
       this.lastKnownConfigOptions = parseConfigOptions(update.configOptions);
     } else if (update.sessionUpdate === 'current_mode_update' && typeof update.currentModeId === 'string') {
       this.capabilitiesHandler.setSessionMode(sessionId, update.currentModeId);
+    } else if (update.sessionUpdate === 'available_commands_update' && Array.isArray(update.availableCommands)) {
+      const normalized: AgySlashCommandDescriptor[] = [];
+      for (const item of update.availableCommands) {
+        if (!isRecord(item) || typeof item.name !== 'string') {
+          continue;
+        }
+        const trimmedName = item.name.replace(/^\/+/, '').trim();
+        if (trimmedName.length === 0) {
+          continue;
+        }
+        const description =
+          typeof item.description === 'string' && item.description.trim().length > 0
+            ? item.description.trim()
+            : undefined;
+        const inputObj = isRecord(item.input) ? item.input : undefined;
+        const argumentHint =
+          inputObj !== undefined && typeof inputObj.hint === 'string' && inputObj.hint.trim().length > 0
+            ? inputObj.hint.trim()
+            : undefined;
+        normalized.push({
+          name: trimmedName,
+          ...(description !== undefined ? { description } : {}),
+          ...(argumentHint !== undefined ? { argumentHint } : {}),
+          source: 'acp',
+        });
+      }
+      this.availableCommandsBySession.set(sessionId, normalized);
+      this.latestAvailableCommands = normalized;
+      this.availableCommandsEmitter.fire();
     }
 
     const sessionUpdate: AcpSessionUpdate = {

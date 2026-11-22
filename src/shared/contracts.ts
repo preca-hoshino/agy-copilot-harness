@@ -16,6 +16,22 @@ export const AUTH_PROVIDER_ID = 'google-antigravity';
 export type PermissionPrompt = (request: AcpRequestPermissionParams) => Promise<string | undefined>;
 export type FileWriteHandler = (uri: vscode.Uri, write: () => Promise<void>) => Promise<void>;
 
+export interface AgySlashCommandDescriptor {
+  name: string;
+  description?: string | undefined;
+  argumentHint?: string | undefined;
+  source: 'acp' | 'ls';
+}
+
+export interface AgyTurnFileDiff {
+  originalContent?: string | undefined;
+  modifiedContent?: string | undefined;
+}
+
+export interface AgyForkConversationResult {
+  newCascadeId: string;
+}
+
 export interface ModelQuotaInfo {
   label: string;
   modelId: string;
@@ -63,13 +79,30 @@ export interface AcpBackendInterface {
   readonly onDidChangeBackendState: vscode.Event<{ ready: boolean; error?: string | undefined }>;
   registerPermissionPrompt?: (sessionId: string, prompt: PermissionPrompt) => vscode.Disposable;
   registerFileWriteHandler?: (sessionId: string, handler: FileWriteHandler) => vscode.Disposable;
+  getAvailableCommands?: (sessionId?: string) => AgySlashCommandDescriptor[];
+  onDidChangeAvailableCommands?: (listener: () => void) => vscode.Disposable;
+  fetchSlashCommands?: (workspaceUris?: string[], sessionId?: string) => Promise<AgySlashCommandDescriptor[]>;
+  forkConversation?: (
+    sourceCascadeId: string,
+    forkAtStepIndex?: number,
+  ) => Promise<AgyForkConversationResult | undefined>;
+  getTurnFileDiff?: (
+    conversationId: string,
+    fileUri: string,
+    stepIndex?: number,
+  ) => Promise<AgyTurnFileDiff | undefined>;
+  acknowledgeCodeEdit?: (cascadeId: string, absoluteUri: string, contents: string, accept: boolean) => Promise<boolean>;
   ensureStarted: () => Promise<void>;
   listSessions: () => Promise<AcpSessionListResult>;
   loadSession: (sessionId: string, cwd: string, token?: vscode.CancellationToken) => Promise<AcpSessionLoadResult>;
   resumeSession: (sessionId: string, cwd: string) => Promise<AcpSessionLoadResult>;
   newSession: (cwd: string) => Promise<AcpSessionLoadResult>;
   setConfigOption: (sessionId: string, configId: string, value: string) => Promise<AcpConfigOption[] | undefined>;
-  prompt: (sessionId: string, content: AcpContentBlock[], token?: vscode.CancellationToken) => Promise<AcpSessionPromptResult>;
+  prompt: (
+    sessionId: string,
+    content: AcpContentBlock[],
+    token?: vscode.CancellationToken,
+  ) => Promise<AcpSessionPromptResult>;
   waitForConversationFullyIdle: (sessionId: string, token: vscode.CancellationToken) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
   logout: () => Promise<void>;
