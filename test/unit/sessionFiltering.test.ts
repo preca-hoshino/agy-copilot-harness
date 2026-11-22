@@ -396,6 +396,33 @@ describe('AgySessionController inputState & workspace filtering', () => {
     expect(state1.groups.map((g) => g.id)).toEqual(['mode']);
     expect(state2.groups.map((g) => g.id)).toEqual(['mode']);
 
+    const modeGroup1 = state1.groups[0];
+    expect(modeGroup1?.items.map((item) => item.id)).toEqual(['default', 'accept-edits', 'auto', 'plan']);
+    expect((modeGroup1?.items[0] as { agyPickerMeta?: unknown })?.agyPickerMeta).toMatchObject({
+      provider: 'antigravity',
+      category: 'permission',
+      pickerLabel: 'Manual permissions',
+      shortLabel: 'Manual',
+      tone: '',
+      lastInteractiveMode: 'default',
+    });
+    expect((modeGroup1?.items[2] as { agyPickerMeta?: unknown })?.agyPickerMeta).toMatchObject({
+      pickerLabel: 'Auto',
+      shortLabel: 'Auto',
+      tone: 'warning',
+    });
+
+    // Switching from accept-edits to plan retains accept-edits as lastInteractiveMode
+    controller.setSessionMode('sess-1', 'accept-edits');
+    controller.setSessionMode('sess-1', 'plan');
+    expect(controller.getLastInteractiveMode('sess-1')).toBe('accept-edits');
+
+    const stateAfterPlan = handler?.(buildSessionResource('sess-1'), undefined, cancellationToken) as vscode.ChatSessionInputState;
+    expect((stateAfterPlan.groups[0]?.selected as { agyPickerMeta?: unknown })?.agyPickerMeta).toMatchObject({
+      pickerLabel: 'Plan',
+      lastInteractiveMode: 'accept-edits',
+    });
+
     controller.dispose();
     disposeBackend();
   });

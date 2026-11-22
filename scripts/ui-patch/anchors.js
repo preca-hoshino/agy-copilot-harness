@@ -53,6 +53,10 @@ const COMMON_ANCHORS = {
     /(?<dto>[A-Za-z_$][\w$]*)\.hasForkHandler&&!this\.forkSession&&\(this\.forkSession=async\((?<c>[A-Za-z_$][\w$]*),(?<l>[A-Za-z_$][\w$]*)\)=>\{let (?<u>[A-Za-z_$][\w$]*)=await this\._proxy\.\$forkChatSession\(this\._providerHandle,this\.sessionResource,\k<c>\?this\.toRequestDto\(\k<c>\):void 0,\k<l>\);return (?<revive>[A-Za-z_$][\w$]*)\(\k<u>\)\}\)/g,
     'RemoteSession sideChat and fork bridge',
   ],
+  modePermissionsPicker: [
+    /\brenderLabel\((?<el>[$\w]+)\)\{let (?<children>[$\w]+)=\[\];\k<el>\.classList\.add\("chat-session-option-picker"\);let (?<group>[$\w]+)=this\.delegate\.getOptionGroup\(\),(?<compact>[$\w]+)=this\._pickerOptions\?\.compact\.get\(\)\?\?!1;\k<el>\.classList\.toggle\("compact",\k<compact>\);(?=let (?<label>[$\w]+)=this\.currentOption\?\.name\?\?\k<group>\?\.description\?\?[$\w]+\(15978,null\),(?<isDefaultIcon>[$\w]+)=this\.currentOption\?\.default&&this\.currentOption\?\.icon;return \k<el>\.classList\.toggle\("icon-only",\k<compact>&&!!this\.currentOption\?\.icon\),this\.currentOption\?\.icon&&\k<children>\.push\((?<renderIcon>[A-Za-z_$][\w$]*)\((?<toIcon>[A-Za-z_$][\w$]*)\(this\.currentOption\.icon\)\)\),!\k<isDefaultIcon>&&\(!\k<compact>\|\|!this\.currentOption\?\.icon\)&&\k<children>\.push\((?<dom>[A-Za-z_$][\w$]*)\("span\.chat-session-option-label",void 0,\k<label>\)\),(?<reset>[A-Za-z_$][\w$]*)\(\k<el>,\.\.\.\k<children>\),this\.setAriaLabelAttributes\(\k<el>\),\k<el>\.ariaLabel=\k<label>,null\})/g,
+    'ChatSessionOptionPicker.renderLabel 2-tier mode and permissions picker',
+  ],
 };
 
 const SESSIONS_ANCHORS = {

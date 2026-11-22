@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { parse as parseJsonc } from 'jsonc-parser';
 import * as vscode from 'vscode';
 import type { AcpSessionSummary } from '../acp/acpTypes.js';
 import type { AcpBackendInterface } from '../shared/contracts.js';
@@ -29,6 +30,27 @@ export interface EditingActionNotification {
   readonly hasRemainingEdits?: boolean | undefined;
 }
 
+export interface AgyModePickerMeta {
+  readonly provider: 'antigravity';
+  readonly category: 'mode' | 'permission';
+  readonly pickerLabel: string;
+  readonly shortLabel: string;
+  readonly detail: string;
+  readonly tone: '' | 'info' | 'warning';
+  readonly lastInteractiveMode: string;
+  readonly sandboxEnabled: boolean;
+  readonly sandboxSource: 'workspace' | 'user' | 'default';
+}
+
+interface AgyChatSessionProviderOptionItem extends vscode.ChatSessionProviderOptionItem {
+  readonly agyPickerMeta: AgyModePickerMeta;
+}
+
+interface TerminalSandboxStatus {
+  readonly enabled: boolean;
+  readonly source: 'workspace' | 'user' | 'default';
+}
+
 interface ModeOptionDescriptor {
   readonly id: string;
   readonly name: string;
@@ -46,7 +68,7 @@ const MODE_OPTIONS: readonly ModeOptionDescriptor[] = [
   {
     id: 'accept-edits',
     name: 'Accept edits',
-    description: 'Auto-approve file edits',
+    description: 'Auto-approve workspace file edits',
     icon: 'edit',
   },
   {
@@ -192,6 +214,7 @@ export class AgySessionController implements vscode.Disposable {
   private readonly newSessionIds = new Set<string>();
   private readonly untitledToRealId = new Map<string, string>();
   private readonly sessionModes = new Map<string, string>();
+  private readonly lastInteractiveModes = new Map<string, string>();
   private readonly sessionCwds = new Map<string, string>();
   private readonly sessionStatuses = new Map<string, vscode.ChatSessionStatus>();
   private readonly sessionChanges = new Map<string, vscode.ChatSessionFileChange[]>();
@@ -388,6 +411,11 @@ export class AgySessionController implements vscode.Disposable {
       this.sessionModes.set(realSessionId, mode);
     }
 
+    const lastInteractive = this.lastInteractiveModes.get(untitledId);
+    if (lastInteractive !== undefined && !this.lastInteractiveModes.has(realSessionId)) {
+      this.lastInteractiveModes.set(realSessionId, lastInteractive);
+    }
+
     const cwd = this.sessionCwds.get(untitledId);
     if (cwd !== undefined && !this.sessionCwds.has(realSessionId)) {
       this.sessionCwds.set(realSessionId, cwd);
@@ -548,6 +576,21 @@ export class AgySessionController implements vscode.Disposable {
     return this.getDefaultMode();
   }
 
+  public getLastInteractiveMode(sessionId?: string): string {
+    if (sessionId !== undefined && sessionId.length > 0) {
+      const resolvedId = this.resolveSessionId(sessionId);
+      const stored = this.lastInteractiveModes.get(resolvedId) ?? this.lastInteractiveModes.get(sessionId);
+      if (stored !== undefined && stored.length > 0 && stored !== 'plan') {
+        return stored;
+      }
+      const currentMode = this.sessionModes.get(resolvedId) ?? this.sessionModes.get(sessionId);
+      if (currentMode !== undefined && currentMode.length > 0 && currentMode !== 'plan') {
+        return currentMode;
+      }
+    }
+    return this.getDefaultInteractiveMode();
+  }
+
   public setSessionMode(sessionId: string, mode: string, syncInputState = true): void {
     if (mode.length === 0) {
       return;
@@ -556,6 +599,12 @@ export class AgySessionController implements vscode.Disposable {
     this.sessionModes.set(resolvedId, mode);
     if (resolvedId !== sessionId) {
       this.sessionModes.set(sessionId, mode);
+    }
+    if (mode !== 'plan') {
+      this.lastInteractiveModes.set(resolvedId, mode);
+      if (resolvedId !== sessionId) {
+        this.lastInteractiveModes.set(sessionId, mode);
+      }
     }
     if (syncInputState) {
       this.syncInputStateSelection(sessionId, resolvedId, 'mode', mode);
@@ -665,7 +714,9 @@ export class AgySessionController implements vscode.Disposable {
       this.newSessionIds.add(newSessionId);
     }
     this.sessionCwds.set(newSessionId, cwd);
-    this.sessionModes.set(newSessionId, this.getSessionMode(sourceSessionId));
+    const inheritedMode = this.getSessionMode(sourceSessionId);
+    this.sessionModes.set(newSessionId, inheritedMode);
+    this.lastInteractiveModes.set(newSessionId, this.getLastInteractiveMode(sourceSessionId));
 
     const sourceTitle = this.getSessionTitle(sourceSessionId) ?? 'Antigravity Session';
     const label = isSideChat ? `Side Chat: ${sourceTitle}` : `Fork: ${sourceTitle}`;
@@ -804,6 +855,7 @@ export class AgySessionController implements vscode.Disposable {
     this.newSessionIds.clear();
     this.untitledToRealId.clear();
     this.sessionModes.clear();
+    this.lastInteractiveModes.clear();
     this.sessionCwds.clear();
     this.sessionStatuses.clear();
     this.sessionChanges.clear();
@@ -829,6 +881,9 @@ export class AgySessionController implements vscode.Disposable {
     const initialOptions = extractInitialOptions(context);
     if (initialOptions.mode !== undefined && initialOptions.mode.length > 0) {
       this.sessionModes.set(untitledId, initialOptions.mode);
+      if (initialOptions.mode !== 'plan') {
+        this.lastInteractiveModes.set(untitledId, initialOptions.mode);
+      }
     }
 
     const resource = buildSessionResource(untitledId);
@@ -869,7 +924,7 @@ export class AgySessionController implements vscode.Disposable {
       resolvedId !== undefined
         ? (this.sessionModes.get(resolvedId) ?? prevMode ?? this.getDefaultMode())
         : (prevMode ?? this.getDefaultMode());
-    const groups = [this.buildModeGroup(selectedMode)];
+    const groups = [this.buildModeGroup(selectedMode, resolvedId ?? rawSessionId)];
 
     const inputState = this.controller.createChatSessionInputState(groups);
     if (rawSessionId !== undefined) {
@@ -891,7 +946,7 @@ export class AgySessionController implements vscode.Disposable {
     return inputState;
   }
 
-  private buildModeGroup(selectedModeId: string): vscode.ChatSessionProviderOptionGroup {
+  private buildModeGroup(selectedModeId: string, sessionId?: string): vscode.ChatSessionProviderOptionGroup {
     const mode = this.backend.getLastKnownConfigOptions().find((option) => option.id === 'mode');
     const choices =
       mode !== undefined && mode.options.length > 0
@@ -905,11 +960,16 @@ export class AgySessionController implements vscode.Disposable {
             };
           })
         : MODE_OPTIONS;
-    const items: vscode.ChatSessionProviderOptionItem[] = choices.map((option) => ({
+    const effectiveSelectedId = selectedModeId.length > 0 ? selectedModeId : (mode?.currentValue ?? 'default');
+    const lastInteractiveMode =
+      effectiveSelectedId !== 'plan' ? effectiveSelectedId : this.getLastInteractiveMode(sessionId);
+    const sandbox = this.resolveTerminalSandboxStatus();
+    const items: AgyChatSessionProviderOptionItem[] = choices.map((option) => ({
       id: option.id,
       name: option.name,
       ...(option.description !== undefined ? { description: option.description } : {}),
       icon: new vscode.ThemeIcon(option.icon),
+      agyPickerMeta: buildModePickerMeta(option.id, option.name, option.description, lastInteractiveMode, sandbox),
     }));
 
     const selected =
@@ -1002,10 +1062,14 @@ export class AgySessionController implements vscode.Disposable {
           continue;
         }
         changed = true;
-        nextGroups.push({
-          ...group,
-          selected: matched,
-        });
+        if (groupId === 'mode') {
+          nextGroups.push(this.buildModeGroup(matched.id, resolvedId));
+        } else {
+          nextGroups.push({
+            ...group,
+            selected: matched,
+          });
+        }
       }
       if (changed) {
         inputState.groups = nextGroups;
@@ -1065,6 +1129,43 @@ export class AgySessionController implements vscode.Disposable {
       this.outputChannel.appendLine(`[AgySessionController] Failed reading defaultMode config: ${formatError(error)}`);
     }
     return 'default';
+  }
+
+  private getDefaultInteractiveMode(): string {
+    const defaultMode = this.getDefaultMode();
+    return defaultMode !== 'plan' ? defaultMode : 'default';
+  }
+
+  private resolveTerminalSandboxStatus(): TerminalSandboxStatus {
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (workspaceFolders !== undefined) {
+      for (const folder of workspaceFolders) {
+        if (folder.uri.scheme !== 'file') {
+          continue;
+        }
+        for (const relDir of ['.gemini', '.antigravity']) {
+          const enabled = readSandboxSettingFromFile(path.join(folder.uri.fsPath, relDir, 'settings.json'));
+          if (enabled !== undefined) {
+            return { enabled, source: 'workspace' };
+          }
+        }
+      }
+    }
+
+    const appDataDir = getConfiguredAppDataDir();
+    const userCandidates = [
+      path.join(os.homedir(), '.gemini', appDataDir, 'settings.json'),
+      path.join(os.homedir(), '.gemini', 'antigravity-cli', 'settings.json'),
+      path.join(os.homedir(), '.gemini', 'settings.json'),
+    ];
+    for (const candidate of userCandidates) {
+      const enabled = readSandboxSettingFromFile(candidate);
+      if (enabled !== undefined) {
+        return { enabled, source: 'user' };
+      }
+    }
+
+    return { enabled: true, source: 'default' };
   }
 
   private getDefaultWorkspaceCwd(): string {
@@ -1233,6 +1334,81 @@ function formatError(error: unknown): string {
 
 function isRecordObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function buildModePickerMeta(
+  id: string,
+  name: string,
+  description: string | undefined,
+  lastInteractiveMode: string,
+  sandbox: TerminalSandboxStatus,
+): AgyModePickerMeta {
+  const base = {
+    provider: 'antigravity' as const,
+    lastInteractiveMode,
+    sandboxEnabled: sandbox.enabled,
+    sandboxSource: sandbox.source,
+  };
+  switch (id) {
+    case 'default':
+      return {
+        ...base,
+        category: 'permission',
+        pickerLabel: 'Manual permissions',
+        shortLabel: 'Manual',
+        detail: description ?? 'Ask before edits and commands',
+        tone: '',
+      };
+    case 'accept-edits':
+      return {
+        ...base,
+        category: 'permission',
+        pickerLabel: 'Accept edits',
+        shortLabel: 'Accept edits',
+        detail: description ?? 'Auto-approve workspace file edits',
+        tone: 'info',
+      };
+    case 'auto':
+      return {
+        ...base,
+        category: 'permission',
+        pickerLabel: 'Auto',
+        shortLabel: 'Auto',
+        detail: description ?? 'Automatically approve one-time tool requests',
+        tone: 'warning',
+      };
+    case 'plan':
+      return {
+        ...base,
+        category: 'mode',
+        pickerLabel: 'Plan',
+        shortLabel: 'Plan',
+        detail: description ?? 'Plan changes before executing',
+        tone: '',
+      };
+    default:
+      return {
+        ...base,
+        category: 'permission',
+        pickerLabel: name,
+        shortLabel: name,
+        detail: description ?? '',
+        tone: '',
+      };
+  }
+}
+
+function readSandboxSettingFromFile(filePath: string): boolean | undefined {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed: unknown = parseJsonc(raw, undefined, { allowTrailingComma: true });
+    if (isRecordObject(parsed) && typeof parsed.enableTerminalSandbox === 'boolean') {
+      return parsed.enableTerminalSandbox;
+    }
+  } catch {
+    // Missing or unreadable settings file falls through to next candidate.
+  }
+  return undefined;
 }
 
 function toUriFromUnknown(raw: unknown): vscode.Uri | undefined {

@@ -1,6 +1,7 @@
 const { SESSIONS_ANCHORS, WORKBENCH_ANCHORS, resolveAnchors } = require('./anchors');
 const { markSnippet, reattachFooter } = require('./markers');
 const { buildTrustedAuthAccessSnippet, buildWorkbenchAccountsOrderSnippet } = require('./snippets/accounts');
+const { buildModePermissionsPickerSnippet } = require('./snippets/mode-permissions-picker');
 const { buildSessionsPanelSnippet, buildSessionsSkipContributedSnippet } = require('./snippets/sessions-panel');
 const { buildSessionHistoryUsageSnippet } = require('./snippets/session-usage');
 const { buildStatusBarTooltipSnippet } = require('./snippets/status-tooltip');
@@ -40,6 +41,7 @@ function commonInsertions(matches) {
     [matches.workingSetDedup.end, 'working-set-dedup', buildWorkingSetDedupSnippet(matches.workingSetDedup.groups)],
     [matches.editingActionNotify.end, 'editing-action-notify', buildEditingActionNotifySnippet(matches.editingActionNotify.groups)],
     [matches.sideChatSession.end, 'side-chat-session', buildSideChatSessionSnippet(matches.sideChatSession.groups)],
+    [matches.modePermissionsPicker.end, 'mode-permissions-picker', buildModePermissionsPickerSnippet(matches.modePermissionsPicker.groups)],
   ];
 }
 

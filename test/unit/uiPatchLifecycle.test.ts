@@ -24,6 +24,7 @@ function commonBundle() {
     'class RemoteSession{async _doInitializeContent(e,t){let i=await this._proxy.$provideChatSessionContent();this.history.length=0;this.history.push(...i.history.map(c=>{if(c.type==="request")return c;return{type:"response",parts:c.parts.map(l=>$revive(l)),participant:c.participant,details:c.details}})),i.hasActiveResponseCallback&&void 0,i.hasForkHandler&&!this.forkSession&&(this.forkSession=async(c,l)=>{let u=await this._proxy.$forkChatSession(this._providerHandle,this.sessionResource,c?this.toRequestDto(c):void 0,l);return $revive(u)})}}',
     'class EditingWidget{renderChatEditingSessionWithEntries(e,t,i,n){let C=i.read(e),k=n.read(e);return C.concat(k)}}',
     'class ChatSvc{notifyUserAction(e){if(this._chatServiceTelemetry.notifyUserAction(e),this._onDidPerformUserAction.fire(e),e.action.kind==="chatEditingSessionAction"){let t=this._sessionModels.get(e.sessionResource);t&&t.notifyEditingAction(e.action)}}}',
+    'class ChatOptionPicker{renderLabel(e){let t=[];e.classList.add("chat-session-option-picker");let i=this.delegate.getOptionGroup(),n=this._pickerOptions?.compact.get()??!1;e.classList.toggle("compact",n);let r=this.currentOption?.name??i?.description??$d(15978,null),a=this.currentOption?.default&&this.currentOption?.icon;return e.classList.toggle("icon-only",n&&!!this.currentOption?.icon),this.currentOption?.icon&&t.push($ko($qu(this.currentOption.icon))),!a&&(!n||!this.currentOption?.icon)&&t.push($dom("span.chat-session-option-label",void 0,r)),$reset(e,...t),this.setAriaLabelAttributes(e),e.ariaLabel=r,null}}',
   ].join('\r\n');
 }
 
@@ -127,6 +128,135 @@ describe('VS Code UI patch lifecycle', () => {
       expect(supportsDelegation('antigravity')).toBe(false);
       expect(supportsDelegation('local')).toBe(true);
       expect(supportsDelegation('other-acp')).toBe(false);
+    }
+  });
+
+  it('renders the 2-tier Mode + Permissions split picker and collapsible popup for antigravity in both bundles', () => {
+    expect(runPatch('--apply').status).toBe(0);
+    for (const file of [sessions, workbench]) {
+      const makeEl = (tag = 'div', className = '', text = '') => {
+        const listeners = new Map<string, Array<(ev: unknown) => void>>();
+        const attrs = new Map<string, string>();
+        const classes = new Set<string>(className.split('.').filter(Boolean));
+        const node: Record<string, unknown> = {
+          tagName: tag.toUpperCase(),
+          textContent: text,
+          role: '',
+          tabIndex: 0,
+          ariaLabel: '',
+          ariaHasPopup: undefined,
+          ariaExpanded: 'false',
+          ariaDisabled: undefined,
+          ariaHidden: undefined,
+          style: {} as Record<string, string>,
+          parentElement: null as unknown,
+          children: [] as unknown[],
+          classList: {
+            add: (...cls: string[]) => cls.forEach((c) => c && classes.add(c)),
+            remove: (...cls: string[]) => cls.forEach((c) => classes.delete(c)),
+            toggle: (c: string, force?: boolean) => (force === undefined ? (classes.has(c) ? classes.delete(c) : classes.add(c)) : force ? classes.add(c) : classes.delete(c)),
+            contains: (c: string) => classes.has(c),
+            toArray: () => [...classes],
+          },
+          setAttribute: (k: string, v: string) => attrs.set(k, String(v)),
+          removeAttribute: (k: string) => attrs.delete(k),
+          getAttribute: (k: string) => attrs.get(k),
+          addEventListener: (type: string, cb: (ev: unknown) => void) => {
+            const arr = listeners.get(type) ?? [];
+            arr.push(cb);
+            listeners.set(type, arr);
+          },
+          dispatch: (type: string, ev: Record<string, unknown>) => {
+            for (const cb of listeners.get(type) ?? []) cb({ preventDefault: vi.fn(), stopPropagation: vi.fn(), ...ev });
+          },
+          focus: vi.fn(),
+        };
+        return node;
+      };
+      const showCalls: unknown[][] = [];
+      const setOption = vi.fn();
+      const executeCommand = vi.fn();
+      const result = runInNewContext(
+        `
+        ${fs.readFileSync(file, 'utf8')}
+        const agyGroup = {
+          id: 'mode',
+          name: 'Agent Mode',
+          items: [
+            { id: 'default', name: 'Default', icon: { id: 'shield' }, agyPickerMeta: { provider: 'antigravity', pickerLabel: 'Manual permissions', shortLabel: 'Manual', tone: '', lastInteractiveMode: 'default', sandboxEnabled: false, sandboxSource: 'user' } },
+            { id: 'auto', name: 'Auto', icon: { id: 'zap' }, agyPickerMeta: { provider: 'antigravity', pickerLabel: 'Auto', shortLabel: 'Auto', tone: 'warning', lastInteractiveMode: 'auto', sandboxEnabled: false, sandboxSource: 'user' } },
+            { id: 'plan', name: 'Plan', icon: { id: 'checklist' }, agyPickerMeta: { provider: 'antigravity', pickerLabel: 'Plan', shortLabel: 'Plan', tone: '', lastInteractiveMode: 'auto', sandboxEnabled: false, sandboxSource: 'user' } },
+          ],
+          selected: undefined,
+        };
+        agyGroup.selected = agyGroup.items[1];
+        const picker = new ChatOptionPicker();
+        picker.container = $dom('div.action-item');
+        picker.element = $dom('a.action-label');
+        picker.currentOption = agyGroup.selected;
+        picker._action = { enabled: true };
+        picker._actionWidgetService = { isVisible: false, show: (...args) => __showCalls.push(args), hide: () => {} };
+        picker.commandService = { executeCommand: __exec };
+        picker.actionWidgetOptions = { listOptions: { className: 'base-cls', widgetClassName: 'base-widget' } };
+        picker.setAriaLabelAttributes = (node) => node.setAttribute('aria-haspopup', 'true');
+        picker.delegate = {
+          getOptionGroup: () => agyGroup,
+          getSessionResource: () => ({ scheme: 'antigravity' }),
+          setOption: __setOption,
+        };
+        picker.renderLabel(picker.element);
+        const [modeBtn, permBtn] = picker.element.children;
+        permBtn.dispatch('mousedown', { button: 0 });
+        const permOpenArgs = __showCalls[0];
+        permOpenArgs[3].onHide();
+        modeBtn.dispatch('keydown', { key: 'Enter' });
+        const modeOpenArgs = __showCalls[1];
+
+        // Non-antigravity group falls back to original renderLabel
+        const otherEl = $dom('a.action-label');
+        const otherPicker = new ChatOptionPicker();
+        otherPicker.currentOption = { id: 'other', name: 'Other', icon: { id: 'circle' } };
+        otherPicker.setAriaLabelAttributes = (node) => node.setAttribute('aria-haspopup', 'true');
+        otherPicker.delegate = {
+          getOptionGroup: () => ({ id: 'mode', description: 'Other', items: [] }),
+          getSessionResource: () => ({ scheme: 'copilotcli' }),
+        };
+        otherPicker.renderLabel(otherEl);
+        ({
+          modeText: modeBtn.children[1].textContent,
+          permText: permBtn.children[0].textContent,
+          permClasses: permBtn.children[0].classList.toArray(),
+          permOpenCollapsed: [...permOpenArgs[8].collapsedByDefault],
+          modeOpenCollapsed: [...modeOpenArgs[8].collapsedByDefault],
+          popupWidgetClass: modeOpenArgs[8].widgetClassName,
+          otherElPopup: otherEl.getAttribute('aria-haspopup'),
+          otherElIsSplit: otherEl.classList.contains('agent-host-mode-permissions-trigger'),
+        });
+        `,
+        {
+          token: vi.fn(),
+          __showCalls: showCalls,
+          __setOption: setOption,
+          __exec: executeCommand,
+          $d: () => 'Pick Option',
+          $ko: (icon: unknown) => makeEl('span', `codicon codicon-${(icon as { id?: string })?.id ?? ''}`),
+          $qu: (icon: unknown) => icon,
+          $dom: (sel: string, _attrs?: unknown, text?: string) => makeEl(sel.split('.')[0] || 'div', sel.split('.').slice(1).join('.'), text ?? ''),
+          $reset: (target: Record<string, unknown>, ...kids: unknown[]) => {
+            target.children = kids;
+          },
+        },
+      );
+      expect(result).toEqual({
+        modeText: 'Interactive',
+        permText: 'Auto',
+        permClasses: ['agent-host-mode-permission-summary', 'warning'],
+        permOpenCollapsed: ['agentHostModePicker.mode'],
+        modeOpenCollapsed: ['agentHostModePicker.permissions'],
+        popupWidgetClass: 'base-widget agent-host-mode-permissions-popup',
+        otherElPopup: 'true',
+        otherElIsSplit: false,
+      });
     }
   });
 

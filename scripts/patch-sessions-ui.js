@@ -112,6 +112,11 @@ if (require.main === module) {
   const { renderQuotaGroups, renderQuotaRow } = require('./ui-patch/snippets/quota-rendering');
   const { extractHistoryUsageParts } = require('./ui-patch/snippets/session-usage');
   const { createTerminalApproval } = require('./ui-patch/snippets/terminal-approval');
+  const {
+    isAntigravityModeGroup,
+    resolveModePermissionsViewModel,
+    buildModePermissionsActionItems,
+  } = require('./ui-patch/snippets/mode-permissions-picker');
 
   module.exports = {
     PATCH_START,
@@ -122,6 +127,9 @@ if (require.main === module) {
     extractHistoryUsageParts,
     renderQuotaRow,
     renderQuotaGroups,
+    isAntigravityModeGroup,
+    resolveModePermissionsViewModel,
+    buildModePermissionsActionItems,
     patchSessionsContent: (content) => patchSessions(inspectPatch(content)),
     patchWorkbenchContent: (content) => patchWorkbench(inspectPatch(content)),
   };

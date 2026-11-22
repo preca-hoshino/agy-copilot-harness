@@ -4,7 +4,15 @@ import { describe, expect, it, vi } from 'vitest';
 import type { QuotaPoolSummary } from '../../src/shared/contracts.js';
 
 const requireFromProject = createRequire(`${process.cwd()}/package.json`);
-const { createTerminalApproval, extractHistoryUsageParts, renderQuotaGroups, renderQuotaRow } = requireFromProject('./scripts/patch-sessions-ui.js');
+const {
+  createTerminalApproval,
+  extractHistoryUsageParts,
+  renderQuotaGroups,
+  renderQuotaRow,
+  isAntigravityModeGroup,
+  resolveModePermissionsViewModel,
+  buildModePermissionsActionItems,
+} = requireFromProject('./scripts/patch-sessions-ui.js');
 const { buildSessionsPanelSnippet } = requireFromProject('./scripts/ui-patch/snippets/sessions-panel.js');
 const {
   buildEditingActionNotifySnippet,
@@ -514,5 +522,204 @@ describe('working set, editing action, and side chat UI snippets', () => {
       expect.objectContaining({ command: 'btw', participant: 'antigravity.agent' }),
       null,
     );
+  });
+});
+
+describe('Antigravity 2-tier mode and permissions picker', () => {
+  function makeGroup(selectedId: string, lastInteractiveMode = 'default', sandboxEnabled = true) {
+    const items = [
+      {
+        id: 'default',
+        name: 'Default',
+        description: 'Ask before edits and commands',
+        icon: { id: 'shield' },
+        agyPickerMeta: {
+          provider: 'antigravity',
+          category: 'permission',
+          pickerLabel: 'Manual permissions',
+          shortLabel: 'Manual',
+          detail: 'Ask before edits and commands',
+          tone: '',
+          lastInteractiveMode,
+          sandboxEnabled,
+          sandboxSource: sandboxEnabled ? 'default' : 'user',
+        },
+      },
+      {
+        id: 'accept-edits',
+        name: 'Accept edits',
+        description: 'Auto-approve workspace file edits',
+        icon: { id: 'edit' },
+        agyPickerMeta: {
+          provider: 'antigravity',
+          category: 'permission',
+          pickerLabel: 'Accept edits',
+          shortLabel: 'Accept edits',
+          detail: 'Auto-approve workspace file edits',
+          tone: 'info',
+          lastInteractiveMode,
+          sandboxEnabled,
+          sandboxSource: sandboxEnabled ? 'default' : 'user',
+        },
+      },
+      {
+        id: 'auto',
+        name: 'Auto',
+        description: 'Automatically approve one-time tool requests',
+        icon: { id: 'zap' },
+        agyPickerMeta: {
+          provider: 'antigravity',
+          category: 'permission',
+          pickerLabel: 'Auto',
+          shortLabel: 'Auto',
+          detail: 'Automatically approve one-time tool requests',
+          tone: 'warning',
+          lastInteractiveMode,
+          sandboxEnabled,
+          sandboxSource: sandboxEnabled ? 'default' : 'user',
+        },
+      },
+      {
+        id: 'plan',
+        name: 'Plan',
+        description: 'Plan changes before executing',
+        icon: { id: 'checklist' },
+        agyPickerMeta: {
+          provider: 'antigravity',
+          category: 'mode',
+          pickerLabel: 'Plan',
+          shortLabel: 'Plan',
+          detail: 'Plan changes before executing',
+          tone: '',
+          lastInteractiveMode,
+          sandboxEnabled,
+          sandboxSource: sandboxEnabled ? 'default' : 'user',
+        },
+      },
+    ];
+    return {
+      id: 'mode',
+      name: 'Agent Mode',
+      items,
+      selected: items.find((item) => item.id === selectedId),
+    };
+  }
+
+  it('activates only for antigravity mode pickers and leaves other providers alone', () => {
+    expect(isAntigravityModeGroup(makeGroup('default'), { scheme: 'antigravity' })).toBe(true);
+    expect(isAntigravityModeGroup(makeGroup('default'), { scheme: 'copilotcli' })).toBe(true);
+    expect(isAntigravityModeGroup({ id: 'mode', items: [{ id: 'default', name: 'Default' }] }, { scheme: 'copilotcli' })).toBe(false);
+    expect(isAntigravityModeGroup({ id: 'model', items: [{ id: 'm1', name: 'Model' }] }, { scheme: 'antigravity' })).toBe(false);
+  });
+
+  it('resolves Copilot-style split button labels and tones for default, accept-edits, auto, and plan', () => {
+    const defVm = resolveModePermissionsViewModel(makeGroup('default'), undefined, undefined);
+    expect(defVm).toMatchObject({ isPlan: false, modeLabel: 'Interactive', modeIconId: 'comment', permShortLabel: 'Manual', permTone: '' });
+
+    const editVm = resolveModePermissionsViewModel(makeGroup('accept-edits'), undefined, undefined);
+    expect(editVm).toMatchObject({ isPlan: false, modeLabel: 'Interactive', modeIconId: 'comment', permShortLabel: 'Accept edits', permTone: 'info' });
+
+    const autoVm = resolveModePermissionsViewModel(makeGroup('auto'), undefined, undefined);
+    expect(autoVm).toMatchObject({ isPlan: false, modeLabel: 'Interactive', modeIconId: 'comment', permShortLabel: 'Auto', permTone: 'warning' });
+
+    const planVm = resolveModePermissionsViewModel(makeGroup('plan', 'accept-edits'), undefined, undefined);
+    expect(planVm).toMatchObject({
+      isPlan: true,
+      modeLabel: 'Plan',
+      modeIconId: 'checklist',
+      permShortLabel: 'Accept edits',
+      permTone: '',
+      activePermItem: expect.objectContaining({ id: 'accept-edits' }),
+    });
+  });
+
+  interface ModePickerActionListItem {
+    readonly kind: string;
+    readonly label: string;
+    readonly section?: string;
+    readonly isSectionToggle?: boolean;
+    readonly disabled?: boolean;
+    readonly focusableWhenDisabled?: boolean;
+    readonly description?: string;
+    readonly className?: string;
+    readonly toolbarActions?: Array<{ readonly run: () => void }>;
+    readonly item: {
+      readonly id: string;
+      readonly enabled?: boolean;
+      readonly checked?: boolean;
+      readonly run: () => void;
+    };
+  }
+
+  it('builds 2-tier Agent mode + Permissions + read-only Sandbox sections without Autopilot or Allow all', () => {
+    const onSelectInteractive = vi.fn();
+    const onSelectPlan = vi.fn();
+    const onSelectPermission = vi.fn();
+    const onConfigurePermissions = vi.fn();
+
+    const interactiveVm = resolveModePermissionsViewModel(makeGroup('auto', 'auto', false), undefined, undefined);
+    const items = buildModePermissionsActionItems(interactiveVm, {
+      onSelectInteractive,
+      onSelectPlan,
+      onSelectPermission,
+      onConfigurePermissions,
+    }) as ModePickerActionListItem[];
+
+    const modeItems = items.filter((item) => item.kind === 'action' && !item.isSectionToggle && item.section === 'agentHostModePicker.mode');
+    expect(modeItems.map((item) => item.label)).toEqual(['Interactive', 'Plan']);
+    expect(modeItems.map((item) => item.item.checked)).toEqual([true, false]);
+
+    const permItems = items.filter(
+      (item) => item.kind === 'action' && !item.isSectionToggle && item.section === 'agentHostModePicker.permissions',
+    );
+    expect(permItems.map((item) => item.label)).toEqual([
+      'Manual permissions',
+      'Accept edits',
+      'Auto',
+      'Sandboxing for terminal',
+    ]);
+    expect(permItems.map((item) => item.disabled)).toEqual([false, false, false, true]);
+    expect(permItems[2]?.item.checked).toBe(true);
+
+    const sandboxRow = permItems[3];
+    expect(sandboxRow).toMatchObject({
+      label: 'Sandboxing for terminal',
+      description: 'Off (CLI)',
+      disabled: true,
+      focusableWhenDisabled: true,
+    });
+    expect(sandboxRow?.item.enabled).toBe(false);
+    expect(sandboxRow?.item.checked).toBeUndefined();
+
+    // Gear button opens Harness settings
+    const permHeader = items.find((item) => item.isSectionToggle && item.section === 'agentHostModePicker.permissions');
+    expect(permHeader?.className).toBe('agent-host-mode-permissions warning');
+    permHeader?.toolbarActions?.[0]?.run();
+    expect(onConfigurePermissions).toHaveBeenCalledOnce();
+
+    // Selecting Plan remembers active interactive mode; selecting Interactive in Plan mode restores it
+    const planVm = resolveModePermissionsViewModel(makeGroup('plan', 'auto', true), undefined, 'accept-edits');
+    const planItems = buildModePermissionsActionItems(planVm, {
+      onSelectInteractive,
+      onSelectPlan,
+      onSelectPermission,
+      onConfigurePermissions,
+    }) as ModePickerActionListItem[];
+    const planPerms = planItems.filter(
+      (item) => item.kind === 'action' && !item.isSectionToggle && item.section === 'agentHostModePicker.permissions',
+    );
+    expect(planPerms.every((item) => item.disabled === true && item.focusableWhenDisabled === true)).toBe(true);
+    expect(planPerms[3]?.description).toBe('On (CLI)');
+
+    // Clicking disabled permission in Plan mode does not invoke callback
+    planPerms[0]?.item.run();
+    expect(onSelectPermission).not.toHaveBeenCalled();
+
+    // Clicking Interactive in Plan mode restores remembered interactive item (accept-edits)
+    const planModeItems = planItems.filter(
+      (item) => item.kind === 'action' && !item.isSectionToggle && item.section === 'agentHostModePicker.mode',
+    );
+    planModeItems[0]?.item.run();
+    expect(onSelectInteractive).toHaveBeenCalledWith(expect.objectContaining({ id: 'accept-edits' }));
   });
 });
