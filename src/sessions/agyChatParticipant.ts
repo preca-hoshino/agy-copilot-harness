@@ -11,6 +11,8 @@ import type {
 import type { AgyLanguageModelProvider } from '../models/agyLanguageModelProvider.js';
 import type { AcpBackendInterface, PermissionPrompt, QuotaServiceInterface } from '../shared/contracts.js';
 import { ActiveAgyTurn } from './activeAgyTurn.js';
+import { isSkillMarkdownPath, resolveSkillDisplayNameSync } from './agyCustomizationProvider.js';
+import { AgyEditTracker } from './agyEditTracker.js';
 import type { AgySessionController } from './agySessionController.js';
 import { extractSessionIdFromUri } from './agySessionController.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
@@ -95,6 +97,7 @@ class RunningTurnState {
     public readonly sessionId: string,
     public readonly turn: ActiveAgyTurn,
     public readonly liveAdapter: LiveStreamAdapter,
+    public readonly userPrompt: string,
   ) {}
 
   public isTurnSuperseded(): boolean {
@@ -342,6 +345,20 @@ export class AgyChatParticipant implements vscode.Disposable {
     this.browserRenderer = browserRenderer;
     this.outputChannel = outputChannel;
     this.setSessionModeHook = setSessionModeHook;
+    this.controller.registerActiveTurnSnapshotProvider((sessionId) => this.getActiveTurnSnapshot(sessionId));
+  }
+
+  private getActiveTurnSnapshot(
+    sessionId: string,
+  ): { readonly userPrompt: string; readonly assistantPartialResponse: string } | undefined {
+    const running = this.runningTurns.get(sessionId);
+    if (running === undefined || running.isTurnFinished()) {
+      return undefined;
+    }
+    return {
+      userPrompt: running.userPrompt,
+      assistantPartialResponse: running.liveAdapter.getAccumulatedMessageText(),
+    };
   }
 
   public createHandler(): vscode.ChatRequestHandler {
@@ -414,7 +431,8 @@ export class AgyChatParticipant implements vscode.Disposable {
         sessionId = await this.realizeNewSession(rawSessionId, cwd, request.prompt);
       }
 
-      const contentBlocks = await buildPromptBlocks(request, this.outputChannel);
+      const sideChatPreamble = this.controller.consumeSideChatPreamble(sessionId);
+      const contentBlocks = await buildPromptBlocks(request, this.outputChannel, sideChatPreamble);
       if (isTokenCancelled(token)) {
         if (!this.runningTurns.has(sessionId)) {
           this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
@@ -489,6 +507,23 @@ export class AgyChatParticipant implements vscode.Disposable {
         });
       });
 
+      const configuredAppDataDir = vscode.workspace
+        .getConfiguration('antigravityHarness')
+        .get<string>('appDataDir')
+        ?.trim();
+      const editTracker = new AgyEditTracker({
+        sessionId,
+        sessionCwd: cwd,
+        ...(configuredAppDataDir !== undefined && configuredAppDataDir.length > 0
+          ? { appDataDir: configuredAppDataDir }
+          : {}),
+        backend: this.backend,
+        startExternalEdit: async (uri, write, onTracked): Promise<void> => {
+          await turn.externalEdit(uri, write, onTracked);
+        },
+        outputChannel: this.outputChannel,
+      });
+
       let runningRef: RunningTurnState | undefined;
       const liveAdapter = new LiveStreamAdapter(
         this.browserRenderer,
@@ -508,8 +543,9 @@ export class AgyChatParticipant implements vscode.Disposable {
             this.lmProvider.recordContextWindow(selectedModelId ?? resolvedModel.modelValue, usage.size);
           }
         },
+        editTracker,
       );
-      const running = new RunningTurnState(sessionId, turn, liveAdapter);
+      const running = new RunningTurnState(sessionId, turn, liveAdapter, request.prompt);
       runningRef = running;
 
       let resetDrainTimer: (() => void) | undefined;
@@ -630,6 +666,11 @@ export class AgyChatParticipant implements vscode.Disposable {
       const permissionSubscription = this.backend.registerPermissionPrompt?.(sessionId, permissionHandler);
 
       const fileWriteSubscription = this.backend.registerFileWriteHandler?.(sessionId, async (uri, write) => {
+        if (!editTracker.shouldTrackInWorkingSet(uri.fsPath)) {
+          await write();
+          return;
+        }
+        editTracker.markFileWriteHandled(uri);
         await turn.externalEdit(uri, write, () => {
           liveAdapter.markExternalEdit(uri);
         });
@@ -815,7 +856,9 @@ export class AgyChatParticipant implements vscode.Disposable {
           const superseded = running.isTurnSuperseded();
           if (!superseded) {
             try {
+              await editTracker.flush();
               liveAdapter.flush();
+              this.controller.recordTurnContext(sessionId, request.prompt, liveAdapter.getAccumulatedMessageText());
             } finally {
               turn.finish();
               if (this.activeTurns.get(sessionId) === turn) {
@@ -1192,17 +1235,56 @@ async function askInChat(
   }
 }
 
+function reconstructSlashCommandPrompt(request: vscode.ChatRequest): string {
+  const cmd = request.command?.trim();
+  const body = request.prompt;
+  if (cmd === undefined || cmd.length === 0 || cmd === 'plan' || cmd === 'btw') {
+    return body;
+  }
+  const leadingToken = body.trimStart();
+  if (leadingToken === `/${cmd}` || leadingToken.startsWith(`/${cmd} `)) {
+    return body;
+  }
+  return body.trim().length > 0 ? `/${cmd} ${body}` : `/${cmd}`;
+}
+
+function getInvokedSlashCommandName(promptText: string): string | undefined {
+  const match = /^\/([A-Za-z0-9_.:-]+)(?:\s|$)/.exec(promptText.trimStart());
+  return match?.[1]?.toLowerCase();
+}
+
 async function buildPromptBlocks(
   request: vscode.ChatRequest,
   outputChannel: vscode.OutputChannel,
+  sideChatPreamble?: string,
 ): Promise<AcpContentBlock[]> {
   const blocks: AcpContentBlock[] = [];
-  const references = request.references.filter((reference) => reference.id !== 'vscode.customizations.index');
+  const promptText = reconstructSlashCommandPrompt(request);
+  const invokedCommand = getInvokedSlashCommandName(promptText);
+  const references = request.references.filter((reference) => {
+    if (reference.id === 'vscode.customizations.index') {
+      return false;
+    }
+    if (invokedCommand !== undefined && isUriValue(reference.value) && isSkillMarkdownPath(reference.value.fsPath)) {
+      const skillName = resolveSkillDisplayNameSync(reference.value.fsPath).toLowerCase();
+      if (skillName === invokedCommand) {
+        return false;
+      }
+    }
+    return true;
+  });
 
-  if (request.prompt.length > 0 || references.length === 0) {
+  const combinedText =
+    sideChatPreamble !== undefined && sideChatPreamble.length > 0
+      ? promptText.length > 0
+        ? `${sideChatPreamble}\n\n${promptText}`
+        : sideChatPreamble
+      : promptText;
+
+  if (combinedText.length > 0 || references.length === 0) {
     blocks.push({
       type: 'text',
-      text: request.prompt,
+      text: combinedText,
     });
   }
 

@@ -63,6 +63,7 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
         ...(title !== undefined && title.length > 0 ? { title } : {}),
         history: [],
         options: { mode },
+        forkHandler: this.createForkHandler(),
       };
     }
 
@@ -79,6 +80,7 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
         ...active,
         ...(title !== undefined && title.length > 0 ? { title } : {}),
         options: { mode: this.controller.getSessionMode(sessionId) },
+        forkHandler: this.createForkHandler(),
       };
     }
 
@@ -113,6 +115,7 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
         ...active,
         ...(title !== undefined && title.length > 0 ? { title } : {}),
         options: { mode: this.controller.getSessionMode(sessionId) },
+        forkHandler: this.createForkHandler(),
       };
     }
 
@@ -235,6 +238,17 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
       ...(resolvedTitle !== undefined && resolvedTitle.length > 0 ? { title: resolvedTitle } : {}),
       history,
       options: { mode: activeMode },
+      forkHandler: this.createForkHandler(),
+    };
+  }
+
+  private createForkHandler(): NonNullable<vscode.ChatSession['forkHandler']> {
+    return async (
+      sessionResource: vscode.Uri,
+      request: vscode.ChatRequestTurn | undefined,
+      forkToken: vscode.CancellationToken,
+    ): Promise<vscode.ChatSessionItem> => {
+      return await this.controller.createForkOrSideChatSession(sessionResource, request, forkToken);
     };
   }
 

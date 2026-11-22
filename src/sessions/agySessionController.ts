@@ -1,11 +1,33 @@
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
+import * as fsPromises from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { AcpSessionSummary } from '../acp/acpTypes.js';
 import type { AcpBackendInterface } from '../shared/contracts.js';
 import { ANTIGRAVITY_SCHEME } from '../shared/contracts.js';
+
+export interface ActiveTurnSnapshot {
+  readonly userPrompt: string;
+  readonly assistantPartialResponse: string;
+}
+
+export interface SideChatContextMetadata {
+  readonly sourceSessionId: string;
+  readonly turnId?: string | undefined;
+  readonly selection?: string | undefined;
+  readonly includeSourceContext: boolean;
+  readonly inFlightSnapshot?: ActiveTurnSnapshot | undefined;
+  readonly forkedFromBackend: boolean;
+  contextInjected: boolean;
+}
+
+export interface EditingActionNotification {
+  readonly uri?: unknown;
+  readonly outcome?: string | undefined;
+  readonly hasRemainingEdits?: boolean | undefined;
+}
 
 interface ModeOptionDescriptor {
   readonly id: string;
@@ -175,6 +197,9 @@ export class AgySessionController implements vscode.Disposable {
   private readonly sessionChanges = new Map<string, vscode.ChatSessionFileChange[]>();
   private readonly sessionTitles = new Map<string, string>();
   private readonly sessionInputStates = new Map<string, vscode.ChatSessionInputState>();
+  private readonly sideChatMetadataBySessionId = new Map<string, SideChatContextMetadata>();
+  private readonly sessionRecentTurnSummaries = new Map<string, string[]>();
+  private activeTurnSnapshotProvider: ((sessionId: string) => ActiveTurnSnapshot | undefined) | undefined;
 
   private watcher: fs.FSWatcher | undefined;
   private debounceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -388,6 +413,12 @@ export class AgySessionController implements vscode.Disposable {
       this.sessionInputStates.set(realSessionId, inputState);
     }
 
+    const sideChatMeta = this.sideChatMetadataBySessionId.get(untitledId);
+    if (sideChatMeta !== undefined && !this.sideChatMetadataBySessionId.has(realSessionId)) {
+      this.sideChatMetadataBySessionId.set(realSessionId, sideChatMeta);
+      this.sideChatMetadataBySessionId.delete(untitledId);
+    }
+
     const untitledResource = buildSessionResource(untitledId);
     const untitledItem = this.controller.items.get(untitledResource);
     const realResource = buildSessionResource(realSessionId);
@@ -542,7 +573,9 @@ export class AgySessionController implements vscode.Disposable {
     }
     const cwd = this.sessionCwds.get(resolvedId);
     if (cwd === undefined || !this.matchesWindowCwd(cwd)) {
-      throw new Error('This Antigravity session does not belong to the current VS Code window. Open its project folder to continue.');
+      throw new Error(
+        'This Antigravity session does not belong to the current VS Code window. Open its project folder to continue.',
+      );
     }
     return cwd;
   }
@@ -552,10 +585,7 @@ export class AgySessionController implements vscode.Disposable {
     return this.sessionTitles.get(resolvedId) ?? this.sessionTitles.get(sessionId);
   }
 
-  public updateSessionMetadata(
-    sessionId: string,
-    metadata: { readonly title?: string | undefined },
-  ): void {
+  public updateSessionMetadata(sessionId: string, metadata: { readonly title?: string | undefined }): void {
     const resolvedId = this.resolveSessionId(sessionId);
     if (metadata.title !== undefined && metadata.title.trim().length > 0) {
       const cleanTitle = metadata.title.trim();
@@ -567,7 +597,188 @@ export class AgySessionController implements vscode.Disposable {
         item.label = cleanTitle;
       });
     }
+  }
 
+  public registerActiveTurnSnapshotProvider(provider: (sessionId: string) => ActiveTurnSnapshot | undefined): void {
+    this.activeTurnSnapshotProvider = provider;
+  }
+
+  public recordTurnContext(sessionId: string, userPrompt: string, assistantResponse: string): void {
+    const resolvedId = this.resolveSessionId(sessionId);
+    const trimmedPrompt = userPrompt.trim();
+    const trimmedResponse = assistantResponse.trim();
+    if (trimmedPrompt.length === 0 && trimmedResponse.length === 0) {
+      return;
+    }
+    const existing = this.sessionRecentTurnSummaries.get(resolvedId) ?? [];
+    const entry = [
+      trimmedPrompt.length > 0 ? `User: ${trimmedPrompt.slice(0, 600)}` : '',
+      trimmedResponse.length > 0 ? `Assistant: ${trimmedResponse.slice(0, 1200)}` : '',
+    ]
+      .filter((line) => line.length > 0)
+      .join('\n');
+    const updated = [...existing, entry].slice(-3);
+    this.sessionRecentTurnSummaries.set(resolvedId, updated);
+  }
+
+  public async createForkOrSideChatSession(
+    sessionResource: vscode.Uri,
+    request: vscode.ChatRequestTurn | undefined,
+    token: vscode.CancellationToken,
+  ): Promise<vscode.ChatSessionItem> {
+    if (token.isCancellationRequested) {
+      throw new Error('Canceled');
+    }
+
+    const rawSourceId = extractSessionIdFromUri(sessionResource);
+    const sourceSessionId = this.resolveSessionId(rawSourceId);
+    const parsedPayload = parseSideChatRequestPayload(request?.prompt);
+    const isSideChat = request?.command === 'btw' || parsedPayload?.sideChat === true;
+
+    let cwd = this.getDefaultWorkspaceCwd();
+    try {
+      cwd = await this.getSessionCwd(sourceSessionId);
+    } catch {
+      // Fall back to default workspace cwd
+    }
+
+    const inFlightSnapshot = this.activeTurnSnapshotProvider?.(sourceSessionId);
+    let forkedNewId: string | undefined;
+    if (
+      !this.isNewSession(sourceSessionId) &&
+      inFlightSnapshot === undefined &&
+      this.backend.forkConversation !== undefined
+    ) {
+      try {
+        const forked = await this.backend.forkConversation(sourceSessionId);
+        forkedNewId = forked?.newCascadeId;
+      } catch (error: unknown) {
+        this.outputChannel.appendLine(
+          `[AgySessionController] ForkConversation failed for ${sourceSessionId}: ${formatError(error)}`,
+        );
+      }
+    }
+
+    const newSessionId =
+      forkedNewId !== undefined && forkedNewId.length > 0 ? forkedNewId : `untitled-${crypto.randomUUID()}`;
+    if (forkedNewId === undefined || forkedNewId.length === 0) {
+      this.newSessionIds.add(newSessionId);
+    }
+    this.sessionCwds.set(newSessionId, cwd);
+    this.sessionModes.set(newSessionId, this.getSessionMode(sourceSessionId));
+
+    const sourceTitle = this.getSessionTitle(sourceSessionId) ?? 'Antigravity Session';
+    const label = isSideChat ? `Side Chat: ${sourceTitle}` : `Fork: ${sourceTitle}`;
+    this.sessionTitles.set(newSessionId, label);
+
+    if (isSideChat) {
+      this.sideChatMetadataBySessionId.set(newSessionId, {
+        sourceSessionId,
+        turnId: parsedPayload?.turnId,
+        selection: parsedPayload?.selection,
+        includeSourceContext: parsedPayload?.includeSourceContext !== false,
+        inFlightSnapshot,
+        forkedFromBackend: forkedNewId !== undefined && forkedNewId.length > 0,
+        contextInjected: false,
+      });
+    }
+
+    const resource = buildSessionResource(newSessionId);
+    const item = this.controller.createChatSessionItem(resource, label);
+    item.iconPath = new vscode.ThemeIcon(isSideChat ? 'comment-discussion' : 'antigravity-logo');
+    const now = Date.now();
+    item.timing = { created: now, lastRequestStarted: now, lastRequestEnded: now };
+    applyLocationToItem(item, label, cwd);
+
+    this.lastItemsSignature = undefined;
+    if (this.matchesWindowCwd(cwd)) {
+      this.controller.items.add(item);
+    }
+    return item;
+  }
+
+  public consumeSideChatPreamble(sessionId: string): string | undefined {
+    const resolvedId = this.resolveSessionId(sessionId);
+    const meta = this.sideChatMetadataBySessionId.get(resolvedId) ?? this.sideChatMetadataBySessionId.get(sessionId);
+    if (meta === undefined || meta.contextInjected) {
+      return undefined;
+    }
+    meta.contextInjected = true;
+
+    const sections: string[] = [];
+    if (meta.includeSourceContext) {
+      if (!meta.forkedFromBackend) {
+        const recent = this.sessionRecentTurnSummaries.get(meta.sourceSessionId);
+        if (recent !== undefined && recent.length > 0) {
+          sections.push(`<recent_main_turns>\n${recent.join('\n---\n')}\n</recent_main_turns>`);
+        }
+      }
+      if (meta.inFlightSnapshot !== undefined) {
+        const promptPart = meta.inFlightSnapshot.userPrompt.trim();
+        const responsePart = meta.inFlightSnapshot.assistantPartialResponse.trim();
+        sections.push(
+          [
+            '<in_flight_main_turn>',
+            ...(promptPart.length > 0 ? [`User request currently running in main session:\n${promptPart}`] : []),
+            ...(responsePart.length > 0 ? [`Assistant response so far:\n${responsePart}`] : []),
+            '</in_flight_main_turn>',
+          ].join('\n'),
+        );
+      }
+    }
+
+    if (meta.selection !== undefined && meta.selection.trim().length > 0) {
+      sections.push(`<selected_excerpt>\n${meta.selection.trim()}\n</selected_excerpt>`);
+    }
+
+    sections.push(
+      "[Side Chat (/btw): Answer the user's side question concisely and accurately using the context above, without modifying unrelated task flow in the main session.]",
+    );
+    return sections.join('\n\n');
+  }
+
+  public async handleEditingAction(sessionResourceRaw: unknown, actionRaw: unknown): Promise<void> {
+    const sessionUri = toUriFromUnknown(sessionResourceRaw);
+    if (sessionUri === undefined || sessionUri.scheme !== ANTIGRAVITY_SCHEME) {
+      return;
+    }
+    const rawSessionId = extractSessionIdFromUri(sessionUri);
+    const resolvedId = this.resolveSessionId(rawSessionId);
+    const action = isRecordObject(actionRaw) ? (actionRaw as EditingActionNotification) : undefined;
+    const outcome = action?.outcome;
+    const fileUri = toUriFromUnknown(action?.uri);
+
+    if (outcome === 'rejected' && action?.hasRemainingEdits !== true && fileUri !== undefined) {
+      const targetStr = fileUri.toString();
+      const existing = this.sessionChanges.get(resolvedId);
+      if (existing !== undefined) {
+        const filtered = existing.filter((entry) => entry.modifiedUri.toString() !== targetStr);
+        if (filtered.length !== existing.length) {
+          this.setSessionChanges(resolvedId, filtered);
+        }
+      }
+    }
+
+    if (
+      (outcome === 'accepted' || outcome === 'rejected') &&
+      fileUri !== undefined &&
+      this.backend.acknowledgeCodeEdit !== undefined &&
+      !this.isNewSession(resolvedId)
+    ) {
+      let contents = '';
+      if (fileUri.scheme === 'file' && fileUri.fsPath.length > 0) {
+        try {
+          contents = await fsPromises.readFile(fileUri.fsPath, 'utf8');
+        } catch {
+          contents = '';
+        }
+      }
+      void this.backend
+        .acknowledgeCodeEdit(resolvedId, fileUri.toString(), contents, outcome === 'accepted')
+        .catch(() => {
+          /* best-effort acknowledgement */
+        });
+    }
   }
 
   public dispose(): void {
@@ -598,6 +809,8 @@ export class AgySessionController implements vscode.Disposable {
     this.sessionChanges.clear();
     this.sessionTitles.clear();
     this.sessionInputStates.clear();
+    this.sideChatMetadataBySessionId.clear();
+    this.sessionRecentTurnSummaries.clear();
   }
 
   private handleNewChatSessionItem(
@@ -635,9 +848,10 @@ export class AgySessionController implements vscode.Disposable {
     const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
     return workspaceFolders.length === 0
       ? cwd === ''
-      : cwd !== undefined && workspaceFolders.some((folder) =>
-        folder.uri.scheme === 'file' && isPathEqual(cwd, normalizeAcpCwd(folder.uri.fsPath)),
-      );
+      : cwd !== undefined &&
+          workspaceFolders.some(
+            (folder) => folder.uri.scheme === 'file' && isPathEqual(cwd, normalizeAcpCwd(folder.uri.fsPath)),
+          );
   }
 
   private handleGetChatSessionInputState(
@@ -679,10 +893,18 @@ export class AgySessionController implements vscode.Disposable {
 
   private buildModeGroup(selectedModeId: string): vscode.ChatSessionProviderOptionGroup {
     const mode = this.backend.getLastKnownConfigOptions().find((option) => option.id === 'mode');
-    const choices = mode !== undefined && mode.options.length > 0 ? mode.options.map((choice) => {
-      const known = MODE_OPTIONS.find((option) => option.id === choice.value);
-      return { id: choice.value, name: choice.name, description: choice.description ?? known?.description, icon: known?.icon ?? 'settings-sliders' };
-    }) : MODE_OPTIONS;
+    const choices =
+      mode !== undefined && mode.options.length > 0
+        ? mode.options.map((choice) => {
+            const known = MODE_OPTIONS.find((option) => option.id === choice.value);
+            return {
+              id: choice.value,
+              name: choice.name,
+              description: choice.description ?? known?.description,
+              icon: known?.icon ?? 'settings-sliders',
+            };
+          })
+        : MODE_OPTIONS;
     const items: vscode.ChatSessionProviderOptionItem[] = choices.map((option) => ({
       id: option.id,
       name: option.name,
@@ -690,7 +912,10 @@ export class AgySessionController implements vscode.Disposable {
       icon: new vscode.ThemeIcon(option.icon),
     }));
 
-    const selected = items.find((item) => item.id === selectedModeId) ?? items.find((item) => item.id === mode?.currentValue) ?? items[0];
+    const selected =
+      items.find((item) => item.id === selectedModeId) ??
+      items.find((item) => item.id === mode?.currentValue) ??
+      items[0];
     return {
       id: 'mode',
       name: 'Agent Mode',
@@ -1004,4 +1229,63 @@ function formatError(error: unknown): string {
     return error.message;
   }
   return String(error);
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function toUriFromUnknown(raw: unknown): vscode.Uri | undefined {
+  if (raw instanceof vscode.Uri) {
+    return raw;
+  }
+  if (typeof raw === 'string' && raw.length > 0) {
+    try {
+      return vscode.Uri.parse(raw);
+    } catch {
+      return undefined;
+    }
+  }
+  if (isRecordObject(raw)) {
+    if (typeof raw.fsPath === 'string' && raw.fsPath.length > 0) {
+      return vscode.Uri.file(raw.fsPath);
+    }
+    if (typeof raw.scheme === 'string' && typeof raw.path === 'string') {
+      return vscode.Uri.from({
+        scheme: raw.scheme,
+        path: raw.path,
+        ...(typeof raw.authority === 'string' ? { authority: raw.authority } : {}),
+        ...(typeof raw.query === 'string' ? { query: raw.query } : {}),
+        ...(typeof raw.fragment === 'string' ? { fragment: raw.fragment } : {}),
+      });
+    }
+  }
+  return undefined;
+}
+
+function parseSideChatRequestPayload(prompt: string | undefined):
+  | {
+      readonly sideChat?: boolean | undefined;
+      readonly turnId?: string | undefined;
+      readonly selection?: string | undefined;
+      readonly includeSourceContext?: boolean | undefined;
+    }
+  | undefined {
+  if (prompt === undefined || !prompt.trimStart().startsWith('{')) {
+    return undefined;
+  }
+  try {
+    const parsed: unknown = JSON.parse(prompt);
+    if (!isRecordObject(parsed)) {
+      return undefined;
+    }
+    return {
+      sideChat: typeof parsed.sideChat === 'boolean' ? parsed.sideChat : undefined,
+      turnId: typeof parsed.turnId === 'string' ? parsed.turnId : undefined,
+      selection: typeof parsed.selection === 'string' ? parsed.selection : undefined,
+      includeSourceContext: typeof parsed.includeSourceContext === 'boolean' ? parsed.includeSourceContext : undefined,
+    };
+  } catch {
+    return undefined;
+  }
 }

@@ -9,6 +9,7 @@ import { AgyLanguageModelProvider } from './models/agyLanguageModelProvider.js';
 import { AgyQuotaService } from './quota/agyQuotaService.js';
 import { QuotaStatusUI } from './quota/quotaStatusUI.js';
 import { AgyChatParticipant } from './sessions/agyChatParticipant.js';
+import { AgyCustomizationProvider } from './sessions/agyCustomizationProvider.js';
 import { AgySessionContentProvider } from './sessions/agySessionContentProvider.js';
 import { AgySessionController } from './sessions/agySessionController.js';
 import { BrowserSubagentRenderer, openMediaPreviewPanel } from './sessions/browserSubagentRenderer.js';
@@ -204,6 +205,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     attachmentDir,
     (sessionId) => chatParticipant.getActiveSession(sessionId),
   );
+  const configuredAppDataDir = vscode.workspace
+    .getConfiguration('antigravityHarness')
+    .get<string>('appDataDir')
+    ?.trim();
+  const customizationRegistration = AgyCustomizationProvider.register(
+    backend,
+    sessionController,
+    configuredAppDataDir !== undefined && configuredAppDataDir.length > 0 ? configuredAppDataDir : 'antigravity',
+  );
   const participant = vscode.chat.createChatParticipant(ANTIGRAVITY_SCHEME, chatParticipant.createHandler());
 
   const runLogin = async (): Promise<void> => {
@@ -251,6 +261,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     lmProvider,
     sessionController,
     contentProvider,
+    customizationRegistration.disposable,
     chatParticipant,
     participant,
     googleAuthProvider,
@@ -276,7 +287,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand('antigravityHarness.manageModels', async (): Promise<void> => {
       void quotaService.refresh();
-      await vscode.commands.executeCommand('workbench.action.chat.manage', '@provider:"Antigravity"', ANTIGRAVITY_SCHEME);
+      await vscode.commands.executeCommand(
+        'workbench.action.chat.manage',
+        '@provider:"Antigravity"',
+        ANTIGRAVITY_SCHEME,
+      );
     }),
     vscode.commands.registerCommand('antigravityHarness.signIn', async (): Promise<void> => {
       await runLogin();
@@ -299,6 +314,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await sessionController.refreshSessions();
       await quotaService.refresh(true);
     }),
+    vscode.commands.registerCommand(
+      'antigravityHarness._onEditingAction',
+      async (sessionResourceRaw?: unknown, actionRaw?: unknown): Promise<void> => {
+        await sessionController.handleEditingAction(sessionResourceRaw, actionRaw);
+      },
+    ),
     vscode.commands.registerCommand(
       'antigravityHarness.openMediaPreview',
       async (mediaArg?: unknown, titleArg?: unknown): Promise<void> => {

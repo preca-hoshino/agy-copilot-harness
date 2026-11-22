@@ -1689,4 +1689,100 @@ describe('AgySessionController inputState & workspace filtering', () => {
       disposeBackend();
     }
   });
+
+  it('creates /btw side chat sessions with in-flight context, forwards slash commands, and syncs Keep/Undo actions', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'main-sess-1', cwd: 'D:\\repo', title: 'Main Feature' },
+    ]);
+    const acknowledgeCalls: Array<{ id: string; uri: string; contents: string; accept: boolean }> = [];
+    backend.acknowledgeCodeEdit = async (id, uri, contents, accept) => {
+      acknowledgeCalls.push({ id, uri, contents, accept });
+      return true;
+    };
+    const promptCalls: Array<{ sessionId: string; blocks: unknown[] }> = [];
+    vi.spyOn(backend, 'prompt').mockImplementation(async (sessionId, blocks) => {
+      promptCalls.push({ sessionId, blocks });
+      return { stopReason: 'end_turn' };
+    });
+
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(
+      backend,
+      controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer,
+      createFakeOutputChannel(),
+    );
+
+    const mainResource = buildSessionResource('main-sess-1');
+    const source = new vscode.CancellationTokenSource();
+    try {
+      controller.recordTurnContext('main-sess-1', 'Build feature X', 'Updated files cleanly.');
+      controller.registerActiveTurnSnapshotProvider((id) =>
+        id === 'main-sess-1' ? { userPrompt: 'Refactor module Y', assistantPartialResponse: 'Editing index.ts...' } : undefined,
+      );
+
+      const sideItem = await controller.createForkOrSideChatSession(
+        mainResource,
+        {
+          prompt: JSON.stringify({
+            sideChat: true,
+            turnId: 'turn-2',
+            selection: 'const x = 42;',
+            includeSourceContext: true,
+          }),
+          command: 'btw',
+        } as unknown as vscode.ChatRequestTurn,
+        source.token,
+      );
+      expect(sideItem.label).toBe('Side Chat: Main Feature');
+
+      await participant.createHandler()(
+        { prompt: 'Why 42?', command: 'btw', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: sideItem, isUntitled: false } },
+        { push: vi.fn() } as unknown as vscode.ChatResponseStream,
+        source.token,
+      );
+      expect(promptCalls).toHaveLength(1);
+      const sentText = (promptCalls[0]?.blocks[0] as { text?: string } | undefined)?.text ?? '';
+      expect(sentText).toContain('<in_flight_main_turn>');
+      expect(sentText).toContain('Refactor module Y');
+      expect(sentText).toContain('<selected_excerpt>');
+      expect(sentText).toContain('const x = 42;');
+      expect(sentText).toContain('Why 42?');
+
+      // Subsequent regular prompt should reconstruct non-plan command (/compact) without side-chat preamble
+      await participant.createHandler()(
+        { prompt: 'focus on API', command: 'compact', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource: mainResource, label: 'Main Feature' }, isUntitled: false } },
+        { push: vi.fn() } as unknown as vscode.ChatResponseStream,
+        source.token,
+      );
+      const secondText = (promptCalls[1]?.blocks[0] as { text?: string } | undefined)?.text ?? '';
+      expect(secondText).toBe('/compact focus on API');
+
+      // Keep/Undo synchronization with session changes and AcknowledgeCascadeCodeEdit
+      const fileA = vscode.Uri.file('D:\\repo\\src\\a.ts');
+      const fileB = vscode.Uri.file('D:\\repo\\src\\b.ts');
+      controller.setSessionChanges('main-sess-1', [
+        { uri: fileA, originalUri: fileA, modifiedUri: fileA, insertions: 2, deletions: 0 },
+        { uri: fileB, originalUri: fileB, modifiedUri: fileB, insertions: 1, deletions: 1 },
+      ]);
+      await controller.handleEditingAction(mainResource, { uri: fileA, outcome: 'rejected' });
+      expect(controller.controller.items.get(mainResource)?.changes?.map((c) => c.modifiedUri.toString())).toEqual([
+        fileB.toString(),
+      ]);
+      await vi.waitFor(() => expect(acknowledgeCalls).toHaveLength(1));
+      expect(acknowledgeCalls[0]).toMatchObject({ id: 'main-sess-1', accept: false });
+    } finally {
+      source.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
 });
