@@ -287,6 +287,8 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
             );
           }
         }
+      } else if (update.optionId === 'folder' && isUnrealized) {
+        this.controller.setSessionCwd(rawSessionId, optionValue);
       }
     }
   }

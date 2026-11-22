@@ -428,7 +428,9 @@ export class AgyChatParticipant implements vscode.Disposable {
       }
 
       if (this.controller.isNewSession(rawSessionId)) {
-        sessionId = await this.realizeNewSession(rawSessionId, cwd, request.prompt);
+        const realized = await this.realizeNewSession(rawSessionId, cwd, request.prompt, token);
+        sessionId = realized.sessionId;
+        releaseSession = realized.releaseSession;
       }
 
       const sideChatPreamble = this.controller.consumeSideChatPreamble(sessionId);
@@ -447,10 +449,14 @@ export class AgyChatParticipant implements vscode.Disposable {
         }
         const existing = this.runningTurns.get(sessionId);
         if (existing !== undefined && !existing.canBeSuperseded()) {
+          if (releaseSession !== undefined) {
+            releaseSession();
+            releaseSession = undefined;
+          }
           await existing.waitUntilSteerableOrSettled(token);
           continue;
         }
-        releaseSession = await acquireSessionOperation(this.backend, sessionId, token);
+        releaseSession ??= await acquireSessionOperation(this.backend, sessionId, token);
         const current = this.runningTurns.get(sessionId);
         if (current !== undefined && !current.canBeSuperseded()) {
           releaseSession();
@@ -942,26 +948,44 @@ export class AgyChatParticipant implements vscode.Disposable {
     }
   }
 
-  private async realizeNewSession(rawSessionId: string, cwd: string, promptText: string): Promise<string> {
+  private async realizeNewSession(
+    rawSessionId: string,
+    cwd: string,
+    promptText: string,
+    token: vscode.CancellationToken,
+  ): Promise<{ readonly sessionId: string; readonly releaseSession?: (() => void) | undefined }> {
     const existingCreation = this.pendingCreations.get(rawSessionId);
     if (existingCreation !== undefined) {
-      return await existingCreation;
+      return { sessionId: await existingCreation };
     }
+    let acquiredRelease: (() => void) | undefined;
     const creation = (async (): Promise<string> => {
       const created = await this.backend.newSession(cwd);
       const newSessionId = created.sessionId;
-      this.controller.markSessionRealized(rawSessionId, newSessionId);
-
-      const derivedTitle = deriveSessionTitle(promptText);
-      this.controller.updateSessionMetadata(newSessionId, {
-        ...(derivedTitle !== undefined ? { title: derivedTitle } : {}),
-      });
-      return newSessionId;
+      // Hold the per-session operation lock before publishing the realized item so
+      // an eager session open attaches to the active turn rather than replaying.
+      acquiredRelease = await acquireSessionOperation(this.backend, newSessionId, token);
+      try {
+        this.controller.markSessionRealized(rawSessionId, newSessionId);
+        const derivedTitle = deriveSessionTitle(promptText);
+        this.controller.updateSessionMetadata(newSessionId, {
+          ...(derivedTitle !== undefined ? { title: derivedTitle } : {}),
+        });
+        return newSessionId;
+      } catch (error: unknown) {
+        acquiredRelease();
+        acquiredRelease = undefined;
+        throw error;
+      }
     })();
     this.pendingCreations.set(rawSessionId, creation);
     try {
-      return await creation;
+      const newSessionId = await creation;
+      const releaseSession = acquiredRelease;
+      acquiredRelease = undefined;
+      return { sessionId: newSessionId, ...(releaseSession !== undefined ? { releaseSession } : {}) };
     } finally {
+      acquiredRelease?.();
       if (this.pendingCreations.get(rawSessionId) === creation) {
         this.pendingCreations.delete(rawSessionId);
       }

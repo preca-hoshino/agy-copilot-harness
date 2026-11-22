@@ -494,12 +494,56 @@ describe('AgySessionController inputState & workspace filtering', () => {
     await expect(controller.getSessionCwd('s-empty')).resolves.toBe('');
     await expect(controller.getSessionCwd('untitled-empty')).resolves.toBe('');
 
-    // An empty Agents window uses the same rule.
+    // In Agents Window (no workspace folders, isAgentSessionsWorkspace = true), keep all project sessions + empty cwd.
     ws.workspaceFolders = undefined;
     ws.isAgentSessionsWorkspace = true;
     await controller.refreshSessions();
-    expect(collectIds()).toEqual(['s-empty']);
+    expect(collectIds()).toEqual(['s-proj-a', 's-proj-a-sub', 's-proj-b', 's-scratch', 's-empty']);
+    const projAItem = controller.controller.items.get(buildSessionResource('s-proj-a'));
+    const emptyItem = controller.controller.items.get(buildSessionResource('s-empty'));
+    expect(projAItem?.metadata).toEqual({
+      workingDirectoryPath: normalizeAcpCwd(projectA),
+      cwd: normalizeAcpCwd(projectA),
+    });
+    expect(emptyItem?.metadata).toBeUndefined();
+    await expect(controller.getSessionCwd('s-proj-a')).resolves.toBe(normalizeAcpCwd(projectA));
+    await expect(controller.getSessionCwd('s-empty')).resolves.toBe('');
 
+    const agentsOutput = createFakeOutputChannel();
+    const agentsContentProvider = new AgySessionContentProvider(backend, controller, {} as BrowserSubagentRenderer, agentsOutput);
+    const agentsToken = new vscode.CancellationTokenSource();
+    const agentsDraftResource = buildSessionResource('untitled-agents');
+    await agentsContentProvider.provideHandleOptionsChange(
+      agentsDraftResource,
+      [{ optionId: 'folder', value: projectASub }],
+      agentsToken.token,
+    );
+    await expect(controller.getSessionCwd('untitled-agents')).resolves.toBe(normalizeAcpCwd(projectASub));
+
+    const newItemFromAgentsWindow = (
+      controller as unknown as {
+        handleNewChatSessionItem: (
+          context: vscode.NewChatSessionItemContext,
+          token: vscode.CancellationToken,
+        ) => vscode.ChatSessionItem;
+      }
+    ).handleNewChatSessionItem(
+      {
+        request: { prompt: 'hello' } as unknown as vscode.ChatRequest,
+        sessionOptions: [{ optionId: 'folder', value: projectB }],
+      },
+      agentsToken.token,
+    );
+    const createdAgentsId = newItemFromAgentsWindow.resource.path.replace(/^\/+/, '');
+    await expect(controller.getSessionCwd(createdAgentsId)).resolves.toBe(normalizeAcpCwd(projectB));
+    expect(newItemFromAgentsWindow.metadata).toEqual({
+      workingDirectoryPath: normalizeAcpCwd(projectB),
+      cwd: normalizeAcpCwd(projectB),
+    });
+    agentsContentProvider.dispose();
+    agentsToken.dispose();
+
+    ws.isAgentSessionsWorkspace = false;
     ws.workspaceFolders = [makeWorkspaceFolder(projectA, 'project'), makeWorkspaceFolder(scratchDir, 'scratch')];
     await controller.refreshSessions();
     expect(collectIds()).toEqual(['s-proj-a', 's-scratch']);

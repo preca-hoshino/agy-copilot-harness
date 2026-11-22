@@ -629,6 +629,23 @@ export class AgySessionController implements vscode.Disposable {
     return cwd;
   }
 
+  public setSessionCwd(sessionId: string, rawFolder: string): void {
+    const normalized = normalizeAcpCwd(rawFolder);
+    if (normalized.length === 0) {
+      return;
+    }
+    const resolvedCwd = this.resolveFolderSelection(normalized);
+    const resolvedId = this.resolveSessionId(sessionId);
+    this.sessionCwds.set(resolvedId, resolvedCwd);
+    if (resolvedId !== sessionId) {
+      this.sessionCwds.set(sessionId, resolvedCwd);
+    }
+    const label = this.getSessionTitle(sessionId) ?? 'New Antigravity Session';
+    this.applyToSessionItems(sessionId, resolvedId, (item) => {
+      applyLocationToItem(item, label, resolvedCwd);
+    });
+  }
+
   public getSessionTitle(sessionId: string): string | undefined {
     const resolvedId = this.resolveSessionId(sessionId);
     return this.sessionTitles.get(resolvedId) ?? this.sessionTitles.get(sessionId);
@@ -869,7 +886,13 @@ export class AgySessionController implements vscode.Disposable {
     context: NewChatSessionContextWithInputState,
     _token: vscode.CancellationToken,
   ): vscode.ChatSessionItem {
-    const resolvedCwd = this.getDefaultWorkspaceCwd();
+    const initialOptions = extractInitialOptions(context);
+    const normalizedFolder =
+      initialOptions.folder !== undefined && initialOptions.folder.length > 0
+        ? normalizeAcpCwd(initialOptions.folder)
+        : '';
+    const resolvedCwd =
+      normalizedFolder.length > 0 ? this.resolveFolderSelection(normalizedFolder) : this.getDefaultWorkspaceCwd();
     const untitledId = `untitled-${crypto.randomUUID()}`;
     this.newSessionIds.add(untitledId);
     this.sessionCwds.set(untitledId, resolvedCwd);
@@ -878,7 +901,6 @@ export class AgySessionController implements vscode.Disposable {
     const label = promptText.length > 0 ? truncateTitle(promptText) : 'New Antigravity Session';
     this.sessionTitles.set(untitledId, label);
 
-    const initialOptions = extractInitialOptions(context);
     if (initialOptions.mode !== undefined && initialOptions.mode.length > 0) {
       this.sessionModes.set(untitledId, initialOptions.mode);
       if (initialOptions.mode !== 'plan') {
@@ -899,10 +921,31 @@ export class AgySessionController implements vscode.Disposable {
     return item;
   }
 
+  private isAgentSessionsWindow(): boolean {
+    return (vscode.workspace as { readonly isAgentSessionsWorkspace?: boolean }).isAgentSessionsWorkspace === true;
+  }
+
+  private resolveFolderSelection(normalizedFolder: string): string {
+    const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+    if (workspaceFolders.length === 0) {
+      return this.isAgentSessionsWindow() ? normalizedFolder : '';
+    }
+    const matchedFolder = workspaceFolders.find((folder) => {
+      if (folder.uri.scheme !== 'file') {
+        return false;
+      }
+      const root = normalizeAcpCwd(folder.uri.fsPath);
+      return root.length > 0 && isPathInsideOrEqual(normalizedFolder, root);
+    });
+    return matchedFolder !== undefined ? normalizeAcpCwd(matchedFolder.uri.fsPath) : this.getDefaultWorkspaceCwd();
+  }
+
   private matchesWindowCwd(cwd: string | undefined): boolean {
     const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
     return workspaceFolders.length === 0
-      ? cwd === ''
+      ? this.isAgentSessionsWindow()
+        ? cwd !== undefined
+        : cwd === ''
       : cwd !== undefined &&
           workspaceFolders.some(
             (folder) => folder.uri.scheme === 'file' && isPathEqual(cwd, normalizeAcpCwd(folder.uri.fsPath)),
@@ -1251,23 +1294,28 @@ function parseTimestampMs(raw: string | undefined): number | undefined {
 
 function extractInitialOptions(context: NewChatSessionContextWithInputState): {
   readonly mode?: string | undefined;
+  readonly folder?: string | undefined;
 } {
   let mode: string | undefined;
+  let folder: string | undefined;
 
   if (context.sessionOptions !== undefined) {
     for (const option of context.sessionOptions) {
       const value = typeof option.value === 'string' ? option.value : option.value.id;
       if (option.optionId === 'mode') {
         mode = value;
+      } else if (option.optionId === 'folder') {
+        folder = value;
       }
     }
   }
 
   if (context.inputState?.groups !== undefined) {
     mode ??= findSelectedOptionId(context.inputState.groups, 'mode');
+    folder ??= findSelectedOptionId(context.inputState.groups, 'folder');
   }
 
-  return { mode };
+  return { mode, folder };
 }
 
 function getConfiguredAppDataDir(): string {
@@ -1290,10 +1338,16 @@ function applyLocationToItem(
 ): void {
   const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
   if (normalizedCwd === '') {
+    delete item.metadata;
     item.description = 'No Project';
     item.tooltip = `${label}\nNo Project`;
     return;
   }
+
+  item.metadata = {
+    workingDirectoryPath: normalizedCwd,
+    cwd: normalizedCwd,
+  };
 
   if (workspaceFolders.length === 1) {
     const firstFolderPath = normalizeAcpCwd(workspaceFolders[0]?.uri.fsPath ?? '');
