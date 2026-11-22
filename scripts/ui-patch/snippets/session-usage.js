@@ -2,10 +2,57 @@ const { validateSnippetSyntax } = require('./validate');
 
 function extractHistoryUsageParts(history, sessionResource) {
   if (sessionResource?.scheme !== 'antigravity' || !Array.isArray(history)) return;
+  const parseUri =
+    typeof sessionResource?.constructor?.parse === 'function'
+      ? (raw) => {
+          try {
+            return sessionResource.constructor.parse(raw);
+          } catch {
+            return undefined;
+          }
+        }
+      : undefined;
   for (const turn of history) {
     if (turn?.type !== 'response' || !Array.isArray(turn.parts)) continue;
     for (let i = turn.parts.length - 1; i >= 0; i -= 1) {
-      const value = turn.parts[i]?.content?.value;
+      const current = turn.parts[i];
+      if (
+        parseUri &&
+        current?.kind === 'toolInvocationSerialized' &&
+        current.isComplete !== false &&
+        !current.resultError &&
+        typeof current.toolSpecificData?.uri === 'string' &&
+        current.toolSpecificData.agyEdit !== false
+      ) {
+        const rawEntries =
+          Array.isArray(current.toolSpecificData.changes) && current.toolSpecificData.changes.length > 0
+            ? current.toolSpecificData.changes
+            : [current.toolSpecificData];
+        const edits = [];
+        for (const entry of rawEntries) {
+          if (typeof entry?.uri !== 'string') continue;
+          const parsedUri = parseUri(entry.uri);
+          if (!parsedUri) continue;
+          edits.push({
+            kind: 'externalEdit',
+            uri: parsedUri,
+            editKind: entry.editKind === 'create' ? 'create' : 'edit',
+            diff: {
+              added: typeof entry.insertions === 'number' ? entry.insertions : 0,
+              removed: typeof entry.deletions === 'number' ? entry.deletions : 0,
+            },
+            afterContentUri: parsedUri,
+            undoStopId: current.toolCallId,
+            ...(current.subAgentInvocationId !== undefined ? { subAgentInvocationId: current.subAgentInvocationId } : {}),
+          });
+        }
+        if (edits.length > 0) {
+          current.presentation = 'hidden';
+          turn.parts.splice(i + 1, 0, ...edits);
+          continue;
+        }
+      }
+      const value = current?.content?.value;
       if (typeof value !== 'string') continue;
       const match = /^<!--AGY_USAGE:(\{[^>]+\})-->$/.exec(value.trim());
       if (!match) continue;

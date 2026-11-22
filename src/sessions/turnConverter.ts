@@ -837,7 +837,10 @@ function populateEditPart(part: vscode.ChatToolInvocationPart, merged: AcpToolCa
     firstChange.modifiedUri.fsPath.length > 0 ? firstChange.modifiedUri.fsPath : firstChange.modifiedUri.path,
   );
   const nameLower = (merged.name ?? '').toLowerCase();
-  const verb = nameLower.includes('write') || nameLower.includes('create') ? 'Write' : 'Edit';
+  const isWriteOrCreate = nameLower.includes('write') || nameLower.includes('create');
+  const verb = isWriteOrCreate ? 'Write' : 'Edit';
+  const resolveEditKind = (change: vscode.ChatSessionFileChange): 'create' | 'edit' =>
+    isWriteOrCreate && change.originalUri === undefined ? 'create' : 'edit';
   const totalInsertions = changes.reduce((sum, item) => sum + item.insertions, 0);
   const totalDeletions = changes.reduce((sum, item) => sum + item.deletions, 0);
   const statsText = totalInsertions > 0 || totalDeletions > 0 ? ` (+${totalInsertions} -${totalDeletions})` : '';
@@ -846,9 +849,17 @@ function populateEditPart(part: vscode.ChatToolInvocationPart, merged: AcpToolCa
   part.invocationMessage = linkMd;
   part.pastTenseMessage = linkMd;
   part.toolSpecificData = {
+    agyEdit: merged.status !== 'failed',
     uri: firstChange.modifiedUri.toString(),
     insertions: totalInsertions,
     deletions: totalDeletions,
+    editKind: resolveEditKind(firstChange),
+    changes: changes.map((change) => ({
+      uri: change.modifiedUri.toString(),
+      insertions: change.insertions,
+      deletions: change.deletions,
+      editKind: resolveEditKind(change),
+    })),
   };
 }
 

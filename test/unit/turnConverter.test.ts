@@ -529,6 +529,13 @@ describe('TurnConverter', () => {
         expect(writePart.presentation).toBeUndefined();
         expect(writePart.invocationMessage).toBeInstanceOf(vscode.MarkdownString);
         expect((writePart.invocationMessage as vscode.MarkdownString).value).toContain('Write [app.ts (+2 -1)]');
+        expect(writePart.toolSpecificData).toMatchObject({
+          agyEdit: true,
+          editKind: 'edit',
+          insertions: 2,
+          deletions: 1,
+          changes: [{ insertions: 2, deletions: 1, editKind: 'edit' }],
+        });
       }
 
       const mdPart = parts[5];
@@ -572,7 +579,11 @@ describe('TurnConverter', () => {
     const result = converter.finalizeHistory();
     const response = result.turns[1] as vscode.ChatResponseTurn2;
     expect(response.response).toHaveLength(1);
-    expect(response.response[0]).toMatchObject({ isError: true, presentation: undefined });
+    expect(response.response[0]).toMatchObject({
+      isError: true,
+      presentation: undefined,
+      toolSpecificData: { agyEdit: false },
+    });
     expect(result.changes).toEqual([]);
   });
 
@@ -1026,6 +1037,12 @@ describe('TurnConverter', () => {
     const brainPart = pushedBrain[0] as vscode.ChatToolInvocationPart;
     expect(brainPart.presentation).toBeUndefined();
     expect((brainPart.pastTenseMessage as { value?: string } | undefined)?.value).toContain('Write [implementation_plan.md (+2 -0)]');
+    expect(brainPart.toolSpecificData).toMatchObject({
+      agyEdit: true,
+      editKind: 'create',
+      insertions: 2,
+      deletions: 0,
+    });
     expect(brainChanges).toHaveLength(0);
   });
 

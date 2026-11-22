@@ -37,6 +37,10 @@ const COMMON_ANCHORS = {
     /if\((?<item>[A-Za-z_$][\w$]*)\.kind==="externalEdits"\)\{(?=if\((?<session>[A-Za-z_$][\w$]*)\?\.editingSession&&(?<idx>[A-Za-z_$][\w$]*)!==void 0&&(?<reqId>[A-Za-z_$][\w$]*)\)\{let [A-Za-z_$][\w$]*=\k<item>\.start\?await \k<session>\.editingSession\.startExternalEdits\(\k<reqId>,\k<idx>,(?<revive>[A-Za-z_$][\w$]*)\(\k<item>\.resources\),\k<item>\.undoStopId\):await \k<session>\.editingSession\.stopExternalEdits\(\k<reqId>,\k<idx>\);(?<parts>[A-Za-z_$][\w$]*)\.push\()/g,
     'MainThreadChatAgents2.$handleProgressChunk externalEdits baseline',
   ],
+  liveEditPill: [
+    /if\((?<item>[A-Za-z_$][\w$]*)\.kind==="externalEdits"\)\{if\((?<session>[A-Za-z_$][\w$]*)\?\.editingSession&&(?<idx>[A-Za-z_$][\w$]*)!==void 0&&(?<reqId>[A-Za-z_$][\w$]*)\)\{let [A-Za-z_$][\w$]*=\k<item>\.start\?await \k<session>\.editingSession\.startExternalEdits\(\k<reqId>,\k<idx>,(?<revive>[A-Za-z_$][\w$]*)\(\k<item>\.resources\),\k<item>\.undoStopId\):await \k<session>\.editingSession\.stopExternalEdits\(\k<reqId>,\k<idx>\);(?<parts>[A-Za-z_$][\w$]*)\.push\(\.\.\.[A-Za-z_$][\w$]*\)\}continue\}(?=if\(\k<item>\.kind==="beginToolInvocation"\)\{)/g,
+    'MainThreadChatAgents2.$handleProgressChunk live edit pill',
+  ],
   workingSetDedup: [
     /\brenderChatEditingSessionWithEntries\((?<arg0>[A-Za-z_$][\w$]*),(?<arg1>[A-Za-z_$][\w$]*),(?<arg2>[A-Za-z_$][\w$]*),(?<arg3>[A-Za-z_$][\w$]*)\)\{/g,
     'renderChatEditingSessionWithEntries deduplication',

@@ -233,11 +233,11 @@ export function reconstructBeforeContent(
   const inputRecord = rawInput ?? args;
 
   const targetContent =
-    getStringField(args, ['TargetContent', 'old_string', 'oldText']) ??
-    getStringField(rawInput, ['TargetContent', 'old_string', 'oldText']);
+    getStringField(args, ['Target', 'TargetContent', 'targetContent', 'old_string', 'oldText']) ??
+    getStringField(rawInput, ['Target', 'TargetContent', 'targetContent', 'old_string', 'oldText']);
   const replacementContent =
-    getStringField(args, ['ReplacementContent', 'new_string', 'newText']) ??
-    getStringField(rawInput, ['ReplacementContent', 'new_string', 'newText']);
+    getStringField(args, ['Replacement', 'ReplacementContent', 'replacementContent', 'new_string', 'newText']) ??
+    getStringField(rawInput, ['Replacement', 'ReplacementContent', 'replacementContent', 'new_string', 'newText']);
 
   if (targetContent !== undefined && replacementContent !== undefined) {
     if (currentDiskContent === undefined) {
@@ -261,8 +261,13 @@ export function reconstructBeforeContent(
       if (!isRecord(chunk)) {
         continue;
       }
-      const chunkTarget = typeof chunk.TargetContent === 'string' ? chunk.TargetContent : undefined;
-      const chunkReplacement = typeof chunk.ReplacementContent === 'string' ? chunk.ReplacementContent : undefined;
+      const chunkTarget = getStringField(chunk, ['TargetContent', 'targetContent', 'Target', 'oldText']);
+      const chunkReplacement = getStringField(chunk, [
+        'ReplacementContent',
+        'replacementContent',
+        'Replacement',
+        'newText',
+      ]);
       if (
         chunkTarget !== undefined &&
         chunkReplacement !== undefined &&

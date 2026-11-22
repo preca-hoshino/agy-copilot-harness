@@ -8,6 +8,7 @@ const { buildTerminalApprovalSnippet } = require('./snippets/terminal-approval')
 const {
   buildEditingActionNotifySnippet,
   buildExternalEditBaselineSnippet,
+  buildLiveEditPillSnippet,
   buildSideChatSessionSnippet,
   buildWorkingSetDedupSnippet,
 } = require('./snippets/working-set');
@@ -35,6 +36,7 @@ function commonInsertions(matches) {
     [sessionDelegation.end, 'session-delegation', `if(${type}==="antigravity")return false;`],
     [matches.sessionHistoryUsage.end, 'session-history-usage', buildSessionHistoryUsageSnippet()],
     [matches.externalEditBaseline.end, 'external-edit-baseline', buildExternalEditBaselineSnippet(matches.externalEditBaseline.groups)],
+    [matches.liveEditPill.end, 'live-edit-pill', buildLiveEditPillSnippet(matches.liveEditPill.groups)],
     [matches.workingSetDedup.end, 'working-set-dedup', buildWorkingSetDedupSnippet(matches.workingSetDedup.groups)],
     [matches.editingActionNotify.end, 'editing-action-notify', buildEditingActionNotifySnippet(matches.editingActionNotify.groups)],
     [matches.sideChatSession.end, 'side-chat-session', buildSideChatSessionSnippet(matches.sideChatSession.groups)],

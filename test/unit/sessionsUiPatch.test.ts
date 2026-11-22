@@ -9,6 +9,7 @@ const { buildSessionsPanelSnippet } = requireFromProject('./scripts/ui-patch/sni
 const {
   buildEditingActionNotifySnippet,
   buildExternalEditBaselineSnippet,
+  buildLiveEditPillSnippet,
   buildSideChatSessionSnippet,
   buildWorkingSetDedupSnippet,
 } = requireFromProject('./scripts/ui-patch/snippets/working-set.js');
@@ -125,6 +126,78 @@ describe('historical session usage extraction', () => {
     expect(otherHistory[0]?.parts).toEqual([
       { kind: 'markdownContent', content: { value: '<!--AGY_USAGE:{"used":42000,"size":1048576}-->' } },
     ]);
+  });
+
+  it('converts completed historical agyEdit tool calls to native externalEdit pills and leaves failed ones visible', () => {
+    class MockResourceUri {
+      public readonly scheme = 'antigravity';
+      public constructor(public readonly raw: string) {}
+      public static parse(raw: string): MockResourceUri {
+        return new MockResourceUri(raw);
+      }
+      public toString(): string {
+        return this.raw;
+      }
+    }
+    const history = [
+      {
+        type: 'response',
+        parts: [
+          {
+            kind: 'toolInvocationSerialized',
+            toolCallId: 'tc-multi',
+            isComplete: true,
+            subAgentInvocationId: 'sub-1',
+            toolSpecificData: {
+              agyEdit: true,
+              uri: 'file:///repo/a.ts',
+              insertions: 11,
+              deletions: 10,
+              editKind: 'edit',
+              changes: [
+                { uri: 'file:///repo/a.ts', insertions: 11, deletions: 10, editKind: 'edit' },
+                { uri: 'file:///repo/new.ts', insertions: 5, deletions: 0, editKind: 'create' },
+              ],
+            },
+          },
+          {
+            kind: 'toolInvocationSerialized',
+            toolCallId: 'tc-failed',
+            isComplete: true,
+            toolSpecificData: {
+              agyEdit: false,
+              uri: 'file:///repo/failed.ts',
+              insertions: 1,
+              deletions: 0,
+              editKind: 'create',
+            },
+          },
+        ],
+      },
+    ];
+    extractHistoryUsageParts(history, new MockResourceUri('antigravity:/s1'));
+    expect(history[0]?.parts).toHaveLength(4);
+    expect(history[0]?.parts[0]).toMatchObject({ kind: 'toolInvocationSerialized', toolCallId: 'tc-multi', presentation: 'hidden' });
+    expect(history[0]?.parts[1]).toEqual({
+      kind: 'externalEdit',
+      uri: new MockResourceUri('file:///repo/a.ts'),
+      editKind: 'edit',
+      diff: { added: 11, removed: 10 },
+      afterContentUri: new MockResourceUri('file:///repo/a.ts'),
+      undoStopId: 'tc-multi',
+      subAgentInvocationId: 'sub-1',
+    });
+    expect(history[0]?.parts[2]).toEqual({
+      kind: 'externalEdit',
+      uri: new MockResourceUri('file:///repo/new.ts'),
+      editKind: 'create',
+      diff: { added: 5, removed: 0 },
+      afterContentUri: new MockResourceUri('file:///repo/new.ts'),
+      undoStopId: 'tc-multi',
+      subAgentInvocationId: 'sub-1',
+    });
+    expect(history[0]?.parts[3]).toMatchObject({ kind: 'toolInvocationSerialized', toolCallId: 'tc-failed' });
+    expect((history[0]?.parts[3] as { presentation?: string }).presentation).toBeUndefined();
   });
 });
 
@@ -266,8 +339,8 @@ describe('Agents account quota panel', () => {
 });
 
 describe('working set, editing action, and side chat UI snippets', () => {
-  it('strips __agy_before and passes baseline snapshot URIs to startExternalEdits', async () => {
-    const snippet = buildExternalEditBaselineSnippet({
+  it('strips __agy_before, suppresses duplicate B8s parts for antigravity, and converts completed live edits into externalEdit pills', async () => {
+    const baselineSnippet = buildExternalEditBaselineSnippet({
       item: 'p',
       session: 'r',
       idx: 'h',
@@ -275,10 +348,17 @@ describe('working set, editing action, and side chat UI snippets', () => {
       revive: 'revive',
       parts: 'c',
     });
-    const startExternalEdits = vi.fn(async () => ['part-1']);
+    const livePillSnippet = buildLiveEditPillSnippet({
+      item: 'p',
+      session: 'r',
+      reqId: 'l',
+      parts: 'c',
+    });
+    const startExternalEdits = vi.fn(async () => ['b8s-part']);
     const stopExternalEdits = vi.fn(async () => ['stop-part']);
 
     class FakeUri {
+      public readonly scheme = 'file';
       public constructor(public readonly path: string, public readonly query = '') {}
       public static parse(raw: string): FakeUri {
         return new FakeUri(raw, '');
@@ -286,17 +366,53 @@ describe('working set, editing action, and side chat UI snippets', () => {
       public with(change: { query?: string }): FakeUri {
         return new FakeUri(this.path, change.query ?? this.query);
       }
+      public toString(): string {
+        const clean = this.path.startsWith('file://') ? this.path : `file://${this.path}`;
+        return this.query.length > 0 ? `${clean}?${this.query}` : clean;
+      }
     }
 
-    const runner = runInNewContext(`(async function(p,r,h,l,c,revive){for(const _ of[0]){${snippet}let f=p.start?await r.editingSession.startExternalEdits(l,h,revive(p.resources),p.undoStopId):await r.editingSession.stopExternalEdits(l,h);c.push(...f)}})`);
-    const parts: string[] = [];
-    const target = new FakeUri('/workspace/a.ts', '__agy_before=' + encodeURIComponent('file:///tmp/base.tmp'));
+    const runner = runInNewContext(
+      `(async function(t,r,h,l,c,revive){for(const p of t){${baselineSnippet.replace('if(r?.sessionResource?.scheme', 'if(p.kind==="externalEdits"&&r?.sessionResource?.scheme')}if(p.kind==="externalEdits"){if(r?.editingSession&&h!==void 0&&l){let f=p.start?await r.editingSession.startExternalEdits(l,h,revive(p.resources),p.undoStopId):await r.editingSession.stopExternalEdits(l,h);c.push(...f)}continue}${livePillSnippet}c.push(p)}})`,
+    );
+
+    const streamingTool = { kind: 'toolInvocation', toolCallId: 'edit-1', presentation: undefined as string | undefined };
+    const reqModel: { _responseParts: Array<Record<string, unknown>>; __agyBeforeUris?: Map<string, FakeUri> } = {
+      _responseParts: [streamingTool],
+    };
+    const snapshotOriginal = new FakeUri('chat-editing-snapshot-text-model:/workspace/a.ts');
+    const getEntry = vi.fn(() => ({ originalURI: snapshotOriginal }));
+    const agySession = {
+      sessionResource: { scheme: 'antigravity', constructor: FakeUri },
+      editingSession: { startExternalEdits, stopExternalEdits, getEntry },
+    };
+    const agyParts: Array<Record<string, unknown>> = [
+      { kind: 'externalToolInvocationUpdate', toolCallId: 'edit-1', isComplete: false },
+    ];
+    const target = new FakeUri('/workspace/a.ts', `__agy_before=${encodeURIComponent('file:///tmp/base.tmp')}`);
+
+    // First run the completed tool update before startExternalEdits finishes (matching async tracker timing).
     await runner(
-      { kind: 'externalEdits', start: true, resources: [target], undoStopId: 'u1' },
-      { editingSession: { startExternalEdits, stopExternalEdits } },
+      [
+        {
+          kind: 'externalToolInvocationUpdate',
+          toolCallId: 'edit-1',
+          isComplete: true,
+          toolSpecificData: {
+            agyEdit: true,
+            uri: 'file:///workspace/a.ts',
+            insertions: 3,
+            deletions: 1,
+            editKind: 'edit',
+          },
+        },
+        { kind: 'externalEdits', start: true, resources: [target], undoStopId: 'u1' },
+        { kind: 'externalEdits', start: false, resources: [target], undoStopId: 'u1' },
+      ],
+      agySession,
       0,
-      'req-1',
-      parts,
+      reqModel,
+      agyParts,
       (x: unknown) => x,
     );
 
@@ -304,7 +420,40 @@ describe('working set, editing action, and side chat UI snippets', () => {
     const call = startExternalEdits.mock.calls[0] as unknown[];
     expect((call[2] as FakeUri[])[0]?.query).toBe('');
     expect((call[4] as FakeUri[])[0]?.path).toBe('file:///tmp/base.tmp');
-    expect(parts).toEqual(['part-1']);
+    expect(streamingTool.presentation).toBe('hidden');
+    // Stale in-batch partial update was stripped; closing update + single externalEdit pill remain (no B8s parts).
+    expect(agyParts).toHaveLength(2);
+    expect(agyParts[0]).toMatchObject({ kind: 'externalToolInvocationUpdate', toolCallId: 'edit-1', isComplete: true });
+    expect(agyParts[1]).toEqual({
+      kind: 'externalEdit',
+      uri: new FakeUri('file:///workspace/a.ts'),
+      editKind: 'edit',
+      diff: { added: 3, removed: 1 },
+      beforeContentUri: snapshotOriginal,
+      afterContentUri: new FakeUri('file:///workspace/a.ts'),
+      undoStopId: 'edit-1',
+    });
+
+    // Non-antigravity sessions still pass through VS Code's default externalEdits + externalToolInvocationUpdate behavior.
+    const copilotParts: unknown[] = [];
+    await runner(
+      [
+        { kind: 'externalEdits', start: true, resources: [new FakeUri('/workspace/b.ts')], undoStopId: 'u2' },
+        {
+          kind: 'externalToolInvocationUpdate',
+          toolCallId: 'c1',
+          isComplete: true,
+          toolSpecificData: { agyEdit: true, uri: 'file:///workspace/b.ts', insertions: 1, deletions: 0 },
+        },
+      ],
+      { sessionResource: { scheme: 'copilotcli', constructor: FakeUri }, editingSession: { startExternalEdits, stopExternalEdits } },
+      0,
+      reqModel,
+      copilotParts,
+      (x: unknown) => x,
+    );
+    expect(copilotParts[0]).toBe('b8s-part');
+    expect((copilotParts[1] as { kind: string }).kind).toBe('externalToolInvocationUpdate');
   });
 
   it('deduplicates session.changes against live ChatEditingSession entries for antigravity only', () => {

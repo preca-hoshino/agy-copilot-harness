@@ -115,6 +115,15 @@ describe('agyEditTracker', () => {
         content: [{ type: 'diff', path: 'a.ts', oldText: 'old body', newText: 'new body' }],
       }),
     ).toBe('old body');
+
+    expect(
+      reconstructBeforeContent('const value = 42;\n', {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 't4',
+        name: 'edit_file',
+        rawInput: { Target: 'const value = 10;', Replacement: 'const value = 42;' },
+      }),
+    ).toBe('const value = 10;\n');
   });
 
   it('captures baseline snapshot URI with __agy_before for workspace edits and skips brain files', async () => {
