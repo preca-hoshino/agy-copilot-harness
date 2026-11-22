@@ -95,9 +95,6 @@ function resolveModePermissionsViewModel(group, currentOption, rememberedInterac
   const permShortLabel = activePermItem ? permMeta?.shortLabel || permDefaults.shortLabel : 'Plan';
   const permTone = isPlan ? '' : permMeta ? permMeta.tone || '' : permDefaults.tone;
 
-  const sandboxEnabled = typeof anyMeta?.sandboxEnabled === 'boolean' ? anyMeta.sandboxEnabled : true;
-  const sandboxSource = anyMeta?.sandboxSource || 'default';
-
   return {
     items,
     current,
@@ -110,8 +107,6 @@ function resolveModePermissionsViewModel(group, currentOption, rememberedInterac
     modeIconId,
     permShortLabel,
     permTone,
-    sandboxEnabled,
-    sandboxSource,
   };
 }
 
@@ -201,7 +196,7 @@ function buildModePermissionsActionItems(vm, callbacks) {
     section: MODE_SECTION_ID,
   });
 
-  const permissionsHeaderDesc = vm.isPlan ? `${vm.permShortLabel} (Plan)` : vm.permShortLabel;
+  const permissionsHeaderDesc = vm.permShortLabel;
   actionItems.push({
     kind: 'action',
     label: 'Permissions',
@@ -216,9 +211,7 @@ function buildModePermissionsActionItems(vm, callbacks) {
     section: PERMISSIONS_SECTION_ID,
     isSectionToggle: true,
     description: permissionsHeaderDesc,
-    ariaDescription: vm.isPlan
-      ? `Current permissions: ${vm.permShortLabel} (locked in Plan mode)`
-      : `Current permissions: ${vm.permShortLabel}`,
+    ariaDescription: `Current permissions: ${vm.permShortLabel}`,
     className: ['agent-host-mode-permissions', vm.permTone].filter(Boolean).join(' '),
     toolbarActions: [
       {
@@ -239,10 +232,7 @@ function buildModePermissionsActionItems(vm, callbacks) {
     const defaults = defaultMetaForOption(permItem);
     const meta = permItem.agyPickerMeta;
     const permLabel = meta?.pickerLabel || defaults.pickerLabel;
-    const baseDetail = permItem.description || meta?.detail || defaults.detail;
-    const permDetail = vm.isPlan
-      ? `${baseDetail} (Switch to Interactive mode to change)`
-      : baseDetail;
+    const permDetail = permItem.description || meta?.detail || defaults.detail;
     const isDisabled = vm.isPlan || Boolean(permItem.locked);
     const isChecked = !vm.isPlan && permItem.id === vm.current?.id;
     const iconId = permItem.icon?.id || defaults.iconId;
@@ -255,7 +245,6 @@ function buildModePermissionsActionItems(vm, callbacks) {
       disabled: isDisabled,
       focusableWhenDisabled: true,
       section: PERMISSIONS_SECTION_ID,
-      ...(vm.isPlan ? { hover: { content: 'Permissions are locked while in Plan mode. Switch Agent mode to Interactive to change.' } } : {}),
       item: {
         id: `antigravity.permission.${permItem.id}`,
         label: permLabel,
@@ -271,36 +260,6 @@ function buildModePermissionsActionItems(vm, callbacks) {
       },
     });
   }
-
-  const sandboxDescription = vm.sandboxEnabled ? 'On (CLI)' : 'Off (CLI)';
-  const sandboxDetail = `Antigravity CLI enableTerminalSandbox (${vm.sandboxSource})`;
-  actionItems.push(
-    {
-      kind: 'separator',
-      label: '',
-      section: PERMISSIONS_SECTION_ID,
-    },
-    {
-      kind: 'action',
-      label: 'Sandboxing for terminal',
-      description: sandboxDescription,
-      detail: sandboxDetail,
-      group: { title: '', icon: { id: 'shield' } },
-      disabled: true,
-      focusableWhenDisabled: true,
-      section: PERMISSIONS_SECTION_ID,
-      hover: { content: 'Read-only status from Antigravity CLI settings. Per-session switching is not available over ACP.' },
-      item: {
-        id: 'antigravity.sandboxStatus',
-        label: 'Sandboxing for terminal',
-        tooltip: sandboxDetail,
-        enabled: false,
-        checked: undefined,
-        class: undefined,
-        run: () => {},
-      },
-    },
-  );
 
   return actionItems;
 }

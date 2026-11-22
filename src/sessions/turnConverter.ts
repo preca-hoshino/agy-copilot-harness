@@ -11,6 +11,7 @@ import type {
   AcpToolCallUpdatePayload,
   AcpUsageUpdatePayload,
 } from '../acp/acpTypes.js';
+import type { AgyContextWindowUsage, ChatPromptTokenDetail } from '../shared/contracts.js';
 import {
   formatSkillReadMarkdownLink,
   isSkillMarkdownPath,
@@ -18,12 +19,20 @@ import {
 } from './agyCustomizationProvider.js';
 import { type AgyEditTracker, extractEditTargetPaths, isInternalAntigravityPath } from './agyEditTracker.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
+import { mapTokenGroupsToPromptDetails } from './contextUsageBreakdown.js';
+
+export interface ConvertedHistoryUsage {
+  readonly used: number;
+  readonly size: number;
+  readonly completionTokens?: number | undefined;
+  readonly details?: readonly ChatPromptTokenDetail[] | undefined;
+}
 
 export interface ConvertedHistory {
   readonly title?: string | undefined;
   readonly turns: Array<vscode.ChatRequestTurn2 | vscode.ChatResponseTurn2>;
   readonly changes: vscode.ChatSessionFileChange[];
-  readonly usage?: { readonly used: number; readonly size: number } | undefined;
+  readonly usage?: ConvertedHistoryUsage | undefined;
 }
 
 type ToolCallCategory = 'browser' | 'execute' | 'read' | 'edit' | 'generic';
@@ -155,7 +164,7 @@ export class TurnConverter {
     }
   }
 
-  public finalizeHistory(modelId?: string): ConvertedHistory {
+  public finalizeHistory(modelId?: string, detailedUsage?: AgyContextWindowUsage): ConvertedHistory {
     this.flushPendingUserTurn();
     this.flushCurrentResponseTurn();
 
@@ -179,12 +188,15 @@ export class TurnConverter {
       }
     }
 
-    if (this.latestUsage !== undefined && turns.length > 0) {
+    const resolvedUsage = buildConvertedHistoryUsage(this.latestUsage, detailedUsage);
+
+    if (resolvedUsage !== undefined && turns.length > 0) {
       const lastIndex = turns.length - 1;
       const lastTurn = turns[lastIndex];
       if (lastTurn instanceof vscode.ChatResponseTurn2) {
+        const serializedUsage = JSON.stringify(resolvedUsage).replaceAll('>', '\\u003e');
         const usagePart = new vscode.ChatResponseMarkdownPart(
-          new vscode.MarkdownString(`<!--AGY_USAGE:${JSON.stringify(this.latestUsage)}-->`),
+          new vscode.MarkdownString(`<!--AGY_USAGE:${serializedUsage}-->`),
         );
         turns[lastIndex] = new vscode.ChatResponseTurn2(
           [...lastTurn.response, usagePart],
@@ -224,7 +236,7 @@ export class TurnConverter {
       title: this.title,
       turns,
       changes,
-      ...(this.latestUsage !== undefined ? { usage: this.latestUsage } : {}),
+      ...(resolvedUsage !== undefined ? { usage: resolvedUsage } : {}),
     };
   }
 
@@ -412,6 +424,7 @@ export class LiveStreamAdapter {
     private readonly attachmentDir?: string,
     private readonly onUsageUpdate?: (usage: AcpUsageUpdatePayload) => void,
     private readonly editTracker?: AgyEditTracker | undefined,
+    private readonly formatUsage?: ((usage: AcpUsageUpdatePayload) => vscode.ChatResponseUsage) | undefined,
   ) {
     this.browserRenderer = browserRenderer;
     this.sessionId = sessionId;
@@ -473,10 +486,14 @@ export class LiveStreamAdapter {
         if (isUsageUpdatePayload(update)) {
           this.onUsageUpdate?.(update);
           if (typeof this.stream.usage === 'function') {
-            this.stream.usage({
-              promptTokens: update.used,
-              completionTokens: 0,
-            });
+            const formatted =
+              this.formatUsage !== undefined
+                ? this.formatUsage(update)
+                : {
+                    promptTokens: update.used,
+                    completionTokens: 0,
+                  };
+            this.stream.usage(formatted);
           }
         }
         break;
@@ -1361,4 +1378,37 @@ function getFirstNumber(record: Record<string, unknown> | undefined, keys: reado
     }
   }
   return undefined;
+}
+
+function buildConvertedHistoryUsage(
+  acpUsage: { readonly used: number; readonly size: number } | undefined,
+  detailedUsage: AgyContextWindowUsage | undefined,
+): ConvertedHistoryUsage | undefined {
+  if (detailedUsage === undefined) {
+    return acpUsage;
+  }
+  const used =
+    Number.isFinite(detailedUsage.estimatedTokensUsed) && detailedUsage.estimatedTokensUsed > 0
+      ? detailedUsage.estimatedTokensUsed
+      : (acpUsage?.used ?? 0);
+  if (used <= 0 && acpUsage === undefined) {
+    return undefined;
+  }
+  const size =
+    Number.isFinite(detailedUsage.maxContextTokens) && detailedUsage.maxContextTokens > 0
+      ? detailedUsage.maxContextTokens
+      : (acpUsage?.size ?? 0);
+  const details = mapTokenGroupsToPromptDetails(detailedUsage, used);
+  const rawCompletion = detailedUsage.completionTokens;
+  const completionTokens =
+    rawCompletion !== undefined && Number.isFinite(rawCompletion) && rawCompletion > 0
+      ? Math.min(used, rawCompletion)
+      : undefined;
+
+  return {
+    used,
+    size,
+    ...(completionTokens !== undefined && completionTokens > 0 ? { completionTokens } : {}),
+    ...(details.length > 0 ? { details } : {}),
+  };
 }

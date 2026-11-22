@@ -9,13 +9,19 @@ import type {
   AcpToolCallUpdatePayload,
 } from '../acp/acpTypes.js';
 import type { AgyLanguageModelProvider } from '../models/agyLanguageModelProvider.js';
-import type { AcpBackendInterface, PermissionPrompt, QuotaServiceInterface } from '../shared/contracts.js';
+import type {
+  AcpBackendInterface,
+  AgyContextWindowUsage,
+  PermissionPrompt,
+  QuotaServiceInterface,
+} from '../shared/contracts.js';
 import { ActiveAgyTurn } from './activeAgyTurn.js';
 import { isSkillMarkdownPath, resolveSkillDisplayNameSync } from './agyCustomizationProvider.js';
 import { AgyEditTracker } from './agyEditTracker.js';
 import type { AgySessionController } from './agySessionController.js';
 import { extractSessionIdFromUri } from './agySessionController.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
+import { buildChatResponseUsage } from './contextUsageBreakdown.js';
 import { acquireSessionOperation } from './sessionOperationCoordinator.js';
 import { LiveStreamAdapter } from './turnConverter.js';
 
@@ -68,6 +74,7 @@ const LIVE_UPDATE_MAX_DRAIN_MS = 10_000;
 const MAX_HANDOFF_BUFFER = 500;
 const YIELD_PERMISSION_DELEGATE_TIMEOUT_MS = 500;
 const YIELD_POLL_INTERVAL_MS = 100;
+const USAGE_BREAKDOWN_REFRESH_MS = 500;
 const CANCELLING_RETRY_DELAYS_MS: readonly number[] = [100, 200, 350, 500, 750, 1000, 1000, 1500, 2000, 2500];
 
 type TurnPhase = 'prompt' | 'idle-wait' | 'draining' | 'yielded' | 'finished';
@@ -531,6 +538,61 @@ export class AgyChatParticipant implements vscode.Disposable {
       });
 
       let runningRef: RunningTurnState | undefined;
+      const modelKey = selectedModelId ?? resolvedModel.modelValue;
+      let latestBreakdown: AgyContextWindowUsage | undefined;
+      let lastBreakdownFetchAt = 0;
+      let inFlightBreakdown: Promise<void> | undefined;
+      let sawUsageUpdate = false;
+      let latestAcpUsed = 0;
+
+      const applyBreakdown = (breakdown: AgyContextWindowUsage, emitToTurn: boolean): void => {
+        latestBreakdown = breakdown;
+        if (breakdown.maxContextTokens > 0) {
+          this.lmProvider.recordContextWindow(modelKey, breakdown.maxContextTokens, true);
+        }
+        if (emitToTurn && runningRef?.isTurnSuperseded() !== true && runningRef?.isTurnFinished() !== true) {
+          turn.usage(buildChatResponseUsage({ totalUsed: breakdown.estimatedTokensUsed, breakdown }));
+        }
+      };
+
+      const refreshUsageBreakdown = async (force: boolean, emitToTurn: boolean): Promise<void> => {
+        if (typeof this.backend.getSessionContextUsage !== 'function') {
+          return;
+        }
+        if (this.disposed || !this.backend.isReady || runningRef?.isTurnSuperseded() === true) {
+          return;
+        }
+        if (inFlightBreakdown !== undefined) {
+          if (!force) {
+            return;
+          }
+          await inFlightBreakdown;
+        }
+        const now = Date.now();
+        if (!force && now - lastBreakdownFetchAt < USAGE_BREAKDOWN_REFRESH_MS) {
+          return;
+        }
+        lastBreakdownFetchAt = now;
+        const fetchPromise = (async (): Promise<void> => {
+          try {
+            const breakdown = await this.backend.getSessionContextUsage?.(sessionId);
+            if (breakdown !== undefined) {
+              applyBreakdown(breakdown, emitToTurn);
+            }
+          } catch {
+            // Breakdown enrichment is best-effort and must not disrupt the turn lifecycle.
+          }
+        })();
+        inFlightBreakdown = fetchPromise;
+        try {
+          await fetchPromise;
+        } finally {
+          if (inFlightBreakdown === fetchPromise) {
+            inFlightBreakdown = undefined;
+          }
+        }
+      };
+
       const liveAdapter = new LiveStreamAdapter(
         this.browserRenderer,
         sessionId,
@@ -545,14 +607,23 @@ export class AgyChatParticipant implements vscode.Disposable {
         },
         this.attachmentDir,
         (usage): void => {
+          sawUsageUpdate = true;
+          latestAcpUsed = usage.used;
           if (typeof usage.size === 'number' && Number.isFinite(usage.size) && usage.size > 0) {
-            this.lmProvider.recordContextWindow(selectedModelId ?? resolvedModel.modelValue, usage.size);
+            this.lmProvider.recordContextWindow(modelKey, usage.size, false);
           }
+          void refreshUsageBreakdown(false, true);
         },
         editTracker,
+        (usage): vscode.ChatResponseUsage => {
+          return buildChatResponseUsage({ totalUsed: usage.used, breakdown: latestBreakdown });
+        },
       );
       const running = new RunningTurnState(sessionId, turn, liveAdapter, request.prompt);
       runningRef = running;
+      if (!this.controller.isNewSession(rawSessionId)) {
+        void refreshUsageBreakdown(true, false);
+      }
 
       let resetDrainTimer: (() => void) | undefined;
       let rejectDrain: ((error: Error) => void) | undefined;
@@ -864,6 +935,11 @@ export class AgyChatParticipant implements vscode.Disposable {
             try {
               await editTracker.flush();
               liveAdapter.flush();
+              if (promptDispatched && !this.disposed && this.backend.isReady) {
+                await refreshUsageBreakdown(true, true);
+              } else if (sawUsageUpdate && latestBreakdown !== undefined) {
+                turn.usage(buildChatResponseUsage({ totalUsed: latestAcpUsed, breakdown: latestBreakdown }));
+              }
               this.controller.recordTurnContext(sessionId, request.prompt, liveAdapter.getAccumulatedMessageText());
             } finally {
               turn.finish();

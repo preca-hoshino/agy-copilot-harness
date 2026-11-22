@@ -3,7 +3,6 @@ import * as fs from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { parse as parseJsonc } from 'jsonc-parser';
 import * as vscode from 'vscode';
 import type { AcpSessionSummary } from '../acp/acpTypes.js';
 import type { AcpBackendInterface } from '../shared/contracts.js';
@@ -38,17 +37,10 @@ export interface AgyModePickerMeta {
   readonly detail: string;
   readonly tone: '' | 'info' | 'warning';
   readonly lastInteractiveMode: string;
-  readonly sandboxEnabled: boolean;
-  readonly sandboxSource: 'workspace' | 'user' | 'default';
 }
 
 interface AgyChatSessionProviderOptionItem extends vscode.ChatSessionProviderOptionItem {
   readonly agyPickerMeta: AgyModePickerMeta;
-}
-
-interface TerminalSandboxStatus {
-  readonly enabled: boolean;
-  readonly source: 'workspace' | 'user' | 'default';
 }
 
 interface ModeOptionDescriptor {
@@ -1006,13 +998,12 @@ export class AgySessionController implements vscode.Disposable {
     const effectiveSelectedId = selectedModeId.length > 0 ? selectedModeId : (mode?.currentValue ?? 'default');
     const lastInteractiveMode =
       effectiveSelectedId !== 'plan' ? effectiveSelectedId : this.getLastInteractiveMode(sessionId);
-    const sandbox = this.resolveTerminalSandboxStatus();
     const items: AgyChatSessionProviderOptionItem[] = choices.map((option) => ({
       id: option.id,
       name: option.name,
       ...(option.description !== undefined ? { description: option.description } : {}),
       icon: new vscode.ThemeIcon(option.icon),
-      agyPickerMeta: buildModePickerMeta(option.id, option.name, option.description, lastInteractiveMode, sandbox),
+      agyPickerMeta: buildModePickerMeta(option.id, option.name, option.description, lastInteractiveMode),
     }));
 
     const selected =
@@ -1177,38 +1168,6 @@ export class AgySessionController implements vscode.Disposable {
   private getDefaultInteractiveMode(): string {
     const defaultMode = this.getDefaultMode();
     return defaultMode !== 'plan' ? defaultMode : 'default';
-  }
-
-  private resolveTerminalSandboxStatus(): TerminalSandboxStatus {
-    const workspaceFolders = vscode.workspace.workspaceFolders;
-    if (workspaceFolders !== undefined) {
-      for (const folder of workspaceFolders) {
-        if (folder.uri.scheme !== 'file') {
-          continue;
-        }
-        for (const relDir of ['.gemini', '.antigravity']) {
-          const enabled = readSandboxSettingFromFile(path.join(folder.uri.fsPath, relDir, 'settings.json'));
-          if (enabled !== undefined) {
-            return { enabled, source: 'workspace' };
-          }
-        }
-      }
-    }
-
-    const appDataDir = getConfiguredAppDataDir();
-    const userCandidates = [
-      path.join(os.homedir(), '.gemini', appDataDir, 'settings.json'),
-      path.join(os.homedir(), '.gemini', 'antigravity-cli', 'settings.json'),
-      path.join(os.homedir(), '.gemini', 'settings.json'),
-    ];
-    for (const candidate of userCandidates) {
-      const enabled = readSandboxSettingFromFile(candidate);
-      if (enabled !== undefined) {
-        return { enabled, source: 'user' };
-      }
-    }
-
-    return { enabled: true, source: 'default' };
   }
 
   private getDefaultWorkspaceCwd(): string {
@@ -1395,13 +1354,10 @@ function buildModePickerMeta(
   name: string,
   description: string | undefined,
   lastInteractiveMode: string,
-  sandbox: TerminalSandboxStatus,
 ): AgyModePickerMeta {
   const base = {
     provider: 'antigravity' as const,
     lastInteractiveMode,
-    sandboxEnabled: sandbox.enabled,
-    sandboxSource: sandbox.source,
   };
   switch (id) {
     case 'default':
@@ -1450,19 +1406,6 @@ function buildModePickerMeta(
         tone: '',
       };
   }
-}
-
-function readSandboxSettingFromFile(filePath: string): boolean | undefined {
-  try {
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const parsed: unknown = parseJsonc(raw, undefined, { allowTrailingComma: true });
-    if (isRecordObject(parsed) && typeof parsed.enableTerminalSandbox === 'boolean') {
-      return parsed.enableTerminalSandbox;
-    }
-  } catch {
-    // Missing or unreadable settings file falls through to next candidate.
-  }
-  return undefined;
 }
 
 function toUriFromUnknown(raw: unknown): vscode.Uri | undefined {

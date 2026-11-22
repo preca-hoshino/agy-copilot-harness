@@ -59,9 +59,32 @@ function extractHistoryUsageParts(history, sessionResource) {
       try {
         const parsed = JSON.parse(match[1]);
         if (typeof parsed?.used === 'number' && Number.isFinite(parsed.used) && parsed.used >= 0) {
-          const part = { kind: 'usage', promptTokens: parsed.used, completionTokens: 0 };
+          const completion =
+            typeof parsed.completionTokens === 'number' &&
+            Number.isFinite(parsed.completionTokens) &&
+            parsed.completionTokens >= 0
+              ? Math.min(parsed.used, parsed.completionTokens)
+              : 0;
+          const part = {
+            kind: 'usage',
+            promptTokens: Math.max(0, parsed.used - completion),
+            completionTokens: completion,
+          };
           if (typeof parsed.size === 'number' && Number.isFinite(parsed.size) && parsed.size > 0) {
             part.contextUsage = { currentTokens: parsed.used, tokenLimit: parsed.size };
+          }
+          if (Array.isArray(parsed.details) && parsed.details.length > 0) {
+            const details = parsed.details.filter(
+              (detail) =>
+                typeof detail?.category === 'string' &&
+                typeof detail?.label === 'string' &&
+                typeof detail?.percentageOfPrompt === 'number' &&
+                Number.isFinite(detail.percentageOfPrompt) &&
+                detail.percentageOfPrompt > 0,
+            );
+            if (details.length > 0) {
+              part.promptTokenDetails = details;
+            }
           }
           turn.parts.splice(i, 1, part);
         }

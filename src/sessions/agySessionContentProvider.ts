@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import type { AcpConfigOption, AcpSessionLoadResult } from '../acp/acpTypes.js';
-import type { AcpBackendInterface } from '../shared/contracts.js';
+import type { AcpBackendInterface, AgyContextWindowUsage } from '../shared/contracts.js';
 import { ANTIGRAVITY_SCHEME } from '../shared/contracts.js';
 import type { ActiveAgySession } from './agyChatParticipant.js';
 import type { AgySessionController } from './agySessionController.js';
@@ -38,6 +38,7 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
     outputChannel: vscode.OutputChannel,
     private readonly attachmentDir?: string,
     private readonly getActiveSession?: (sessionId: string) => ActiveAgySession | undefined,
+    private readonly onContextWindowResolved?: (modelId: string | undefined, size: number) => void,
   ) {
     this.backend = backend;
     this.controller = controller;
@@ -209,8 +210,22 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
       throw createCancellationError();
     }
 
+    let detailedUsage: AgyContextWindowUsage | undefined;
+    if (typeof this.backend.getSessionContextUsage === 'function') {
+      try {
+        detailedUsage = await raceWithCancellation(this.backend.getSessionContextUsage(sessionId), token);
+      } catch (usageError: unknown) {
+        if (isCancellationError(usageError)) {
+          throw usageError;
+        }
+      }
+    }
+
     const loadedModelId = extractModelIdFromLoadResult(loadResult);
-    const converted = converter.finalizeHistory(loadedModelId);
+    if (detailedUsage !== undefined && detailedUsage.maxContextTokens > 0) {
+      this.onContextWindowResolved?.(loadedModelId, detailedUsage.maxContextTokens);
+    }
+    const converted = converter.finalizeHistory(loadedModelId, detailedUsage);
 
     const loadedMode = extractModeFromLoadResult(loadResult);
     if (loadedMode !== undefined && loadedMode.length > 0) {

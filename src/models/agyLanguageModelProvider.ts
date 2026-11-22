@@ -36,6 +36,7 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
   private readonly onDidChangeEmitter = new vscode.EventEmitter<void>();
   private readonly disposables: vscode.Disposable[] = [];
   private readonly reportedContextWindows = new Map<string, number>();
+  private readonly authoritativeContextWindows = new Map<string, number>();
 
   public readonly onDidChangeLanguageModelChatInformation: vscode.Event<void> = this.onDidChangeEmitter.event;
 
@@ -163,7 +164,7 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
     };
   }
 
-  public recordContextWindow(modelId: string | undefined, size: number): void {
+  public recordContextWindow(modelId: string | undefined, size: number, authoritative = false): void {
     if (modelId === undefined || !Number.isFinite(size) || size <= 0) {
       return;
     }
@@ -192,7 +193,16 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
 
     let changed = false;
     for (const key of keys) {
-      if (this.reportedContextWindows.get(key) !== size) {
+      if (authoritative) {
+        if (this.authoritativeContextWindows.get(key) !== size) {
+          this.authoritativeContextWindows.set(key, size);
+          changed = true;
+        }
+        if (this.reportedContextWindows.get(key) !== size) {
+          this.reportedContextWindows.set(key, size);
+          changed = true;
+        }
+      } else if (!this.authoritativeContextWindows.has(key) && this.reportedContextWindows.get(key) !== size) {
         this.reportedContextWindows.set(key, size);
         changed = true;
       }
@@ -240,14 +250,21 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
     readonly signedIn: boolean;
   }): vscode.LanguageModelChatInformation {
     const limits = inferTokenLimits(params.id, params.name);
+    const authoritativeSize =
+      this.authoritativeContextWindows.get(params.id.toLowerCase()) ??
+      params.effortVariants
+        .map((variant) => this.authoritativeContextWindows.get(variant.model.value.toLowerCase()))
+        .find((value): value is number => value !== undefined);
     const reportedSize =
+      authoritativeSize ??
       this.reportedContextWindows.get(params.id.toLowerCase()) ??
       params.effortVariants
         .map((variant) => this.reportedContextWindows.get(variant.model.value.toLowerCase()))
         .find((value): value is number => value !== undefined);
     const maxContextWindowTokens = reportedSize ?? limits.maxContextWindowTokens;
-    const maxInputTokens =
+    const fallbackMaxInputTokens =
       reportedSize !== undefined ? Math.min(limits.maxInputTokens, reportedSize) : limits.maxInputTokens;
+    const maxInputTokens = authoritativeSize ?? fallbackMaxInputTokens;
     const family = inferModelFamily(params.id, params.name);
     const icon = MODEL_FAMILY_ICONS[family];
     const efforts = [...new Set(params.effortVariants.map((variant) => variant.effort))];

@@ -4,7 +4,6 @@ const { buildTrustedAuthAccessSnippet, buildWorkbenchAccountsOrderSnippet } = re
 const { buildModePermissionsPickerSnippet } = require('./snippets/mode-permissions-picker');
 const { buildSessionsPanelSnippet, buildSessionsSkipContributedSnippet } = require('./snippets/sessions-panel');
 const {
-  buildSessionsChatInputPickerSnippet,
   buildSessionsNewModeActionSnippet,
   buildSessionsNewModeViewItemSnippet,
   buildSessionsProviderSnippet,
@@ -92,16 +91,23 @@ function patchSessions(patch) {
     ...commonInsertions(matches),
     [panel.start, 'sessions-panel', buildSessionsPanelSnippet(panelDom.groups, panelActions.groups, chatStatus.groups)],
     [contributed.end, 'sessions-contributed', buildSessionsSkipContributedSnippet()],
-    [sessionsChatInputPicker.end, 'sessions-chat-input-picker', buildSessionsChatInputPickerSnippet(sessionsChatInputPicker.groups)],
     [
       sessionsNewModeViewItem.end,
       'sessions-new-mode-view-item',
-      buildSessionsNewModeViewItemSnippet(sessionsNewModeViewItem.groups, sessionsOptionPicker.groups),
+      buildSessionsNewModeViewItemSnippet(
+        sessionsNewModeViewItem.groups,
+        sessionsOptionPicker.groups,
+        sessionsChatInputPicker.groups,
+      ),
     ],
     [
       sessionsNewModeAction.end,
       'sessions-new-mode-action',
-      buildSessionsNewModeActionSnippet(sessionsNewModeAction.groups, sessionsNewModeViewItem.groups),
+      buildSessionsNewModeActionSnippet(
+        sessionsNewModeAction.groups,
+        sessionsNewModeViewItem.groups,
+        sessionsChatInputPicker.groups,
+      ),
     ],
     [
       sessionsDefaultProvider.end,

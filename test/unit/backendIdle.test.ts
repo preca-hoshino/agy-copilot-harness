@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import type * as http from 'node:http';
+import * as zlib from 'node:zlib';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const { httpRequestMock } = vi.hoisted(() => ({
@@ -272,6 +273,154 @@ describe('backend fully-idle waiting', () => {
       firstPrompt.resolve({ stopReason: 'end_turn' });
       secondPrompt.resolve({ stopReason: 'end_turn' });
       source.dispose();
+      backend.dispose();
+    }
+  });
+
+  it('reads chunked Connect frames from StreamAgentStateUpdates and attaches generator outputTokens', async () => {
+    const streamFrameJson = JSON.stringify({
+      update: {
+        contextWindowUsage: {
+          generatorMetadataIndex: 4,
+          estimatedTokensUsed: 62_000,
+          maxContextTokens: 256_000,
+          estimatedAfterCompaction: 12_000,
+          tokenGroups: [
+            { name: 'System Prompt', type: 'TOKEN_TYPE_SYSTEM_PROMPT', source: 'TOKEN_SOURCE_SYSTEM', numTokens: 8_000 },
+            { name: 'Chat Messages', type: 'TOKEN_TYPE_CHAT_MESSAGES', source: 'TOKEN_SOURCE_USER', numTokens: 54_000 },
+          ],
+        },
+      },
+    });
+    const streamBytes = Buffer.from(streamFrameJson, 'utf8');
+    const streamEnvelope = Buffer.alloc(5 + streamBytes.length);
+    streamEnvelope.writeUInt8(0, 0);
+    streamEnvelope.writeUInt32BE(streamBytes.length, 1);
+    streamBytes.copy(streamEnvelope, 5);
+
+    const metadataJson = JSON.stringify({
+      generatorMetadata: [
+        { chatModel: { usage: { inputTokens: 60_000, outputTokens: '2450' } } },
+      ],
+    });
+
+    const recordedRequests: Array<{ path?: string | null | undefined; body: Buffer }> = [];
+    httpRequestMock.mockImplementation((options: http.RequestOptions, cb: (res: http.IncomingMessage) => void) => {
+      const bodyChunks: Buffer[] = [];
+      const req = new EventEmitter() as EventEmitter & {
+        setTimeout: ReturnType<typeof vi.fn>;
+        end: ReturnType<typeof vi.fn>;
+        destroy: ReturnType<typeof vi.fn>;
+      };
+      req.setTimeout = vi.fn(() => req);
+      req.destroy = vi.fn();
+      req.end = vi.fn((chunk?: Buffer | string) => {
+        if (chunk !== undefined) {
+          bodyChunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk);
+        }
+        recordedRequests.push({ path: options.path, body: Buffer.concat(bodyChunks) });
+        queueMicrotask(() => {
+          const res = new EventEmitter() as http.IncomingMessage;
+          res.statusCode = 200;
+          cb(res);
+          if (options.path?.endsWith('/StreamAgentStateUpdates') === true) {
+            res.emit('data', streamEnvelope.subarray(0, 3));
+            res.emit('data', streamEnvelope.subarray(3, 20));
+            res.emit('data', streamEnvelope.subarray(20));
+          } else {
+            res.emit('data', Buffer.from(metadataJson, 'utf8'));
+            res.emit('end');
+          }
+        });
+      });
+      return req as unknown as http.ClientRequest;
+    });
+
+    const backend = createBackend();
+    try {
+      const usage = await backend.getSessionContextUsage('session-usage-1');
+      expect(usage).toEqual({
+        estimatedTokensUsed: 62_000,
+        maxContextTokens: 256_000,
+        estimatedAfterCompaction: 12_000,
+        completionTokens: 2_450,
+        tokenGroups: [
+          { name: 'System Prompt', type: 'TOKEN_TYPE_SYSTEM_PROMPT', source: 'TOKEN_SOURCE_SYSTEM', numTokens: 8_000 },
+          { name: 'Chat Messages', type: 'TOKEN_TYPE_CHAT_MESSAGES', source: 'TOKEN_SOURCE_USER', numTokens: 54_000 },
+        ],
+      });
+      expect(recordedRequests).toHaveLength(2);
+      const streamReqEnvelope = recordedRequests[0]?.body;
+      expect(streamReqEnvelope?.readUInt8(0)).toBe(0);
+      const decodedStreamReq = JSON.parse(streamReqEnvelope?.subarray(5).toString('utf8') ?? '{}');
+      expect(decodedStreamReq).toMatchObject({
+        conversationId: 'session-usage-1',
+        initialStepsPageBounds: { startIndex: 0, endIndexExclusive: 0 },
+      });
+    } finally {
+      backend.dispose();
+    }
+  });
+
+  it('supports gzipped Connect response frames and fails soft on trailer errors', async () => {
+    const gzipped = zlib.gzipSync(
+      Buffer.from(
+        JSON.stringify({
+          update: {
+            contextWindowUsage: {
+              estimatedTokensUsed: 15_000,
+              maxContextTokens: 512_000,
+              tokenGroups: [
+                { name: 'System Prompt', type: 'TOKEN_TYPE_SYSTEM_PROMPT', source: 'TOKEN_SOURCE_SYSTEM', numTokens: 15_000 },
+              ],
+            },
+          },
+        }),
+        'utf8',
+      ),
+    );
+    const gzipEnvelope = Buffer.alloc(5 + gzipped.length);
+    gzipEnvelope.writeUInt8(1, 0);
+    gzipEnvelope.writeUInt32BE(gzipped.length, 1);
+    gzipped.copy(gzipEnvelope, 5);
+
+    const trailerBytes = Buffer.from('{"error":{"code":"not_found"}}', 'utf8');
+    const trailerEnvelope = Buffer.alloc(5 + trailerBytes.length);
+    trailerEnvelope.writeUInt8(2, 0);
+    trailerEnvelope.writeUInt32BE(trailerBytes.length, 1);
+    trailerBytes.copy(trailerEnvelope, 5);
+
+    let callCount = 0;
+    httpRequestMock.mockImplementation((_options: http.RequestOptions, cb: (res: http.IncomingMessage) => void) => {
+      callCount += 1;
+      const responseBuf = callCount === 1 ? gzipEnvelope : trailerEnvelope;
+      const req = new EventEmitter() as EventEmitter & {
+        setTimeout: ReturnType<typeof vi.fn>;
+        end: ReturnType<typeof vi.fn>;
+        destroy: ReturnType<typeof vi.fn>;
+      };
+      req.setTimeout = vi.fn(() => req);
+      req.destroy = vi.fn();
+      req.end = vi.fn(() => {
+        queueMicrotask(() => {
+          const res = new EventEmitter() as http.IncomingMessage;
+          res.statusCode = 200;
+          cb(res);
+          res.emit('data', responseBuf);
+        });
+      });
+      return req as unknown as http.ClientRequest;
+    });
+
+    const backend = createBackend();
+    try {
+      const gzippedResult = await backend.getSessionContextUsage('session-gzip');
+      expect(gzippedResult?.estimatedTokensUsed).toBe(15_000);
+      expect(gzippedResult?.maxContextTokens).toBe(512_000);
+
+      const trailerResult = await backend.getSessionContextUsage('session-missing');
+      expect(trailerResult).toBeUndefined();
+    } finally {
       backend.dispose();
     }
   });

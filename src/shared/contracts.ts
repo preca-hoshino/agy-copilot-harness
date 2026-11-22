@@ -32,6 +32,27 @@ export interface AgyForkConversationResult {
   newCascadeId: string;
 }
 
+export interface ChatPromptTokenDetail {
+  readonly category: string;
+  readonly label: string;
+  readonly percentageOfPrompt: number;
+}
+
+export interface AgyTokenGroupUsage {
+  readonly name: string;
+  readonly type: string;
+  readonly source: string;
+  readonly numTokens: number;
+}
+
+export interface AgyContextWindowUsage {
+  readonly estimatedTokensUsed: number;
+  readonly maxContextTokens: number;
+  readonly estimatedAfterCompaction?: number | undefined;
+  readonly completionTokens?: number | undefined;
+  readonly tokenGroups: readonly AgyTokenGroupUsage[];
+}
+
 export interface ModelQuotaInfo {
   label: string;
   modelId: string;
@@ -92,6 +113,7 @@ export interface AcpBackendInterface {
     stepIndex?: number,
   ) => Promise<AgyTurnFileDiff | undefined>;
   acknowledgeCodeEdit?: (cascadeId: string, absoluteUri: string, contents: string, accept: boolean) => Promise<boolean>;
+  getSessionContextUsage?: (sessionId: string) => Promise<AgyContextWindowUsage | undefined>;
   ensureStarted: () => Promise<void>;
   listSessions: () => Promise<AcpSessionListResult>;
   loadSession: (sessionId: string, cwd: string, token?: vscode.CancellationToken) => Promise<AcpSessionLoadResult>;

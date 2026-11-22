@@ -73,6 +73,9 @@ function buildSessionsProviderSnippet(
     'getHarnessPresentation(harness){return harness==="antigravity"?{label:"Antigravity",icon:{id:"antigravity-logo"}}:void 0;}' +
     'get _cloudSessionsEnabled(){return!0;}' +
     '_assertCloudSessionsEnabled(){}' +
+    '_usesSandbox(){return!1;}' +
+    '_validateSandboxSession(){}' +
+    'getModelPickerOptions(){return{showUnavailableFeatured:!1,showManageModelsAction:!1,showAutoModel:!1};}' +
     'get supportsLocalWorkspaces(){return!0;}' +
     'get supportsQuickChats(){return!0;}' +
     'get supportsAutomationSessionConfiguration(){return!1;}' +
@@ -118,7 +121,8 @@ function buildSessionsProviderSnippet(
     'void this.ensureInputStateLoaded(session?.resource);' +
     'return{id:"mode",name:"Agent Mode",items:[],selected:void 0};' +
     '}' +
-    'const draft=session?.sessionId?this._newSessions.get(session.sessionId):void 0;' +
+    'const sid=session?.sessionId||(typeof session?.resource?.path==="string"?session.resource.path.replace(/^\\/+/, ""):void 0);' +
+    'const draft=sid?this._newSessions.get(sid):void 0;' +
     'const storedOpt=draft?.selectedOptions?.get("mode")??(session?.resource?this.chatSessionsService?.getSessionOption?.(session.resource,"mode"):void 0);' +
     'const storedId=typeof storedOpt==="string"?storedOpt:storedOpt?.id;' +
     'const selectedId=storedId||this._agyLastModeId||base.selected?.id;' +
@@ -131,13 +135,20 @@ function buildSessionsProviderSnippet(
     'return{...base,items,selected};' +
     '}' +
     'setNewSessionModeOption(session,option){' +
+    'const sid=session?.sessionId||(typeof session?.resource?.path==="string"?session.resource.path.replace(/^\\/+/, ""):void 0);' +
+    'const draft=sid?this._newSessions.get(sid):void 0;' +
+    'this._applyModeSelection(session,option,draft);' +
+    '}' +
+    'setActiveSessionModeOption(resource,option){' +
+    'this._applyModeSelection({resource},option,void 0);' +
+    '}' +
+    '_applyModeSelection(session,option,draft){' +
     'const id=typeof option==="string"?option:option?.id;' +
     'if(!id)return;' +
     'this._agyLastModeId=id;' +
     'if(id!=="plan")this._agyLastInteractiveModeId=id;' +
     'const group=this.getModeOptionGroup(session);' +
     'const matched=group.items.find(item=>item.id===id)??option;' +
-    'const draft=session?.sessionId?this._newSessions.get(session.sessionId):void 0;' +
     'draft?.setOption?.("mode",matched);' +
     'if(session?.resource)this.chatSessionsService?.setSessionOption?.(session.resource,"mode",matched);' +
     'this._fireOptionStateChanged();' +
@@ -217,9 +228,9 @@ function buildSessionsProviderSnippet(
     'const folderPath=folderRoot.fsPath||folderRoot.path;' +
     'if(folderPath)draft.setOption("folder",folderPath);' +
     '}' +
-    'if(!draft.selectedOptions.has("mode")&&this._agyLastModeId){' +
+    'if(!draft.selectedOptions.has("mode")){' +
     'const g=this.getModeOptionGroup(draft);' +
-    'const opt=g.items.find(i=>i.id===this._agyLastModeId);' +
+    'const opt=(this._agyLastModeId?g.items.find(i=>i.id===this._agyLastModeId):void 0)??g.selected;' +
     'if(opt)draft.setOption("mode",opt);' +
     '}' +
     'const contrib=this.chatSessionsService?.getChatSessionContribution?.(draft.target);' +
@@ -333,46 +344,86 @@ function buildSessionsProviderSnippet(
   );
 }
 
-function buildSessionsChatInputPickerSnippet({ chatInput, expr, isSess, ctx }) {
-  return `{id:${chatInput}.ChatInput,order:4,group:"navigation",when:${expr}.and(${isSess},${ctx}.chatSessionHasModels,${ctx}.chatSessionType.isEqualTo("antigravity"),${ctx}.lockedToCodingAgent)},`;
-}
-
-function buildSessionsNewModeViewItemSnippet({ reg, menuId, mgmtSvc }, { mutCls }) {
+function buildSessionsNewModeViewItemSnippet({ reg, menuId, mgmtSvc }, { mutCls }, chatInputGroups) {
+  const chatInput = chatInputGroups?.chatInput;
+  const registrations =
+    `this._register(${reg}.register(${menuId},"antigravity.newSessionModePicker",(a,v,i)=>_agyCreate(a,v,i,!1)));` +
+    (chatInput
+      ? `this._register(${reg}.register(${chatInput}.ChatInput,"antigravity.chatSessionModePicker",(a,v,i)=>_agyCreate(a,v,i,!0)));`
+      : '');
   return (
-    `,this._register(${reg}.register(${menuId},"antigravity.newSessionModePicker",(action,_viewOpts,instantiation)=>{` +
+    `,((_agyCreate=>{${registrations}})((action,_viewOpts,instantiation,isChatInput)=>{` +
     `const activeSvc=instantiation.invokeFunction(acc=>acc.get(${mgmtSvc}));` +
     'const provider=globalThis[Symbol.for("antigravity.sessionsProvider")];' +
-    'const getSession=()=>activeSvc.session?.get?.();' +
-    'const resolveGroup=()=>provider?.getModeOptionGroup?.(getSession())??{id:"mode",name:"Agent Mode",items:[],selected:void 0};' +
+    'let contextWidget=_viewOpts?.actionContext?.widget;' +
+    'const getTarget=()=>{if(!isChatInput){const s=activeSvc.session?.get?.();return{session:s,resource:s?.resource};}' +
+    'const widgetRes=contextWidget?.viewModel?.model?.sessionResource;' +
+    'if(widgetRes?.scheme==="antigravity")return{session:{resource:widgetRes},resource:widgetRes};' +
+    'const chatRes=activeSvc.chat?.get?.()?.resource;' +
+    'if(chatRes?.scheme==="antigravity")return{session:{resource:chatRes},resource:chatRes};' +
+    'const s=activeSvc.session?.get?.();return{session:s,resource:s?.resource};};' +
+    'const resolveGroup=()=>provider?.getModeOptionGroup?.(getTarget().session)??{id:"mode",name:"Agent Mode",items:[],selected:void 0};' +
     'let currentGroup=resolveGroup();' +
     'const listeners=new Set;' +
     'const delegate={' +
     'onDidChangeOption:cb=>{listeners.add(cb);return{dispose(){listeners.delete(cb)}}},' +
-    'setOption:opt=>{provider?.setNewSessionModeOption?.(getSession(),opt);currentGroup=resolveGroup();for(const cb of [...listeners])cb(opt);},' +
+    'setOption:opt=>{' +
+    'const{session,resource}=getTarget();' +
+    'if(isChatInput){' +
+    'const rawId=typeof resource?.path==="string"?resource.path.replace(/^\\/+/, ""):"";' +
+    'const draft=rawId?provider?._newSessions?.get?.(rawId):void 0;' +
+    'if(draft)provider?.setNewSessionModeOption?.(draft,opt);' +
+    'else provider?.setActiveSessionModeOption?.(resource,opt);' +
+    '}else{provider?.setNewSessionModeOption?.(session,opt);}' +
+    'currentGroup=resolveGroup();const next=currentGroup.selected??opt;for(const cb of [...listeners])cb(next);' +
+    '},' +
     'getOptionGroup:()=>{currentGroup=resolveGroup();return currentGroup;},' +
     'getCurrentOption:()=>resolveGroup().selected,' +
-    'getSessionResource:()=>getSession()?.resource??{scheme:"antigravity"},' +
+    'getSessionResource:()=>getTarget().resource??{scheme:"antigravity"},' +
     '};' +
     `const picker=instantiation.createInstance(${mutCls},action,{group:currentGroup,item:currentGroup.selected},delegate,void 0);` +
     'const fireUpdate=()=>{currentGroup=resolveGroup();const next=currentGroup.selected;for(const cb of [...listeners])cb(next);};' +
+    'let vmSub;' +
+    'if(isChatInput){' +
+    'const origSetCtx=picker.setActionContext?.bind(picker);' +
+    'if(origSetCtx){picker.setActionContext=ctx=>{origSetCtx(ctx);const nextW=ctx?.widget;if(nextW!==contextWidget){contextWidget=nextW;vmSub?.dispose?.();vmSub=nextW?.onDidChangeViewModel?.(fireUpdate);fireUpdate();}};}' +
+    'if(contextWidget?.onDidChangeViewModel)vmSub=contextWidget.onDidChangeViewModel(fireUpdate);' +
+    'picker._register({dispose(){vmSub?.dispose?.();vmSub=void 0;}});' +
+    '}' +
     'if(provider?.onDidChangeOptionState)picker._register(provider.onDidChangeOptionState(fireUpdate));' +
     'if(provider?.chatSessionsService?.onDidChangeOptionGroups)picker._register(provider.chatSessionsService.onDidChangeOptionGroups(t=>{if(!t||t==="antigravity")fireUpdate();}));' +
+    'if(isChatInput&&provider?.chatSessionsService?.onDidChangeSessionOptions)picker._register(provider.chatSessionsService.onDidChangeSessionOptions(ev=>{const cur=getTarget().resource;if(!cur||!ev?.sessionResource||cur.toString?.()===ev.sessionResource.toString?.())fireUpdate();}));' +
     'return picker;' +
     '}))'
   );
 }
 
-function buildSessionsNewModeActionSnippet({ disp, regAct, actCls }, { expr, sessionsWin, ctx, tiKey, menuId }) {
-  return (
+function buildSessionsNewModeActionSnippet({ disp, regAct, actCls }, { expr, sessionsWin, ctx, tiKey, menuId }, chatInputGroups) {
+  const buildAction = (id, targetMenuId, order, whenExpr) =>
     `${disp}.add(${regAct}(class extends ${actCls}{` +
-    `constructor(){super({id:"antigravity.newSessionModePicker",title:"Agent Mode",menu:[{id:${menuId},group:"navigation",order:0,when:${expr}.and(${sessionsWin},${ctx}.enabled,${tiKey}.isEqualTo("antigravity"))}]})}` +
+    `constructor(){super({id:"${id}",title:"Agent Mode",menu:[{id:${targetMenuId},group:"navigation",order:${order},when:${whenExpr}}]})}` +
     'run(){}' +
-    '}));'
+    '}));';
+  const newSessionAct = buildAction(
+    'antigravity.newSessionModePicker',
+    menuId,
+    0,
+    `${expr}.and(${sessionsWin},${ctx}.enabled,${tiKey}.isEqualTo("antigravity"))`,
   );
+  const { chatInput, isSess } = chatInputGroups || {};
+  const chatInputAct =
+    chatInput && isSess
+      ? buildAction(
+          'antigravity.chatSessionModePicker',
+          `${chatInput}.ChatInput`,
+          '.5',
+          `${expr}.and(${isSess},${ctx}.enabled,${ctx}.chatSessionType.isEqualTo("antigravity"),${expr}.equals("sessionUsesExperimentalComposerLayout",!0))`,
+        )
+      : '';
+  return newSessionAct + chatInputAct;
 }
 
 module.exports = {
-  buildSessionsChatInputPickerSnippet,
   buildSessionsNewModeActionSnippet,
   buildSessionsNewModeViewItemSnippet,
   buildSessionsProviderSnippet,

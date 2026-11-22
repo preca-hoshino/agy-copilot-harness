@@ -287,5 +287,10 @@ describe.skipIf(!HAS_AGY_BINARY)('Live Antigravity ACP Backend Integration', () 
     expect(loadResult.modes?.availableModes.length ?? 0).toBeGreaterThan(0);
     expect(backend.getLastKnownConfigOptions().length).toBeGreaterThan(0);
     expect(receivedUpdates.length).toBeGreaterThan(0);
+
+    const contextUsage = await backend.getSessionContextUsage(targetSession.sessionId);
+    expect(contextUsage).toBeDefined();
+    expect(contextUsage?.maxContextTokens).toBeGreaterThan(0);
+    expect(contextUsage?.tokenGroups.length ?? 0).toBeGreaterThan(0);
   }, 45_000);
 });

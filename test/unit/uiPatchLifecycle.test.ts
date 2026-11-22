@@ -35,7 +35,7 @@ var $BaseOpt=typeof BaseOptionPicker!=="undefined"?BaseOptionPicker:class{_regis
 var $BaseCon=typeof BaseContrib!=="undefined"?BaseContrib:class{_register(x){return x}};
 var $Disp=typeof DispStore!=="undefined"?DispStore:class{add(x){return x}};
 var $Act2=typeof $Action2!=="undefined"?$Action2:class{constructor(d){this.desc=d}};
-var $ExprObj=typeof $Expr!=="undefined"?$Expr:{and:(...xs)=>({and:xs}),or:(...xs)=>({or:xs})};
+var $ExprObj=typeof $Expr!=="undefined"?$Expr:{and:(...xs)=>({and:xs}),or:(...xs)=>({or:xs}),equals:(k,v)=>({eq:[k,v]})};
 var $CtxObj=typeof $Ctx!=="undefined"?$Ctx:{enabled:1,chatSessionHasModels:1,lockedToCodingAgent:1,chatSessionType:{isEqualTo:v=>({eq:v}),notEqualsTo:v=>({neq:v})}};
 var $ProvObj=typeof $Provider!=="undefined"?$Provider:{Cloud:"cloud",Background:"bg"};
 var $IsSessObj=typeof $IsSessions!=="undefined"?$IsSessions:{negate:()=>1};
@@ -244,9 +244,9 @@ describe('VS Code UI patch lifecycle', () => {
           id: 'mode',
           name: 'Agent Mode',
           items: [
-            { id: 'default', name: 'Default', icon: { id: 'shield' }, agyPickerMeta: { provider: 'antigravity', pickerLabel: 'Manual permissions', shortLabel: 'Manual', tone: '', lastInteractiveMode: 'default', sandboxEnabled: false, sandboxSource: 'user' } },
-            { id: 'auto', name: 'Auto', icon: { id: 'zap' }, agyPickerMeta: { provider: 'antigravity', pickerLabel: 'Auto', shortLabel: 'Auto', tone: 'warning', lastInteractiveMode: 'auto', sandboxEnabled: false, sandboxSource: 'user' } },
-            { id: 'plan', name: 'Plan', icon: { id: 'checklist' }, agyPickerMeta: { provider: 'antigravity', pickerLabel: 'Plan', shortLabel: 'Plan', tone: '', lastInteractiveMode: 'auto', sandboxEnabled: false, sandboxSource: 'user' } },
+            { id: 'default', name: 'Default', icon: { id: 'shield' }, agyPickerMeta: { provider: 'antigravity', pickerLabel: 'Manual permissions', shortLabel: 'Manual', tone: '', lastInteractiveMode: 'default' } },
+            { id: 'auto', name: 'Auto', icon: { id: 'zap' }, agyPickerMeta: { provider: 'antigravity', pickerLabel: 'Auto', shortLabel: 'Auto', tone: 'warning', lastInteractiveMode: 'auto' } },
+            { id: 'plan', name: 'Plan', icon: { id: 'checklist' }, agyPickerMeta: { provider: 'antigravity', pickerLabel: 'Plan', shortLabel: 'Plan', tone: '', lastInteractiveMode: 'auto' } },
           ],
           selected: undefined,
         };
@@ -491,12 +491,17 @@ describe('VS Code UI patch lifecycle', () => {
     };
     modeGroup.selected = modeGroup.items[0];
     const activeSessionObs = { get: () => undefined as unknown };
+    const sessionOptions = new Map<string, unknown>();
     const chatSessionsService = {
       activateChatSessionItemProvider: vi.fn(async () => {}),
       getNewChatSessionInputState: vi.fn(async () => [modeGroup]),
       getOptionGroupsForSessionType: vi.fn((type: string) => (type === 'antigravity' ? [modeGroup] : undefined)),
-      getSessionOption: vi.fn(() => undefined),
-      setSessionOption: vi.fn(),
+      getSessionOption: vi.fn((res: { toString: () => string }, key: string) =>
+        sessionOptions.get(`${res.toString()}::${key}`),
+      ),
+      setSessionOption: vi.fn((res: { toString: () => string }, key: string, val: unknown) => {
+        sessionOptions.set(`${res.toString()}::${key}`, val);
+      }),
       onDidChangeItemsProviders: () => ({ dispose() {} }),
       onDidChangeOptionGroups: () => ({ dispose() {} }),
     };
@@ -574,8 +579,26 @@ describe('VS Code UI patch lifecycle', () => {
       const agy = __providers.find((p) => p.id === 'antigravity');
       const folderUri = $URI.file('d:\\\\Code Library\\\\agy-copilot-harness');
       const resolvedWs = agy.resolveWorkspace(folderUri);
+      const cachedWrapped = agy._chatToSession(agy._sessionCache.get('antigravity:/sess-1'));
+      const chatPickerFactory = __getViewItem('antigravity.chatSessionModePicker');
+      const chatPickerInstance = chatPickerFactory(
+        { id: 'antigravity.chatSessionModePicker' },
+        { actionContext: { widget: { viewModel: { model: { sessionResource: cachedWrapped.resource } } } } },
+        { invokeFunction: (fn) => fn(__services), createInstance: (Ctor, ...args) => new Ctor(...args) },
+      );
+      chatPickerInstance.delegate.setOption(modeGroupItems[1]);
+      const chatSelectedAfterPick = chatPickerInstance.delegate.getOptionGroup().selected?.id;
+      const workingSetResult = new EditingWidget().renderChatEditingSessionWithEntries(
+        null,
+        { chatSessionResource: cachedWrapped.resource, entries: { read: () => [] } },
+        { read: () => [{ reference: 'file:///live.ts' }] },
+        { read: () => [{ reference: 'file:///live.ts' }, { reference: 'file:///hist.ts' }] },
+      );
+
       const snapshot = agy.getModelsSnapshotForCreation(undefined, 'antigravity', undefined);
       const draft = agy.createNewSession(folderUri, 'antigravity', {});
+      const draftUsesSandbox = agy._usesSandbox({ sessionId: draft.sessionId });
+      const pickerOptions = agy.getModelPickerOptions(draft.sessionId);
       __setActiveSession(draft);
       const pickerFactory = __getViewItem('antigravity.newSessionModePicker');
       const pickerInstance = pickerFactory(
@@ -585,7 +608,6 @@ describe('VS Code UI patch lifecycle', () => {
       );
       pickerInstance.delegate.setOption(modeGroupItems[1]);
       const updatedGroup = pickerInstance.delegate.getOptionGroup();
-      const cachedWrapped = agy._chatToSession(agy._sessionCache.get('antigravity:/sess-1'));
       ({
         providerIds: __providers.map((p) => p.id),
         env: agy.environment,
@@ -594,14 +616,20 @@ describe('VS Code UI patch lifecycle', () => {
         browseCount: agy.browseActions.length,
         resolvedWsLabel: resolvedWs?.label,
         resolvedWsTrust: resolvedWs?.requiresWorkspaceTrust,
+        draftUsesSandbox,
+        pickerAutoModel: pickerOptions.showAutoModel,
         snapshotModelIds: snapshot.models.map((m) => m.identifier),
         draftHarness: draft.harness,
         draftIcon: draft.icon?.id,
         selectedAfterPick: updatedGroup.selected?.id,
+        chatSelectedAfterPick,
+        workingSetRefs: workingSetResult.map((x) => x.reference),
         cachedLabel: cachedWrapped.workspace?.get()?.label,
         cachedVirtual: cachedWrapped.workspace?.get()?.isVirtualWorkspace,
         cachedIcon: cachedWrapped.icon?.id,
-        hasAntigravityChatInputRule: ChatPickerMenu.some((m) => m.id === 'ChatInput' && JSON.stringify(m.when).includes('"antigravity"')),
+        hasAntigravityChatInputAction: __actions.some(
+          (a) => a.desc?.id === 'antigravity.chatSessionModePicker' && a.desc?.menu?.some?.((m) => m.id === 'ChatInput'),
+        ),
         registeredActionCount: __actions.length,
       });
       `,
@@ -627,6 +655,7 @@ describe('VS Code UI patch lifecycle', () => {
         $Expr: {
           and: (...xs: unknown[]) => ({ and: xs }),
           or: (...xs: unknown[]) => ({ or: xs }),
+          equals: (k: string, v: unknown) => ({ eq: [k, v] }),
         },
         $MenuId: { ChatInput: 'ChatInput', ChatInputSecondary: 'ChatInputSecondary' },
         $Wt: { NewSessionControl: 'NewSessionControl' },
@@ -683,15 +712,19 @@ describe('VS Code UI patch lifecycle', () => {
       browseCount: 0,
       resolvedWsLabel: 'ws',
       resolvedWsTrust: false,
+      draftUsesSandbox: false,
+      pickerAutoModel: false,
       snapshotModelIds: ['antigravity:gemini-2.5-pro'],
       draftHarness: 'antigravity',
       draftIcon: 'antigravity-logo',
       selectedAfterPick: 'plan',
+      chatSelectedAfterPick: 'plan',
+      workingSetRefs: ['file:///live.ts', 'file:///hist.ts'],
       cachedLabel: 'agy-copilot-harness',
       cachedVirtual: false,
       cachedIcon: 'antigravity-logo',
-      hasAntigravityChatInputRule: true,
-      registeredActionCount: 3,
+      hasAntigravityChatInputAction: true,
+      registeredActionCount: 4,
     });
   });
 });

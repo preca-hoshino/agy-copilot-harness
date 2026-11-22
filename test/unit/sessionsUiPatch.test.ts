@@ -22,7 +22,6 @@ const {
   buildWorkingSetDedupSnippet,
 } = requireFromProject('./scripts/ui-patch/snippets/working-set.js');
 const {
-  buildSessionsChatInputPickerSnippet,
   buildSessionsNewModeActionSnippet,
   buildSessionsNewModeViewItemSnippet,
   buildSessionsProviderSnippet,
@@ -139,6 +138,34 @@ describe('historical session usage extraction', () => {
     extractHistoryUsageParts(otherHistory, { scheme: 'copilotcli' });
     expect(otherHistory[0]?.parts).toEqual([
       { kind: 'markdownContent', content: { value: '<!--AGY_USAGE:{"used":42000,"size":1048576}-->' } },
+    ]);
+
+    const detailedHistory = [
+      {
+        type: 'response',
+        parts: [
+          {
+            kind: 'markdownContent',
+            content: {
+              value:
+                '<!--AGY_USAGE:{"used":62000,"size":256000,"completionTokens":2000,"details":[{"category":"System","label":"System Instructions","percentageOfPrompt":11.6},{"category":"User Context","label":"A\\u003eB","percentageOfPrompt":88.4},{"category":"Invalid","percentageOfPrompt":5}]}-->',
+            },
+          },
+        ],
+      },
+    ];
+    extractHistoryUsageParts(detailedHistory, { scheme: 'antigravity' });
+    expect(detailedHistory[0]?.parts).toEqual([
+      {
+        kind: 'usage',
+        promptTokens: 60000,
+        completionTokens: 2000,
+        contextUsage: { currentTokens: 62000, tokenLimit: 256000 },
+        promptTokenDetails: [
+          { category: 'System', label: 'System Instructions', percentageOfPrompt: 11.6 },
+          { category: 'User Context', label: 'A>B', percentageOfPrompt: 88.4 },
+        ],
+      },
     ]);
   });
 
@@ -391,8 +418,11 @@ describe('working set, editing action, and side chat UI snippets', () => {
     );
 
     const streamingTool = { kind: 'toolInvocation', toolCallId: 'edit-1', presentation: undefined as string | undefined };
-    const reqModel: { _responseParts: Array<Record<string, unknown>>; __agyBeforeUris?: Map<string, FakeUri> } = {
-      _responseParts: [streamingTool],
+    const reqModel: {
+      _response: { _responseParts: Array<Record<string, unknown>> };
+      __agyBeforeUris?: Map<string, FakeUri>;
+    } = {
+      _response: { _responseParts: [streamingTool] },
     };
     const snapshotOriginal = new FakeUri('chat-editing-snapshot-text-model:/workspace/a.ts');
     const getEntry = vi.fn(() => ({ originalURI: snapshotOriginal }));
@@ -468,19 +498,71 @@ describe('working set, editing action, and side chat UI snippets', () => {
     );
     expect(copilotParts[0]).toBe('b8s-part');
     expect((copilotParts[1] as { kind: string }).kind).toBe('externalToolInvocationUpdate');
+
+    // Already-completed duplicate toolInvocation cards in _response._responseParts are spliced out cleanly
+    const completedDuplicate = {
+      kind: 'toolInvocation',
+      toolCallId: 'edit-2',
+      presentation: undefined as string | undefined,
+      state: { get: () => ({ type: 4 }) },
+    };
+    const completedReqModel: {
+      _response: { _responseParts: Array<Record<string, unknown>> };
+    } = {
+      _response: { _responseParts: [completedDuplicate] },
+    };
+    const dedupParts: Array<Record<string, unknown>> = [];
+    await runner(
+      [
+        {
+          kind: 'externalToolInvocationUpdate',
+          toolCallId: 'edit-2',
+          isComplete: true,
+          toolSpecificData: {
+            agyEdit: true,
+            uri: 'file:///workspace/c.ts',
+            insertions: 2,
+            deletions: 1,
+            editKind: 'edit',
+          },
+        },
+      ],
+      agySession,
+      0,
+      completedReqModel,
+      dedupParts,
+      (x: unknown) => x,
+    );
+    expect(completedReqModel._response._responseParts).toEqual([]);
+    expect(dedupParts).toHaveLength(1);
+    expect(dedupParts[0]).toMatchObject({
+      kind: 'externalEdit',
+      uri: new FakeUri('file:///workspace/c.ts'),
+      diff: { added: 2, removed: 1 },
+    });
   });
 
-  it('deduplicates session.changes against live ChatEditingSession entries for antigravity only', () => {
+  it('deduplicates session.changes (n) against live and decided ChatEditingSession entries (i / t.entries) for antigravity only', () => {
     const snippet = buildWorkingSetDedupSnippet({ arg1: 't', arg2: 'i', arg3: 'n' });
-    const fn = runInNewContext(`(function(e,t,i,n){${snippet}return{session:i.read(null),live:n.read(null)};})`);
+    const fn = runInNewContext(`(function(e,t,i,n){${snippet}return{live:i.read(null),session:n.read(null)};})`);
 
     const agyRes = fn(
       null,
-      { chatSessionResource: { scheme: 'antigravity' } },
-      { read: () => [{ reference: 'file:///a.ts' }, { reference: 'file:///b.ts' }] },
+      { chatSessionResource: { scheme: 'antigravity' }, entries: { read: () => [{ modifiedURI: 'file:///kept.ts' }] } },
       { read: () => [{ reference: 'file:///a.ts' }] },
+      { read: () => [{ reference: 'file:///a.ts' }, { reference: 'file:///kept.ts' }, { reference: 'file:///b.ts' }] },
     );
+    expect(agyRes.live).toEqual([{ reference: 'file:///a.ts' }]);
     expect(agyRes.session).toEqual([{ reference: 'file:///b.ts' }]);
+
+    const agyReloadRes = fn(
+      null,
+      { chatSessionResource: { scheme: 'antigravity' }, entries: { read: () => [] } },
+      { read: () => [] },
+      { read: () => [{ reference: 'file:///a.ts' }, { reference: 'file:///b.ts' }] },
+    );
+    expect(agyReloadRes.live).toEqual([]);
+    expect(agyReloadRes.session).toEqual([{ reference: 'file:///a.ts' }, { reference: 'file:///b.ts' }]);
 
     const copilotRes = fn(
       null,
@@ -488,6 +570,7 @@ describe('working set, editing action, and side chat UI snippets', () => {
       { read: () => [{ reference: 'file:///a.ts' }] },
       { read: () => [{ reference: 'file:///a.ts' }] },
     );
+    expect(copilotRes.live).toEqual([{ reference: 'file:///a.ts' }]);
     expect(copilotRes.session).toEqual([{ reference: 'file:///a.ts' }]);
   });
 
@@ -532,7 +615,7 @@ describe('working set, editing action, and side chat UI snippets', () => {
 });
 
 describe('Antigravity 2-tier mode and permissions picker', () => {
-  function makeGroup(selectedId: string, lastInteractiveMode = 'default', sandboxEnabled = true) {
+  function makeGroup(selectedId: string, lastInteractiveMode = 'default') {
     const items = [
       {
         id: 'default',
@@ -547,8 +630,6 @@ describe('Antigravity 2-tier mode and permissions picker', () => {
           detail: 'Ask before edits and commands',
           tone: '',
           lastInteractiveMode,
-          sandboxEnabled,
-          sandboxSource: sandboxEnabled ? 'default' : 'user',
         },
       },
       {
@@ -564,8 +645,6 @@ describe('Antigravity 2-tier mode and permissions picker', () => {
           detail: 'Auto-approve workspace file edits',
           tone: 'info',
           lastInteractiveMode,
-          sandboxEnabled,
-          sandboxSource: sandboxEnabled ? 'default' : 'user',
         },
       },
       {
@@ -581,8 +660,6 @@ describe('Antigravity 2-tier mode and permissions picker', () => {
           detail: 'Automatically approve one-time tool requests',
           tone: 'warning',
           lastInteractiveMode,
-          sandboxEnabled,
-          sandboxSource: sandboxEnabled ? 'default' : 'user',
         },
       },
       {
@@ -598,8 +675,6 @@ describe('Antigravity 2-tier mode and permissions picker', () => {
           detail: 'Plan changes before executing',
           tone: '',
           lastInteractiveMode,
-          sandboxEnabled,
-          sandboxSource: sandboxEnabled ? 'default' : 'user',
         },
       },
     ];
@@ -642,6 +717,7 @@ describe('Antigravity 2-tier mode and permissions picker', () => {
   interface ModePickerActionListItem {
     readonly kind: string;
     readonly label: string;
+    readonly detail?: string;
     readonly section?: string;
     readonly isSectionToggle?: boolean;
     readonly disabled?: boolean;
@@ -657,13 +733,13 @@ describe('Antigravity 2-tier mode and permissions picker', () => {
     };
   }
 
-  it('builds 2-tier Agent mode + Permissions + read-only Sandbox sections without Autopilot or Allow all', () => {
+  it('builds 2-tier Agent mode + Permissions sections without Sandbox row and keeps popup descriptions stable in Plan mode', () => {
     const onSelectInteractive = vi.fn();
     const onSelectPlan = vi.fn();
     const onSelectPermission = vi.fn();
     const onConfigurePermissions = vi.fn();
 
-    const interactiveVm = resolveModePermissionsViewModel(makeGroup('auto', 'auto', false), undefined, undefined);
+    const interactiveVm = resolveModePermissionsViewModel(makeGroup('auto', 'auto'), undefined, undefined);
     const items = buildModePermissionsActionItems(interactiveVm, {
       onSelectInteractive,
       onSelectPlan,
@@ -682,20 +758,10 @@ describe('Antigravity 2-tier mode and permissions picker', () => {
       'Manual permissions',
       'Accept edits',
       'Auto',
-      'Sandboxing for terminal',
     ]);
-    expect(permItems.map((item) => item.disabled)).toEqual([false, false, false, true]);
+    expect(permItems.map((item) => item.disabled)).toEqual([false, false, false]);
     expect(permItems[2]?.item.checked).toBe(true);
-
-    const sandboxRow = permItems[3];
-    expect(sandboxRow).toMatchObject({
-      label: 'Sandboxing for terminal',
-      description: 'Off (CLI)',
-      disabled: true,
-      focusableWhenDisabled: true,
-    });
-    expect(sandboxRow?.item.enabled).toBe(false);
-    expect(sandboxRow?.item.checked).toBeUndefined();
+    expect(items.some((item) => item.label === 'Sandboxing for terminal' || item.item?.id === 'antigravity.sandboxStatus')).toBe(false);
 
     // Gear button opens Harness settings
     const permHeader = items.find((item) => item.isSectionToggle && item.section === 'agentHostModePicker.permissions');
@@ -703,19 +769,23 @@ describe('Antigravity 2-tier mode and permissions picker', () => {
     permHeader?.toolbarActions?.[0]?.run();
     expect(onConfigurePermissions).toHaveBeenCalledOnce();
 
-    // Selecting Plan remembers active interactive mode; selecting Interactive in Plan mode restores it
-    const planVm = resolveModePermissionsViewModel(makeGroup('plan', 'auto', true), undefined, 'accept-edits');
+    // Selecting Plan keeps identical header description and option detail widths without bloating text
+    const planVm = resolveModePermissionsViewModel(makeGroup('plan', 'auto'), undefined, 'accept-edits');
     const planItems = buildModePermissionsActionItems(planVm, {
       onSelectInteractive,
       onSelectPlan,
       onSelectPermission,
       onConfigurePermissions,
     }) as ModePickerActionListItem[];
+    const planPermHeader = planItems.find(
+      (item) => item.isSectionToggle && item.section === 'agentHostModePicker.permissions',
+    );
+    expect(planPermHeader?.description).toBe('Accept edits');
     const planPerms = planItems.filter(
       (item) => item.kind === 'action' && !item.isSectionToggle && item.section === 'agentHostModePicker.permissions',
     );
     expect(planPerms.every((item) => item.disabled === true && item.focusableWhenDisabled === true)).toBe(true);
-    expect(planPerms[3]?.description).toBe('On (CLI)');
+    expect(planPerms.map((item) => item.detail)).toEqual(permItems.map((item) => item.detail));
 
     // Clicking disabled permission in Plan mode does not invoke callback
     planPerms[0]?.item.run();
@@ -738,24 +808,22 @@ describe('Antigravity Sessions Window provider snippet', () => {
       { itemCls: 'CacheItem' },
       { getModels: 'getModels', resolveModel: 'resolveModel' },
     );
-    const chatInputSnippet = buildSessionsChatInputPickerSnippet({
-      chatInput: 'MenuId',
-      expr: 'Expr',
-      isSess: 'IsSess',
-      ctx: 'Ctx',
-    });
     const modeViewItemSnippet = buildSessionsNewModeViewItemSnippet(
       { reg: 'reg', menuId: 'NewMenu', mgmtSvc: 'MgmtTok' },
       { mutCls: 'OptPicker' },
+      { chatInput: 'MenuId' },
     );
     const modeActionSnippet = buildSessionsNewModeActionSnippet(
       { disp: 'store', regAct: 'regAct', actCls: 'Act2' },
       { expr: 'Expr', sessionsWin: 'SessWin', ctx: 'Ctx', tiKey: 'TiKey', menuId: 'NewMenu' },
+      { chatInput: 'MenuId', isSess: 'IsSess' },
     );
-    expect(chatInputSnippet).toContain('ChatInput');
-    expect(chatInputSnippet).toContain('"antigravity"');
     expect(modeViewItemSnippet).toContain('antigravity.newSessionModePicker');
+    expect(modeViewItemSnippet).toContain('antigravity.chatSessionModePicker');
+    expect(modeViewItemSnippet).toContain('MenuId.ChatInput');
     expect(modeActionSnippet).toContain('antigravity.newSessionModePicker');
+    expect(modeActionSnippet).toContain('antigravity.chatSessionModePicker');
+    expect(modeActionSnippet).toContain('sessionUsesExperimentalComposerLayout');
 
     const sentPayloads: Array<{ resource: unknown; query: string; opts: Record<string, unknown> }> = [];
     const updatedOptions: Array<{ resource: unknown; options: Map<string, unknown> }> = [];
@@ -937,6 +1005,25 @@ describe('Antigravity Sessions Window provider snippet', () => {
       public _replaceSession(payload: { from: unknown; to: unknown }): void {
         replacements.push(payload);
       }
+      public _usesSandbox(): boolean {
+        return true;
+      }
+      public _validateSandboxSession(): void {
+        throw new Error('GitHub sandbox creation requires a repository for this session.');
+      }
+      public async sendRequest(sessionId: string, chatResource: unknown, opts: unknown) {
+        const draft = this._newSessions.get(sessionId) as Draft | undefined;
+        if (draft) {
+          return this._usesSandbox()
+            ? (this._validateSandboxSession(), undefined)
+            : (this as unknown as { _sendFirstChat: (d: Draft, r: unknown, o: unknown) => Promise<unknown> })._sendFirstChat(
+                draft,
+                chatResource,
+                opts,
+              );
+        }
+        throw new Error(`Session '${sessionId}' not found`);
+      }
     }
 
     const registered: unknown[] = [];
@@ -949,7 +1036,7 @@ describe('Antigravity Sessions Window provider snippet', () => {
         const created = agyProv._createDraftSession(folder, 'antigravity', {});
         const draft = agyProv._newSessions.get(created.sessionId);
         agyProv.setNewSessionModeOption(created, { id: 'auto', name: 'Auto' });
-        const result = await agyProv._sendFirstChat(draft, draft.resource, { query: 'Fix bug', attachedContext: [] });
+        const result = await agyProv.sendRequest(draft.sessionId, draft.resource, { query: 'Fix bug', attachedContext: [] });
         return result;
       })()
       `,

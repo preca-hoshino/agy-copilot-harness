@@ -6,11 +6,14 @@ import * as fsPromises from 'node:fs/promises';
 import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as zlib from 'node:zlib';
 import * as vscode from 'vscode';
 import type {
   AcpBackendInterface,
+  AgyContextWindowUsage,
   AgyForkConversationResult,
   AgySlashCommandDescriptor,
+  AgyTokenGroupUsage,
   AgyTurnFileDiff,
   FileWriteHandler,
   PermissionPrompt,
@@ -130,6 +133,207 @@ async function postLocalJson(
     req.on('error', finishReject);
     req.end(body);
   });
+}
+
+function parseNonNegativeTokenCount(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (/^\d+$/.test(trimmed)) {
+      const parsed = Number(trimmed);
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        return parsed;
+      }
+    }
+  }
+  return undefined;
+}
+
+function extractFirstConnectFrameText(
+  buffer: Buffer,
+): { readonly kind: 'incomplete' } | { readonly kind: 'trailer' } | { readonly kind: 'frame'; readonly text: string } {
+  if (buffer.length < 5) {
+    return { kind: 'incomplete' };
+  }
+  const flags = buffer.readUInt8(0);
+  const frameLength = buffer.readUInt32BE(1);
+  if (buffer.length < 5 + frameLength) {
+    return { kind: 'incomplete' };
+  }
+  if ((flags & 0x02) !== 0) {
+    return { kind: 'trailer' };
+  }
+  const payload = buffer.subarray(5, 5 + frameLength);
+  const rawPayload = (flags & 0x01) !== 0 ? zlib.gunzipSync(payload) : payload;
+  return { kind: 'frame', text: rawPayload.toString('utf8') };
+}
+
+async function postLocalConnectFirstFrame(
+  port: number,
+  requestPath: string,
+  headers: Readonly<Record<string, string>>,
+  body: string,
+  signal: AbortSignal,
+): Promise<{ readonly statusCode: number; readonly frameText?: string | undefined }> {
+  if (signal.aborted) {
+    throw new Error(toErrorMessage(signal.reason));
+  }
+  const jsonBytes = Buffer.from(body, 'utf8');
+  const envelope = Buffer.alloc(5 + jsonBytes.length);
+  envelope.writeUInt8(0, 0);
+  envelope.writeUInt32BE(jsonBytes.length, 1);
+  jsonBytes.copy(envelope, 5);
+
+  return await new Promise<{ readonly statusCode: number; readonly frameText?: string | undefined }>(
+    (resolve, reject) => {
+      let settled = false;
+      const finishReject = (err: unknown): void => {
+        if (!settled) {
+          settled = true;
+          signal.removeEventListener('abort', onAbort);
+          reject(err instanceof Error ? err : new Error(toErrorMessage(err)));
+        }
+      };
+      const finishResolve = (result: {
+        readonly statusCode: number;
+        readonly frameText?: string | undefined;
+      }): void => {
+        if (!settled) {
+          settled = true;
+          signal.removeEventListener('abort', onAbort);
+          resolve(result);
+        }
+      };
+      const req = http.request(
+        {
+          hostname: '127.0.0.1',
+          port,
+          path: requestPath,
+          method: 'POST',
+          headers: {
+            ...headers,
+            'Content-Length': String(envelope.length),
+          },
+          agent: false,
+        },
+        (res) => {
+          const statusCode = res.statusCode ?? 0;
+          if (statusCode < 200 || statusCode >= 300) {
+            finishResolve({ statusCode });
+            req.destroy();
+            return;
+          }
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer | string) => {
+            if (settled) {
+              return;
+            }
+            chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk);
+            const combined = chunks.length === 1 ? (chunks[0] ?? Buffer.alloc(0)) : Buffer.concat(chunks);
+            try {
+              const extracted = extractFirstConnectFrameText(combined);
+              if (extracted.kind === 'incomplete') {
+                return;
+              }
+              if (extracted.kind === 'trailer') {
+                finishResolve({ statusCode });
+                req.destroy();
+                return;
+              }
+              finishResolve({ statusCode, frameText: extracted.text });
+              req.destroy();
+            } catch {
+              finishResolve({ statusCode });
+              req.destroy();
+            }
+          });
+          res.on('end', () => {
+            finishResolve({ statusCode });
+          });
+          res.on('error', finishReject);
+        },
+      );
+      const onAbort = (): void => {
+        req.destroy();
+        finishReject(signal.reason);
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      req.setTimeout(0);
+      req.on('error', finishReject);
+      req.end(envelope);
+    },
+  );
+}
+
+function parseContextWindowUsageFrame(
+  rawFrame: unknown,
+): { readonly usage: AgyContextWindowUsage; readonly generatorMetadataIndex?: number | undefined } | undefined {
+  if (!isRecord(rawFrame)) {
+    return undefined;
+  }
+  const update = isRecord(rawFrame.update) ? rawFrame.update : rawFrame;
+  const cw = update.contextWindowUsage;
+  if (!isRecord(cw)) {
+    return undefined;
+  }
+  const estimatedTokensUsed = parseNonNegativeTokenCount(cw.estimatedTokensUsed);
+  const maxContextTokens = parseNonNegativeTokenCount(cw.maxContextTokens);
+  if (estimatedTokensUsed === undefined || maxContextTokens === undefined || maxContextTokens <= 0) {
+    return undefined;
+  }
+  const estimatedAfterCompaction = parseNonNegativeTokenCount(cw.estimatedAfterCompaction);
+  const generatorMetadataIndex = parseNonNegativeTokenCount(cw.generatorMetadataIndex);
+  const tokenGroups: AgyTokenGroupUsage[] = [];
+  if (Array.isArray(cw.tokenGroups)) {
+    for (const rawGroup of cw.tokenGroups) {
+      if (!isRecord(rawGroup)) {
+        continue;
+      }
+      const numTokens = parseNonNegativeTokenCount(rawGroup.numTokens) ?? 0;
+      tokenGroups.push({
+        name: typeof rawGroup.name === 'string' ? rawGroup.name : '',
+        type: typeof rawGroup.type === 'string' ? rawGroup.type : 'TOKEN_TYPE_UNSPECIFIED',
+        source: typeof rawGroup.source === 'string' ? rawGroup.source : 'TOKEN_SOURCE_UNSPECIFIED',
+        numTokens,
+      });
+    }
+  }
+  return {
+    usage: {
+      estimatedTokensUsed,
+      maxContextTokens,
+      ...(estimatedAfterCompaction !== undefined ? { estimatedAfterCompaction } : {}),
+      tokenGroups,
+    },
+    ...(generatorMetadataIndex !== undefined ? { generatorMetadataIndex } : {}),
+  };
+}
+
+function extractLatestOutputTokensFromMetadata(payload: Record<string, unknown> | undefined): number | undefined {
+  const rawList: unknown = payload?.generatorMetadata;
+  if (!Array.isArray(rawList)) {
+    return undefined;
+  }
+  const list: readonly unknown[] = rawList;
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const entry = list[i];
+    if (!isRecord(entry) || !isRecord(entry.chatModel) || !isRecord(entry.chatModel.usage)) {
+      continue;
+    }
+    const usage = entry.chatModel.usage;
+    const direct = parseNonNegativeTokenCount(usage.outputTokens);
+    if (direct !== undefined) {
+      return direct;
+    }
+    const thinking = parseNonNegativeTokenCount(usage.thinkingOutputTokens);
+    const response = parseNonNegativeTokenCount(usage.responseOutputTokens);
+    if (thinking !== undefined || response !== undefined) {
+      return (thinking ?? 0) + (response ?? 0);
+    }
+  }
+  return undefined;
 }
 
 function parseConfigOptionChoices(rawChoices: unknown[]): AcpConfigOption['options'] {
@@ -691,6 +895,86 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
       },
     );
     return payload !== undefined;
+  }
+
+  public async getSessionContextUsage(sessionId: string): Promise<AgyContextWindowUsage | undefined> {
+    const trimmedSessionId = sessionId.trim();
+    if (
+      trimmedSessionId.length === 0 ||
+      this.disposed ||
+      this._internalHttpPort === undefined ||
+      this.csrfToken.length === 0
+    ) {
+      return undefined;
+    }
+    const framePayload = await this.callLanguageServerConnectFirstFrame(
+      '/exa.language_server_pb.LanguageServerService/StreamAgentStateUpdates',
+      {
+        conversationId: trimmedSessionId,
+        subscriberId: `agy-copilot-harness-usage-${randomUUID().slice(0, 8)}`,
+        initialStepsPageBounds: { startIndex: 0, endIndexExclusive: 0 },
+        initialGeneratorMetadatasPageBounds: { startIndex: 0, endIndexExclusive: 0 },
+        initialExecutorMetadatasPageBounds: { startIndex: 0, endIndexExclusive: 0 },
+      },
+      2500,
+    );
+    const parsed = parseContextWindowUsageFrame(framePayload);
+    if (parsed === undefined) {
+      return undefined;
+    }
+
+    let completionTokens: number | undefined;
+    if (parsed.generatorMetadataIndex !== undefined) {
+      const metadataPayload = await this.callLanguageServerJson(
+        '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata',
+        {
+          cascadeId: trimmedSessionId,
+          generatorMetadataOffset: Math.max(0, parsed.generatorMetadataIndex - 1),
+          includeMessages: false,
+        },
+        1500,
+      );
+      completionTokens = extractLatestOutputTokensFromMetadata(metadataPayload);
+    }
+
+    return {
+      ...parsed.usage,
+      ...(completionTokens !== undefined ? { completionTokens } : {}),
+    };
+  }
+
+  private async callLanguageServerConnectFirstFrame(
+    methodPath: string,
+    body: Record<string, unknown>,
+    timeoutMs = 2500,
+  ): Promise<unknown> {
+    if (this.disposed || this._internalHttpPort === undefined || this.csrfToken.length === 0) {
+      return undefined;
+    }
+    try {
+      const response = await postLocalConnectFirstFrame(
+        this._internalHttpPort,
+        methodPath,
+        {
+          'Content-Type': 'application/connect+json',
+          'Connect-Protocol-Version': '1',
+          'x-codeium-csrf-token': this.csrfToken,
+        },
+        JSON.stringify(body),
+        AbortSignal.timeout(timeoutMs),
+      );
+      if (
+        response.statusCode < 200 ||
+        response.statusCode >= 300 ||
+        response.frameText === undefined ||
+        response.frameText.length === 0
+      ) {
+        return undefined;
+      }
+      return JSON.parse(response.frameText) as unknown;
+    } catch {
+      return undefined;
+    }
   }
 
   private async callLanguageServerJson(

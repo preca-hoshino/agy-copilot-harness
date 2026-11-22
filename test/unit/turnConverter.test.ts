@@ -944,6 +944,66 @@ describe('TurnConverter', () => {
     expect(lastPart.value.value).toBe('<!--AGY_USAGE:{"used":34500,"size":1048576}-->');
   });
 
+  it('embeds detailed breakdown and escaped characters in TurnConverter.finalizeHistory', () => {
+    const renderer = new BrowserSubagentRenderer('D:\\unused');
+    const converter = new TurnConverter(renderer, 'session-detailed-usage');
+
+    converter.processUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Analyze repo' } });
+    converter.processUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Summary ready.' } });
+    converter.processUpdate({ sessionUpdate: 'usage_update', used: 34_500, size: 1_048_576 });
+
+    const history = converter.finalizeHistory('antigravity/gemini-pro', {
+      estimatedTokensUsed: 62_000,
+      maxContextTokens: 256_000,
+      completionTokens: 2_000,
+      tokenGroups: [
+        { name: 'System Prompt', type: 'TOKEN_TYPE_SYSTEM_PROMPT', source: 'TOKEN_SOURCE_SYSTEM', numTokens: 12_400 },
+        { name: 'Custom>Tag', type: 'TOKEN_TYPE_UNSPECIFIED', source: 'TOKEN_SOURCE_USER', numTokens: 49_600 },
+      ],
+    });
+
+    expect(history.usage).toEqual({
+      used: 62_000,
+      size: 256_000,
+      completionTokens: 2_000,
+      details: [
+        { category: 'System', label: 'System Instructions', percentageOfPrompt: 20 },
+        { category: 'User Context', label: 'Custom>Tag', percentageOfPrompt: 80 },
+      ],
+    });
+    const responseTurn = history.turns[1] as vscode.ChatResponseTurn2;
+    const lastPart = responseTurn.response[responseTurn.response.length - 1] as vscode.ChatResponseMarkdownPart;
+    expect(lastPart.value.value).toContain('\\u003e');
+    expect(lastPart.value.value).toMatch(/^<!--AGY_USAGE:\{[^>]+\}-->$/);
+  });
+
+  it('uses formatUsage callback in LiveStreamAdapter when provided', () => {
+    const renderer = new BrowserSubagentRenderer('D:\\unused');
+    const usage = vi.fn();
+    const adapter = new LiveStreamAdapter(
+      renderer,
+      'session-live-detailed',
+      { push: vi.fn(), usage } as unknown as vscode.ChatResponseStream,
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      (payload) => ({
+        promptTokens: payload.used - 500,
+        completionTokens: 500,
+        promptTokenDetails: [{ category: 'System', label: 'System Instructions', percentageOfPrompt: 10 }],
+      }),
+    );
+
+    adapter.handleUpdate({ sessionUpdate: 'usage_update', used: 20_500, size: 256_000 });
+    expect(usage).toHaveBeenCalledExactlyOnceWith({
+      promptTokens: 20_000,
+      completionTokens: 500,
+      promptTokenDetails: [{ category: 'System', label: 'System Instructions', percentageOfPrompt: 10 }],
+    });
+  });
+
   it('hides workspace live edits from the initial in_progress update and keeps brain artifacts as single tool steps', async () => {
     const renderer = new BrowserSubagentRenderer('D:\\unused');
     const pushed: unknown[] = [];

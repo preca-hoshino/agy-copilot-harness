@@ -14,12 +14,18 @@ declare module 'vscode' {
     defaultValue?: string | string[];
   }
 
+  export interface ChatResponsePromptTokenDetail {
+    readonly category: string;
+    readonly label: string;
+    readonly percentageOfPrompt: number;
+  }
+
   export interface ChatResponseUsage {
     promptTokens: number;
     completionTokens: number;
     outputBuffer?: number;
     copilotCredits?: number;
-    promptTokenDetails?: readonly unknown[];
+    promptTokenDetails?: readonly ChatResponsePromptTokenDetail[];
   }
 
   export interface ChatResponseStream {

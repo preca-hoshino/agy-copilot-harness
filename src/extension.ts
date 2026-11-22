@@ -204,6 +204,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     outputChannel,
     attachmentDir,
     (sessionId) => chatParticipant.getActiveSession(sessionId),
+    (modelId, maxContextTokens): void => {
+      lmProvider.recordContextWindow(modelId, maxContextTokens, true);
+    },
   );
   const configuredAppDataDir = vscode.workspace
     .getConfiguration('antigravityHarness')
