@@ -3,6 +3,12 @@ const { markSnippet, reattachFooter } = require('./markers');
 const { buildTrustedAuthAccessSnippet, buildWorkbenchAccountsOrderSnippet } = require('./snippets/accounts');
 const { buildModePermissionsPickerSnippet } = require('./snippets/mode-permissions-picker');
 const { buildSessionsPanelSnippet, buildSessionsSkipContributedSnippet } = require('./snippets/sessions-panel');
+const {
+  buildSessionsChatInputPickerSnippet,
+  buildSessionsNewModeActionSnippet,
+  buildSessionsNewModeViewItemSnippet,
+  buildSessionsProviderSnippet,
+} = require('./snippets/sessions-provider');
 const { buildSessionHistoryUsageSnippet } = require('./snippets/session-usage');
 const { buildStatusBarTooltipSnippet } = require('./snippets/status-tooltip');
 const { buildTerminalApprovalSnippet } = require('./snippets/terminal-approval');
@@ -52,15 +58,61 @@ function patchSessions(patch) {
   const result = resolveAnchors(patch.clean, SESSIONS_ANCHORS);
   if (!result.ok) return result;
   const { matches } = result;
-  const { panel, panelMethod, panelDom, panelActions, chatStatus, contributed } = matches;
+  const {
+    panel,
+    panelMethod,
+    panelDom,
+    panelActions,
+    chatStatus,
+    contributed,
+    sessionsModelHelpers,
+    sessionsOptionPicker,
+    sessionsChatInputPicker,
+    sessionsNewModeViewItem,
+    sessionsNewModeAction,
+    sessionsDraftFactory,
+    sessionsCacheItem,
+    sessionsDefaultProvider,
+  } = matches;
   if (!(panelMethod.end <= panelDom.start && panelDom.end <= panelActions.start && panelActions.end <= panel.start)) {
     return { ok: false, reason: 'Sessions account panel helpers are not in the expected order.' };
+  }
+  if (
+    !(
+      sessionsModelHelpers.end <= sessionsNewModeViewItem.start &&
+      sessionsOptionPicker.end <= sessionsNewModeViewItem.start &&
+      sessionsDraftFactory.end <= sessionsDefaultProvider.start &&
+      sessionsCacheItem.end <= sessionsDefaultProvider.start
+    )
+  ) {
+    return { ok: false, reason: 'Sessions provider helpers are not in the expected order.' };
   }
 
   const content = insertSnippets(patch, [
     ...commonInsertions(matches),
     [panel.start, 'sessions-panel', buildSessionsPanelSnippet(panelDom.groups, panelActions.groups, chatStatus.groups)],
     [contributed.end, 'sessions-contributed', buildSessionsSkipContributedSnippet()],
+    [sessionsChatInputPicker.end, 'sessions-chat-input-picker', buildSessionsChatInputPickerSnippet(sessionsChatInputPicker.groups)],
+    [
+      sessionsNewModeViewItem.end,
+      'sessions-new-mode-view-item',
+      buildSessionsNewModeViewItemSnippet(sessionsNewModeViewItem.groups, sessionsOptionPicker.groups),
+    ],
+    [
+      sessionsNewModeAction.end,
+      'sessions-new-mode-action',
+      buildSessionsNewModeActionSnippet(sessionsNewModeAction.groups, sessionsNewModeViewItem.groups),
+    ],
+    [
+      sessionsDefaultProvider.end,
+      'sessions-antigravity-provider',
+      buildSessionsProviderSnippet(
+        sessionsDefaultProvider.groups,
+        sessionsDraftFactory.groups,
+        sessionsCacheItem.groups,
+        sessionsModelHelpers.groups,
+      ),
+    ],
   ]);
   return { ok: true, content };
 }

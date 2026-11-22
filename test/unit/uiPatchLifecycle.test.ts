@@ -31,6 +31,35 @@ function commonBundle() {
 
 const sessionsOriginal = `${commonBundle()}
 var $chat=token("chatStatusItemService");
+var $BaseOpt=typeof BaseOptionPicker!=="undefined"?BaseOptionPicker:class{_register(d){return d}getDropdownActions(){return[]}};
+var $BaseCon=typeof BaseContrib!=="undefined"?BaseContrib:class{_register(x){return x}};
+var $Disp=typeof DispStore!=="undefined"?DispStore:class{add(x){return x}};
+var $Act2=typeof $Action2!=="undefined"?$Action2:class{constructor(d){this.desc=d}};
+var $ExprObj=typeof $Expr!=="undefined"?$Expr:{and:(...xs)=>({and:xs}),or:(...xs)=>({or:xs})};
+var $CtxObj=typeof $Ctx!=="undefined"?$Ctx:{enabled:1,chatSessionHasModels:1,lockedToCodingAgent:1,chatSessionType:{isEqualTo:v=>({eq:v}),notEqualsTo:v=>({neq:v})}};
+var $ProvObj=typeof $Provider!=="undefined"?$Provider:{Cloud:"cloud",Background:"bg"};
+var $IsSessObj=typeof $IsSessions!=="undefined"?$IsSessions:{negate:()=>1};
+var $SessWinVal=typeof $SessionsWin!=="undefined"?$SessionsWin:1;
+var $TiKeyObj=typeof $TiKey!=="undefined"?$TiKey:{isEqualTo:v=>({ti:v})};
+var $SandboxVal=typeof $SandboxProv!=="undefined"?$SandboxProv:"sandbox";
+var $SqaVal=typeof _sqa!=="undefined"?_sqa:1;
+var $MenuObj=typeof $MenuId!=="undefined"?$MenuId:{ChatInput:"ChatInput",ChatInputSecondary:"ChatInputSecondary"};
+var $WtObj=typeof $Wt!=="undefined"?$Wt:{NewSessionControl:"NewSessionControl"};
+var $SlVal=typeof $Sl!=="undefined"?$Sl:"sl";
+var $RegActFn=typeof $regAction!=="undefined"?$regAction:(C)=>new C();
+var $UriObj=typeof $URI!=="undefined"?$URI:{parse:r=>({scheme:"unknown",path:"///",toString:()=>r}),from:({scheme,path})=>({scheme,path,toString:()=>scheme+":"+path})};
+var $ObsFn=typeof $obs!=="undefined"?$obs:(v=>({get:()=>v}));
+var $EmitFn=typeof $makeEmitter!=="undefined"?$makeEmitter:(()=>({event:()=>({dispose(){}}),fire:()=>{}}));
+var $UuidFn=typeof $uuid!=="undefined"?$uuid:(()=>"u");
+function $getModels(lms){return lms.getLanguageModelIds().map(id=>{let meta=lms.lookupLanguageModel(id);return meta?{identifier:id,metadata:meta}:void 0}).filter(x=>x!==void 0)}function $noop(){}function $resolveModel(models,desired,lms,all){return $resolveInner(models,desired,{hasLiveModels:()=>!0})}
+var $mut=class extends $BaseOpt{constructor(e,t,i,n,r,a,c,l,u,p,h){let{group:g,item:f}=t,v=e;super(v,t,i,n,r,a,c,l,u,p,h);this._actions={getActions:()=>this.getDropdownActions()}}getDropdownActions(){return[]}};
+const ChatPickerMenu=[{id:$MenuObj.ChatInput,order:4,group:"navigation",when:$ExprObj.and($CtxObj.chatSessionHasModels,$CtxObj.chatSessionType.isEqualTo($ProvObj.Cloud),$CtxObj.lockedToCodingAgent)},{id:$MenuObj.ChatInputSecondary,order:4,group:"navigation",when:$ExprObj.and($CtxObj.chatSessionHasModels,$CtxObj.chatSessionType.notEqualsTo($ProvObj.Cloud),$ExprObj.or($IsSessObj.negate(),$CtxObj.chatSessionType.notEqualsTo($ProvObj.Background)),$CtxObj.lockedToCodingAgent)}];
+var _x=$ExprObj.and($SessWinVal,$CtxObj.enabled,$ExprObj.or($SqaVal,$TiKeyObj.isEqualTo($SandboxVal))),G4e=class extends $BaseCon{static{this.ID="workbench.contrib.copilotPickerActionViewItems"}constructor(reg,layout){super(),this._register(reg.register($WtObj.NewSessionControl,"sessions.sandbox.modePicker",(t,i,n)=>{let r=n.invokeFunction(a=>a.get($SlVal));return new ViewItem(n)}))}};
+function dis(){let disp=new $Disp;for(let[id,title,order]of[["sessions.sandbox.modePicker","Agent Mode",0],["sessions.sandbox.approvalPicker","Approvals",1]])disp.add($RegActFn(class extends $Act2{constructor(){super({id,title,menu:[{id:$WtObj.NewSessionControl,group:"navigation",order,when:_x}]})}run(){}}));return disp}
+class $Draft{constructor(res,ws,target,prov){this.resource=res;this.sessionWorkspace=ws;this.target=target;this.providerId=prov;this.sessionType=target;this.sessionId=prov+":"+res.toString();this.selectedOptions=new Map;this.mainChat=$ObsFn({resource:res})}setCreatedBySession(){}setOption(k,v){this.selectedOptions.set(k,v)}setTitle(){}setStatus(){}dispose(){}}
+class $CacheItem{constructor(s,pid,gh,pr,log){this.sessionId=pid+":"+s.resource.toString();this.resource=s.resource;this.providerId=pid;this.sessionType=s.providerType;this.icon={id:"cloud"};this.status=$ObsFn(0);this.workspace=$ObsFn(this._buildWorkspace(s));this.mainChat=$ObsFn({resource:s.resource})}update(){return!1}_buildWorkspace(s){return{uri:$UriObj.parse("unknown:///"),label:"u",icon:{id:"folder"},group:"o",folders:[{root:$UriObj.parse("unknown:///"),workingDirectory:$UriObj.parse("unknown:///"),name:"u"}],requiresWorkspaceTrust:!1,isVirtualWorkspace:!0}}}
+class $Xfe{get id(){return this.providerMode==="sandbox"?"sandbox":"default"}constructor(mode,agentSessionsService,chatService,chatSessionsService,commandService,instantiationService,languageModelsService){this.providerMode=mode;this.agentSessionsService=agentSessionsService;this.chatService=chatService;this.chatSessionsService=chatSessionsService;this.commandService=commandService;this.instantiationService=instantiationService;this.languageModelsService=languageModelsService;this._sessionCache=new Map;this._sessionWrapperCache=new Map;this._newSessions=new Map;this._inFlightCommits=new Set;this._onDidChangeSessionTypes=$EmitFn();this.onDidChangeSessionTypes=this._onDidChangeSessionTypes.event;this._onDidChangeSessions=$EmitFn();this.onDidChangeSessions=this._onDidChangeSessions.event;this._onDidReplaceSession=$EmitFn();this.onDidReplaceSession=this._onDidReplaceSession.event;this._store={add(){}};this._register=x=>x;this._refreshSessionCache()}createNewSession(e,t,i){return this._createDraftSession(e,t,i)}resolveWorkspace(e){if(e&&e.scheme==="file")return{uri:e,label:"ws",folders:[{root:e,workingDirectory:e,name:"ws"}],requiresWorkspaceTrust:!0,isVirtualWorkspace:!1}}_createDraftSession(e,t,i){if(this._assertCloudSessionsEnabled()){}let c="cloud",uUri=$UriObj.from({scheme:c,path:\`/untitled-\${$UuidFn()}\`}),draft=this.instantiationService.createInstance($Draft,uUri,void 0,t,this.id);return this._chatToSession(draft)}_refreshSessionCache(){if(this.providerMode==="sandbox")return;for(let a of this.agentSessionsService.model.sessions){if(a.providerType!=="cloud")continue;let u=new $CacheItem(a,this.id,this.gitHubService,this.pullRequestIconCache,this.logService);this._sessionCache.set(a.resource.toString(),u)}}_chatToSession(e){return{sessionId:e.sessionId,resource:e.resource,providerId:e.providerId,sessionType:e.sessionType,harness:"copilot",environment:this.environment?.id,icon:e.icon,mainChat:e.mainChat,workspace:e.workspace}}_replaceSession(){}_clearCurrentNewSessionIfMatch(){}_waitForSessionInCache(){}_updateChatSessionState(){}}
+function Nos(services){let inst=services.get($InstToken),regSvc=services.get($ProvidersToken),a=0,disp=new $Disp,prov=disp.add(inst.createInstance($Xfe,"default"));if(disp.add(regSvc.registerProvider(prov)),false){}return disp}
 class Panel{createCombinedPanelContent(e){let t=$element("div"),l=$append(t,$element(".sessions-account-titlebar-panel-identities"));
 if(this.accountName){let v=e.add(new $bar(l));e.add(v.onWillRun(()=>{this.hoverService.hideHover(!0),this.clickPanelDisposable.clear()})),v.push(e.add(new $action("copilot.manageModels","Models")))}
 if(this.chatEntitlementService.sentiment.hidden||e.add(this.instantiationService.createInstance(Widget,t))){}return t}
@@ -418,5 +447,251 @@ describe('VS Code UI patch lifecycle', () => {
     expect(fs.readFileSync(workbench, 'utf8')).toBe(workbenchOriginal);
     expect(fs.readFileSync(backupPath(sessions, sessionsOriginal), 'utf8')).toBe(sessionsOriginal);
     expect(fs.readdirSync(dirname(sessions)).some((entry) => entry.startsWith('.agy-ui-'))).toBe(false);
+  });
+
+  it('registers AntigravitySessionsProvider in Agents Window with local workspace mapping, models, drafts, and mode picker menus', () => {
+    expect(runPatch('--apply').status).toBe(0);
+    const providers: unknown[] = [];
+    const registeredViewItems = new Map<string, (...args: unknown[]) => unknown>();
+    const registeredActions: unknown[] = [];
+    const makeUri = (scheme: string, path: string, fsPath?: string) => ({
+      scheme,
+      path,
+      fsPath: fsPath ?? path,
+      toString: () => `${scheme}:${path}`,
+      with: (next: { scheme?: string; path?: string }) => makeUri(next.scheme ?? scheme, next.path ?? path),
+    });
+    const uriHelper = {
+      parse: (raw: string) => {
+        const [scheme = 'file', path = '/'] = raw.split(':');
+        return makeUri(scheme, path);
+      },
+      from: ({ scheme, path }: { scheme: string; path: string }) => makeUri(scheme, path),
+      file: (fsPath: string) => makeUri('file', fsPath.replace(/\\/g, '/'), fsPath),
+    };
+    const agyItem = {
+      resource: makeUri('antigravity', '/sess-1'),
+      providerType: 'antigravity',
+      icon: { id: 'terminal' },
+      metadata: { workingDirectoryPath: 'd:\\Code Library\\agy-copilot-harness' },
+      timing: { created: 100 },
+    };
+    const agyModels = [
+      { identifier: 'antigravity:gemini-2.5-pro', metadata: { targetChatSessionType: 'antigravity', vendor: 'antigravity' } },
+      { identifier: 'copilot:gpt-5', metadata: { targetChatSessionType: 'copilot', vendor: 'copilot' } },
+    ];
+    const modeGroup = {
+      id: 'mode',
+      name: 'Agent Mode',
+      items: [
+        { id: 'default', name: 'Default', agyPickerMeta: { provider: 'antigravity', category: 'permission', shortLabel: 'Manual' } },
+        { id: 'plan', name: 'Plan', agyPickerMeta: { provider: 'antigravity', category: 'mode', shortLabel: 'Plan' } },
+      ],
+      selected: undefined as unknown,
+    };
+    modeGroup.selected = modeGroup.items[0];
+    const activeSessionObs = { get: () => undefined as unknown };
+    const chatSessionsService = {
+      activateChatSessionItemProvider: vi.fn(async () => {}),
+      getNewChatSessionInputState: vi.fn(async () => [modeGroup]),
+      getOptionGroupsForSessionType: vi.fn((type: string) => (type === 'antigravity' ? [modeGroup] : undefined)),
+      getSessionOption: vi.fn(() => undefined),
+      setSessionOption: vi.fn(),
+      onDidChangeItemsProviders: () => ({ dispose() {} }),
+      onDidChangeOptionGroups: () => ({ dispose() {} }),
+    };
+    const languageModelsService = {
+      getLanguageModelIds: () => agyModels.map((m) => m.identifier),
+      lookupLanguageModel: (id: string) => agyModels.find((m) => m.identifier === id)?.metadata,
+      selectLanguageModels: vi.fn(async () => agyModels.map((m) => m.identifier)),
+      onDidChangeLanguageModels: () => ({ dispose() {} }),
+    };
+    const agentSessionsService = {
+      model: {
+        sessions: [agyItem],
+        onDidChangeSessions: () => ({ dispose() {} }),
+      },
+    };
+    const instantiationService = {
+      createInstance: (Ctor: new (...args: unknown[]) => unknown, ...args: unknown[]) =>
+        new Ctor(
+          ...args,
+          agentSessionsService,
+          {},
+          chatSessionsService,
+          {},
+          instantiationService,
+          languageModelsService,
+        ),
+    };
+    const services = {
+      get: (tok: string) => {
+        if (tok === 'inst') return instantiationService;
+        if (tok === 'providers') return { registerProvider: (p: unknown) => providers.push(p) };
+        if (tok === 'sl') return { session: activeSessionObs };
+        return {};
+      },
+    };
+    class BaseOptionPicker {
+      public readonly _disposables: Array<{ dispose?: () => void }> = [];
+      public constructor(
+        public readonly action: unknown,
+        public readonly init: { group: unknown; item: unknown },
+        public readonly delegate: {
+          getOptionGroup: () => unknown;
+          setOption: (opt: unknown) => void;
+          getSessionResource: () => { scheme?: string };
+        },
+      ) {}
+      public _register<T extends { dispose?: () => void }>(d: T): T {
+        this._disposables.push(d);
+        return d;
+      }
+      public getDropdownActions() {
+        return [];
+      }
+    }
+    class BaseContrib {
+      public _register<T>(x: T): T {
+        return x;
+      }
+    }
+    class DispStore {
+      public add<T>(x: T): T {
+        return x;
+      }
+    }
+    class BaseAction2 {
+      public constructor(public readonly desc: unknown) {}
+    }
+
+    const summary = runInNewContext(
+      `
+      ${fs.readFileSync(sessions, 'utf8')}
+      dis();
+      new G4e({ register: (_menu, id, fn) => __regViewItem(id, fn) }, {});
+      Nos(__services);
+      const agy = __providers.find((p) => p.id === 'antigravity');
+      const folderUri = $URI.file('d:\\\\Code Library\\\\agy-copilot-harness');
+      const resolvedWs = agy.resolveWorkspace(folderUri);
+      const snapshot = agy.getModelsSnapshotForCreation(undefined, 'antigravity', undefined);
+      const draft = agy.createNewSession(folderUri, 'antigravity', {});
+      __setActiveSession(draft);
+      const pickerFactory = __getViewItem('antigravity.newSessionModePicker');
+      const pickerInstance = pickerFactory(
+        { id: 'antigravity.newSessionModePicker' },
+        {},
+        { invokeFunction: (fn) => fn(__services), createInstance: (Ctor, ...args) => new Ctor(...args) },
+      );
+      pickerInstance.delegate.setOption(modeGroupItems[1]);
+      const updatedGroup = pickerInstance.delegate.getOptionGroup();
+      const cachedWrapped = agy._chatToSession(agy._sessionCache.get('antigravity:/sess-1'));
+      ({
+        providerIds: __providers.map((p) => p.id),
+        env: agy.environment,
+        supportsLocal: agy.supportsLocalWorkspaces,
+        supportsQuick: agy.supportsQuickChats,
+        browseCount: agy.browseActions.length,
+        resolvedWsLabel: resolvedWs?.label,
+        resolvedWsTrust: resolvedWs?.requiresWorkspaceTrust,
+        snapshotModelIds: snapshot.models.map((m) => m.identifier),
+        draftHarness: draft.harness,
+        draftIcon: draft.icon?.id,
+        selectedAfterPick: updatedGroup.selected?.id,
+        cachedLabel: cachedWrapped.workspace?.get()?.label,
+        cachedVirtual: cachedWrapped.workspace?.get()?.isVirtualWorkspace,
+        cachedIcon: cachedWrapped.icon?.id,
+        hasAntigravityChatInputRule: ChatPickerMenu.some((m) => m.id === 'ChatInput' && JSON.stringify(m.when).includes('"antigravity"')),
+        registeredActionCount: __actions.length,
+      });
+      `,
+      {
+        token: (n: string) => n,
+        __services: services,
+        __providers: providers,
+        __regViewItem: (id: string, fn: (...args: unknown[]) => unknown) => registeredViewItems.set(id, fn),
+        __getViewItem: (id: string) => registeredViewItems.get(id),
+        __actions: registeredActions,
+        __setActiveSession: (s: unknown) => {
+          activeSessionObs.get = () => s;
+        },
+        modeGroupItems: modeGroup.items,
+        $InstToken: 'inst',
+        $ProvidersToken: 'providers',
+        $Sl: 'sl',
+        $URI: uriHelper,
+        $uuid: () => 'uuid-1234',
+        $obs: (v: unknown) => ({ get: () => v }),
+        $makeEmitter: () => ({ event: () => ({ dispose() {} }), fire: () => {} }),
+        $resolveInner: (models: unknown[], desired: unknown) => ({ kind: models.length ? 'available' : 'unavailable', desired }),
+        $Expr: {
+          and: (...xs: unknown[]) => ({ and: xs }),
+          or: (...xs: unknown[]) => ({ or: xs }),
+        },
+        $MenuId: { ChatInput: 'ChatInput', ChatInputSecondary: 'ChatInputSecondary' },
+        $Wt: { NewSessionControl: 'NewSessionControl' },
+        $Ctx: {
+          enabled: 'enabled',
+          chatSessionHasModels: 'hasModels',
+          lockedToCodingAgent: 'locked',
+          chatSessionType: {
+            isEqualTo: (v: string) => ({ eq: v }),
+            notEqualsTo: (v: string) => ({ neq: v }),
+          },
+        },
+        $Provider: { Cloud: 'cloud', Background: 'background' },
+        $IsSessions: { negate: () => ({ not: 'isSessions' }) },
+        $SessionsWin: 'isSessionsWin',
+        $SandboxProv: 'sandbox',
+        $TiKey: { isEqualTo: (v: string) => ({ ti: v }) },
+        _sqa: 'sqa',
+        BaseOptionPicker,
+        BaseContrib,
+        DispStore,
+        $Action2: BaseAction2,
+        $regAction: (Cls: new () => unknown) => {
+          const inst = new Cls();
+          registeredActions.push(inst);
+          return inst;
+        },
+        ViewItem: class {},
+        $d: () => 'Pick',
+        $ko: vi.fn(),
+        $qu: vi.fn(),
+        $dom: vi.fn(),
+        $reset: vi.fn(),
+        $markdown: () => false,
+        $knownProvider: () => undefined,
+        $providerIcon: () => ({}),
+        $themeIcon: { asClassName: () => '' },
+        $source: { External: 'ext' },
+        $invocation: class {},
+        $revive: (x: unknown) => x,
+        $separator: class {},
+        $bar: class {},
+        $action: class {},
+        Widget: class {},
+        $append: vi.fn(),
+        $element: vi.fn(),
+      },
+    );
+    expect(summary).toEqual({
+      providerIds: ['antigravity', 'default'],
+      env: { id: 'local', label: 'Local' },
+      supportsLocal: true,
+      supportsQuick: true,
+      browseCount: 0,
+      resolvedWsLabel: 'ws',
+      resolvedWsTrust: false,
+      snapshotModelIds: ['antigravity:gemini-2.5-pro'],
+      draftHarness: 'antigravity',
+      draftIcon: 'antigravity-logo',
+      selectedAfterPick: 'plan',
+      cachedLabel: 'agy-copilot-harness',
+      cachedVirtual: false,
+      cachedIcon: 'antigravity-logo',
+      hasAntigravityChatInputRule: true,
+      registeredActionCount: 3,
+    });
   });
 });

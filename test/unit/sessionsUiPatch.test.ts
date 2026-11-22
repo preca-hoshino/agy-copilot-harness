@@ -21,6 +21,12 @@ const {
   buildSideChatSessionSnippet,
   buildWorkingSetDedupSnippet,
 } = requireFromProject('./scripts/ui-patch/snippets/working-set.js');
+const {
+  buildSessionsChatInputPickerSnippet,
+  buildSessionsNewModeActionSnippet,
+  buildSessionsNewModeViewItemSnippet,
+  buildSessionsProviderSnippet,
+} = requireFromProject('./scripts/ui-patch/snippets/sessions-provider.js');
 
 class FakeInvocation {
   public readonly confirm = vi.fn();
@@ -721,5 +727,267 @@ describe('Antigravity 2-tier mode and permissions picker', () => {
     );
     planModeItems[0]?.item.run();
     expect(onSelectInteractive).toHaveBeenCalledWith(expect.objectContaining({ id: 'accept-edits' }));
+  });
+});
+
+describe('Antigravity Sessions Window provider snippet', () => {
+  it('routes first chat send through updateChatSessionState, skips untitled flicker, and replaces draft with realized session', async () => {
+    const providerSnippet = buildSessionsProviderSnippet(
+      { services: 'svc', inst: 'inst', regSvc: 'reg', disp: 'disp', prov: 'baseProv', xfeCls: 'Xfe' },
+      { uriCls: 'Uri', uuidFn: 'uuid', draftCls: 'Draft', inst: 'instantiationService' },
+      { itemCls: 'CacheItem' },
+      { getModels: 'getModels', resolveModel: 'resolveModel' },
+    );
+    const chatInputSnippet = buildSessionsChatInputPickerSnippet({
+      chatInput: 'MenuId',
+      expr: 'Expr',
+      isSess: 'IsSess',
+      ctx: 'Ctx',
+    });
+    const modeViewItemSnippet = buildSessionsNewModeViewItemSnippet(
+      { reg: 'reg', menuId: 'NewMenu', mgmtSvc: 'MgmtTok' },
+      { mutCls: 'OptPicker' },
+    );
+    const modeActionSnippet = buildSessionsNewModeActionSnippet(
+      { disp: 'store', regAct: 'regAct', actCls: 'Act2' },
+      { expr: 'Expr', sessionsWin: 'SessWin', ctx: 'Ctx', tiKey: 'TiKey', menuId: 'NewMenu' },
+    );
+    expect(chatInputSnippet).toContain('ChatInput');
+    expect(chatInputSnippet).toContain('"antigravity"');
+    expect(modeViewItemSnippet).toContain('antigravity.newSessionModePicker');
+    expect(modeActionSnippet).toContain('antigravity.newSessionModePicker');
+
+    const sentPayloads: Array<{ resource: unknown; query: string; opts: Record<string, unknown> }> = [];
+    const updatedOptions: Array<{ resource: unknown; options: Map<string, unknown> }> = [];
+    const replacements: Array<{ from: unknown; to: unknown }> = [];
+    const sessionListeners = new Set<() => void>();
+    const sessionsList: Array<Record<string, unknown>> = [];
+
+    const makeUri = (scheme: string, path: string, fsPath?: string) => ({
+      scheme,
+      path,
+      fsPath: fsPath ?? path,
+      toString: () => `${scheme}:${path}`,
+    });
+
+    class Draft {
+      public readonly resource: ReturnType<typeof makeUri>;
+      public readonly sessionWorkspace: unknown;
+      public readonly target: string;
+      public readonly providerId: string;
+      public readonly sessionType: string;
+      public readonly sessionId: string;
+      public readonly selectedOptions = new Map<string, unknown>();
+      public readonly mainChat: { get: () => { resource: ReturnType<typeof makeUri> } };
+      public selectedModelId: string | undefined = 'antigravity:gemini-2.5-pro';
+      public modelConfiguration = { getModelConfigurationForRequest: () => ({ reasoningEffort: 'high' }) };
+      public icon: unknown = { id: 'cloud' };
+      public statusVal = 0;
+
+      public constructor(res: ReturnType<typeof makeUri>, ws: unknown, target: string, pid: string) {
+        this.resource = res;
+        this.sessionWorkspace = ws;
+        this.target = target;
+        this.providerId = pid;
+        this.sessionType = target;
+        this.sessionId = `${pid}:${res.toString()}`;
+        this.mainChat = { get: () => ({ resource: res }) };
+      }
+
+      public setCreatedBySession(): void {}
+      public setOption(key: string, val: unknown): void {
+        this.selectedOptions.set(key, val);
+      }
+      public setTitle(): void {}
+      public setStatus(next: number): void {
+        this.statusVal = next;
+      }
+      public dispose(): void {}
+    }
+
+    class CacheItem {
+      public readonly sessionId: string;
+      public readonly resource: ReturnType<typeof makeUri>;
+      public readonly providerId: string;
+      public readonly sessionType: string;
+      public icon = { id: 'cloud' };
+      public readonly status = { get: () => 3 };
+      public readonly workspace: { get: () => unknown };
+      public readonly mainChat: { get: () => { resource: ReturnType<typeof makeUri> } };
+
+      public constructor(s: Record<string, unknown>, pid: string) {
+        this.resource = s.resource as ReturnType<typeof makeUri>;
+        this.sessionId = `${pid}:${this.resource.toString()}`;
+        this.providerId = pid;
+        this.sessionType = String(s.providerType);
+        this.workspace = { get: () => this._buildWorkspace(s) };
+        this.mainChat = { get: () => ({ resource: this.resource }) };
+      }
+
+      public update(): boolean {
+        return false;
+      }
+
+      public _buildWorkspace(_s: unknown): Record<string, unknown> {
+        return {
+          uri: makeUri('unknown', '///'),
+          label: 'u',
+          folders: [],
+          requiresWorkspaceTrust: false,
+          isVirtualWorkspace: true,
+        };
+      }
+    }
+
+    class Xfe {
+      public readonly _sessionCache = new Map<string, unknown>();
+      public readonly _sessionWrapperCache = new Map<string, unknown>();
+      public readonly _newSessions = new Map<string, unknown>();
+      public readonly _inFlightCommits = new Set<string>();
+      public readonly _onDidChangeSessionTypes = { event: () => ({ dispose() {} }), fire: vi.fn() };
+      public readonly onDidChangeSessionTypes = this._onDidChangeSessionTypes.event;
+      public readonly _onDidChangeSessions = { event: () => ({ dispose() {} }), fire: vi.fn() };
+      public readonly onDidChangeSessions = this._onDidChangeSessions.event;
+      public readonly agentSessionsService = {
+        model: {
+          sessions: sessionsList,
+          onDidChangeSessions: (cb: () => void) => {
+            sessionListeners.add(cb);
+            return { dispose: () => sessionListeners.delete(cb) };
+          },
+        },
+      };
+      public readonly chatService = {
+        sendRequest: vi.fn(async (resource: unknown, query: string, opts: Record<string, unknown>) => {
+          sentPayloads.push({ resource, query, opts });
+          // Materialized intermediate untitled item should be skipped while send is in-flight.
+          sessionsList.push({
+            resource: makeUri('antigravity', '/untitled-ext'),
+            providerType: 'antigravity',
+            metadata: {},
+          });
+          for (const cb of [...sessionListeners]) cb();
+          return {
+            kind: 'sent',
+            data: {
+              responseCreatedPromise: Promise.resolve({ isCanceled: false }),
+              responseCompletePromise: new Promise<void>((resolve) => {
+                setTimeout(() => {
+                  sessionsList.push({
+                    resource: makeUri('antigravity', '/real-123'),
+                    providerType: 'antigravity',
+                    metadata: { workingDirectoryPath: 'd:\\project' },
+                  });
+                  for (const cb of [...sessionListeners]) cb();
+                  resolve();
+                }, 10);
+              }),
+            },
+          };
+        }),
+      };
+      public readonly chatSessionsService = {
+        getChatSessionContribution: () => ({ type: 'antigravity' }),
+        activateChatSessionItemProvider: vi.fn(async () => {}),
+        getNewChatSessionInputState: vi.fn(async () => []),
+        getOptionGroupsForSessionType: () => [],
+        onDidChangeItemsProviders: () => ({ dispose() {} }),
+        onDidChangeOptionGroups: () => ({ dispose() {} }),
+      };
+      public readonly languageModelsService = {
+        getLanguageModelIds: () => [],
+        lookupLanguageModel: () => undefined,
+        onDidChangeLanguageModels: () => ({ dispose() {} }),
+      };
+      public readonly instantiationService = {
+        createInstance: (Ctor: new (...a: unknown[]) => unknown, ...a: unknown[]) => new Ctor(...a),
+      };
+
+      public _register<T>(x: T): T {
+        return x;
+      }
+      public resolveWorkspace(e: { scheme: string; fsPath?: string; path: string }) {
+        if (e.scheme !== 'file') return undefined;
+        return {
+          uri: e,
+          label: 'project',
+          folders: [{ root: e, workingDirectory: e, name: 'project' }],
+          requiresWorkspaceTrust: true,
+          isVirtualWorkspace: false,
+        };
+      }
+      public async _updateChatSessionState(resource: unknown, d: Draft): Promise<{ dispose: () => void }> {
+        updatedOptions.push({ resource, options: new Map(d.selectedOptions) });
+        return { dispose() {} };
+      }
+      public _clearCurrentNewSessionIfMatch(): void {}
+      public async _waitForSessionInCache(res: { toString: () => string }): Promise<unknown> {
+        return this._sessionCache.get(res.toString());
+      }
+      public _chatToSession(e: { sessionId: string; resource: unknown; icon: unknown; workspace?: unknown; mainChat: unknown }) {
+        return {
+          sessionId: e.sessionId,
+          resource: e.resource,
+          harness: 'copilot',
+          icon: e.icon,
+          workspace: e.workspace,
+          mainChat: e.mainChat,
+        };
+      }
+      public _replaceSession(payload: { from: unknown; to: unknown }): void {
+        replacements.push(payload);
+      }
+    }
+
+    const registered: unknown[] = [];
+    const realized: Record<string, unknown> = await runInNewContext(
+      `
+      (async () => {
+        let baseProv;
+        ${providerSnippet}
+        const folder = Uri.file('d:\\\\project');
+        const created = agyProv._createDraftSession(folder, 'antigravity', {});
+        const draft = agyProv._newSessions.get(created.sessionId);
+        agyProv.setNewSessionModeOption(created, { id: 'auto', name: 'Auto' });
+        const result = await agyProv._sendFirstChat(draft, draft.resource, { query: 'Fix bug', attachedContext: [] });
+        return result;
+      })()
+      `,
+      {
+        Xfe,
+        Draft,
+        CacheItem,
+        Uri: {
+          file: (p: string) => makeUri('file', p.replace(/\\/g, '/'), p),
+          from: ({ scheme, path }: { scheme: string; path: string }) => makeUri(scheme, path),
+        },
+        uuid: () => 'draft-1',
+        getModels: () => [],
+        resolveModel: () => ({ kind: 'unavailable' }),
+        svc: {},
+        inst: {
+          createInstance: (Ctor: new (...a: unknown[]) => unknown, ...a: unknown[]) => new Ctor(...a),
+        },
+        reg: {
+          registerProvider: (p: unknown) => registered.push(p),
+        },
+        disp: {
+          add: <T>(x: T) => x,
+        },
+        setTimeout,
+        clearTimeout,
+      },
+    );
+
+    expect(registered).toHaveLength(1);
+    expect(updatedOptions[0]?.options.get('folder')).toBe('d:\\project');
+    expect(updatedOptions[0]?.options.get('mode')).toEqual({ id: 'auto', name: 'Auto' });
+    expect(sentPayloads[0]?.opts).toMatchObject({
+      agentIdSilent: 'antigravity',
+      userSelectedModelId: 'antigravity:gemini-2.5-pro',
+    });
+    expect(realized.harness).toBe('antigravity');
+    expect((realized.resource as { path: string }).path).toBe('/real-123');
+    expect(replacements).toHaveLength(1);
   });
 });

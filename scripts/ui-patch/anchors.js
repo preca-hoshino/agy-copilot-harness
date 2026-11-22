@@ -83,6 +83,38 @@ const SESSIONS_ANCHORS = {
     'Sessions chat status item service',
   ],
   contributed: ['renderContributedSections(e){for(let t of e){', 'Sessions.renderContributedSections'],
+  sessionsModelHelpers: [
+    /function (?<getModels>[$\w]+)\((?<lms>[$\w]+)\)\{return \k<lms>\.getLanguageModelIds\(\)\.map\([$\w]+=>\{let [$\w]+=\k<lms>\.lookupLanguageModel\([$\w]+\);return [$\w]+\?\{identifier:[$\w]+,metadata:[$\w]+\}:void 0\}\)\.filter\([$\w]+=>[$\w]+!==void 0\)\}function [$\w]+\([\s\S]{1,400}?function (?<resolveModel>[$\w]+)\([$\w]+,[$\w]+,[$\w]+,[$\w]+\)\{return [$\w]+\([$\w]+,[$\w]+,\{hasLiveModels:/g,
+    'Sessions language model snapshot helpers',
+  ],
+  sessionsOptionPicker: [
+    /\bvar (?<mutCls>[$\w]+)=class extends [$\w]+\{constructor\([$\w]+,[$\w]+,[$\w]+,[$\w]+,[$\w]+,[$\w]+,[$\w]+,[$\w]+,[$\w]+,[$\w]+,[$\w]+\)\{let\{group:[$\w]+,item:[$\w]+\}=[$\w]+,[\s\S]{1,350}?getActions:\(\)=>this\.getDropdownActions\(\)/g,
+    'Sessions ChatSessionOptionPicker class',
+  ],
+  sessionsChatInputPicker: [
+    /id:(?<chatInput>[$\w]+)\.ChatInput,order:4,group:"navigation",when:(?<expr>[$\w]+)\.and\((?<ctx>[$\w]+)\.chatSessionHasModels,\k<ctx>\.chatSessionType\.isEqualTo\((?<providerEnum>[$\w]+)\.Cloud\),\k<ctx>\.lockedToCodingAgent\)\},(?=\{id:\k<chatInput>\.ChatInputSecondary,order:4,group:"navigation",when:\k<expr>\.and\(\k<ctx>\.chatSessionHasModels,\k<ctx>\.chatSessionType\.notEqualsTo\(\k<providerEnum>\.Cloud\),\k<expr>\.or\((?<isSess>[$\w]+)\.negate\(\),)/g,
+    'Sessions opened chat primary option picker menu',
+  ],
+  sessionsNewModeViewItem: [
+    /(?<expr>[$\w]+)\.and\((?<sessionsWin>[$\w]+),(?<ctx>[$\w]+)\.enabled,[$\w]+\.or\([$\w]+,(?<tiKey>[$\w]+)\.isEqualTo\((?<sandboxProv>[$\w]+)\)\)\),G4e=class extends [$\w]+\{static\{this\.ID="workbench\.contrib\.copilotPickerActionViewItems"\}constructor\((?<reg>[$\w]+),(?<layout>[$\w]+)\)\{super\(\),this\._register\(\k<reg>\.register\((?<menuId>[$\w]+\.NewSessionControl),"sessions\.sandbox\.modePicker",\([$\w]+,[$\w]+,[$\w]+\)=>\{let [$\w]+=[$\w]+\.invokeFunction\([$\w]+=>[$\w]+\.get\((?<mgmtSvc>[$\w]+)\)\);return new [$\w]+\([\s\S]{1,120}?\)\}\)\)/g,
+    'Sessions NewSessionControl mode picker view item registry',
+  ],
+  sessionsNewModeAction: [
+    /function dis\(\)\{let (?<disp>[$\w]+)=new [$\w]+;for\(let\[[$\w]+,[$\w]+,[$\w]+\]of\[\["sessions\.sandbox\.modePicker"[\s\S]{1,220}?\k<disp>\.add\((?<regAct>[$\w]+)\(class extends (?<actCls>[$\w]+)\{[\s\S]{1,180}?\}\)\);(?=return \k<disp>\})/g,
+    'Sessions NewSessionControl mode picker menu action registration',
+  ],
+  sessionsDraftFactory: [
+    /_createDraftSession\([$\w]+,[$\w]+,[$\w]+\)\{if\(this\._assertCloudSessionsEnabled\(\)[\s\S]{1,1200}?[,;](?<uriVar>[$\w]+)=(?<uriCls>[$\w]+)\.from\(\{scheme:[$\w]+,path:`\/untitled-\$\{(?<uuidFn>[$\w]+)\(\)\}`\}\),(?<varName>[$\w]+)=this\.(?<inst>[$\w]+)\.createInstance\((?<draftCls>[$\w]+),/g,
+    'Sessions draft session class and URI factory',
+  ],
+  sessionsCacheItem: [
+    /_refreshSessionCache\(\)\{if\(this\.providerMode==="sandbox"\)return;[\s\S]{1,600}?let (?<item>[$\w]+)=new (?<itemCls>[$\w]+)\((?<agent>[$\w]+),this\.id,this\.gitHubService,this\.pullRequestIconCache,this\.logService\);/g,
+    'Sessions cached session item wrapper',
+  ],
+  sessionsDefaultProvider: [
+    /function Nos\((?<services>[$\w]+)\)\{let (?<inst>[$\w]+)=\k<services>\.get\([$\w]+\),(?<regSvc>[$\w]+)=\k<services>\.get\([$\w]+\),[^;]+,(?<disp>[$\w]+)=new [$\w]+,(?<prov>[$\w]+)=\k<disp>\.add\(\k<inst>\.createInstance\((?<xfeCls>[$\w]+),"default"\)\);(?=if\(\k<disp>\.add\(\k<regSvc>\.registerProvider\(\k<prov>\)\),)/g,
+    'Sessions default provider registration',
+  ],
 };
 
 const WORKBENCH_ANCHORS = {
