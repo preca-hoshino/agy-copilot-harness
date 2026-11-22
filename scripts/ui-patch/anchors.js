@@ -12,6 +12,10 @@ const COMMON_ANCHORS = {
     /\brenderHarness\((?<session>[$\w]+),(?<template>[$\w]+)\)\{let (?<provider>[$\w]+)=[$\w]+\(\k<session>\.providerType\),(?<icon>[$\w]+)=\k<provider>\?[$\w]+\(\k<provider>\):\k<session>\.icon;(?=\k<template>\.harnessIcon\.className=`agent-session-harness-icon \$\{[$\w]+\.asClassName\(\k<icon>\)\}`)/g,
     'AgentSessionRenderer.renderHarness provider icon',
   ],
+  agentSessionIcon: [
+    /\btoAgentSession\((?<session>[$\w]+)\)\{(?=return\{\.\.\.\k<session>,children:\k<session>\.children\?\.map\([$\w]+=>this\.toAgentSession\([$\w]+\)\),isArchived:\(\)=>this\.isArchived\(\k<session>\))/g,
+    'AgentSessionsModel.toAgentSession provider icon',
+  ],
   sessionDelegation: [
     /\bsupportsDelegationForSessionType\((?<type>[$\w]+)\)\{(?=return this\._contributions\.get\(\k<type>\)\?\.contribution\?\.supportsDelegation!==!1\})/g,
     'ChatSessionsService.supportsDelegationForSessionType',

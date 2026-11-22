@@ -24,14 +24,16 @@ function insertSnippets(patch, insertions) {
 }
 
 function commonInsertions(matches) {
-  const { sessionHarnessIcon, sessionDelegation } = matches;
+  const { sessionHarnessIcon, agentSessionIcon, sessionDelegation } = matches;
   const { session, icon } = sessionHarnessIcon.groups;
+  const { session: modelSession } = agentSessionIcon.groups;
   const { type } = sessionDelegation.groups;
   return [
     [matches.statusBar.end, 'status-bar', buildStatusBarTooltipSnippet('status bar tooltip')],
     [matches.trustedAuth.end, 'trusted-auth', buildTrustedAuthAccessSnippet('trusted auth')],
     [matches.terminalApproval.end, 'terminal-approval', buildTerminalApprovalSnippet(matches.terminalInvocation.groups, matches.sessionType.groups)],
-    // VS Code 1.147 drops controller icons in transit; override even the cached terminal fallback.
+    // VS Code 1.147 drops controller icons in transit; override even the cached terminal fallback on both the session model and row renderer.
+    [agentSessionIcon.end, 'agent-session-icon', `if(${modelSession}.providerType==="antigravity")${modelSession}={...${modelSession},icon:{id:"antigravity-logo"}};`],
     [sessionHarnessIcon.end, 'session-harness-icon', `if(${session}.providerType==="antigravity")${icon}={id:"antigravity-logo"};`],
     // Use VS Code's native delegation gate; canDelegate still allows starting new Antigravity sessions.
     [sessionDelegation.end, 'session-delegation', `if(${type}==="antigravity")return false;`],

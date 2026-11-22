@@ -18,6 +18,7 @@ function commonBundle() {
     'class Auth{readAllowedExtensions(e,t){let i=[];try{let a=this._storageService.get(`${e}-${t}`,-1);a&&(i=JSON.parse(a))}catch{}let n=this._productService.trustedExtensionAuthAccess,r=Array.isArray(n)?n:typeof n=="object"?n[e]??[]:[];return r}}',
     'function $session(s){return s.scheme===schemes.vscodeChatEditor?local:s.scheme===uri.scheme?s.authority||local:s.scheme}',
     'class SessionRenderer{renderHarness($row,$template){let $provider=$knownProvider($row.providerType),$icon=$provider?$providerIcon($provider):$row.icon;$template.harnessIcon.className=`agent-session-harness-icon ${$themeIcon.asClassName($icon)}`}}',
+    'class AgentSessionsModel{isArchived(e){return!!e.archived}setArchived(){}isPinned(){return!1}setPinned(){}isRead(){return!0}isMarkedUnread(){return!1}setRead(){}toAgentSession($item){return{...$item,children:$item.children?.map(t=>this.toAgentSession(t)),isArchived:()=>this.isArchived($item),setArchived:t=>this.setArchived($item,t),isPinned:()=>this.isPinned($item),setPinned:t=>this.setPinned($item,t),isRead:()=>this.isRead($item),isMarkedUnread:()=>this.isMarkedUnread($item),setRead:t=>this.setRead($item,t)}}}',
     'class ChatSessionsService{constructor(contributions){this._contributions=contributions}supportsDelegationForSessionType($type){return this._contributions.get($type)?.contribution?.supportsDelegation!==!1}}',
     'function external(e){let n={id:e.toolName,source:$source.External,displayName:e.toolName,modelDescription:e.toolName},r=new $invocation({invocationMessage:e.invocationMessage,pastTenseMessage:e.pastTenseMessage,toolSpecificData:e.toolSpecificData},n);return r}',
     'class Agent{answer(e){this._proxy.$handleQuestionCarouselAnswer(e)}async $handleProgressChunk(e,t){let i=this._pendingProgress.get(e);let{progress:n,chatSession:r,isSubagent:a}=i,c=[],l=r?.getRequests().find(u=>u.id===e)?.response;for(let u of t){let[p,h]=Array.isArray(u)?u:[u];if(p.kind==="externalEdits"){if(r?.editingSession&&h!==void 0&&l){let f=p.start?await r.editingSession.startExternalEdits(l,h,$revive(p.resources),p.undoStopId):await r.editingSession.stopExternalEdits(l,h);c.push(...f)}continue}if(p.kind==="beginToolInvocation"){c.push(p);continue}c.push(p)}n(c)}}',
@@ -111,6 +112,37 @@ describe('VS Code UI patch lifecycle', () => {
       expect(render('antigravity', 'terminal')).toBe('agent-session-harness-icon codicon codicon-antigravity-logo');
       expect(render('other', 'terminal')).toBe('agent-session-harness-icon codicon codicon-terminal');
       expect(render('local', 'terminal')).toBe('agent-session-harness-icon codicon codicon-vm');
+    }
+  });
+
+  it('normalizes the Antigravity session model icon (and child sessions) for hover headers and pickers without changing other providers', () => {
+    expect(runPatch('--apply').status).toBe(0);
+    for (const file of [sessions, workbench]) {
+      const resolveIcons: () => { agyIcon: string; agyChildIcon: string; otherIcon: string; archived: boolean } = runInNewContext(`
+        ${fs.readFileSync(file, 'utf8')}
+        () => {
+          const model = new AgentSessionsModel();
+          const agy = model.toAgentSession({
+            providerType: 'antigravity',
+            icon: { id: 'terminal' },
+            archived: true,
+            children: [{ providerType: 'antigravity', icon: { id: 'terminal' } }],
+          });
+          const other = model.toAgentSession({ providerType: 'other', icon: { id: 'terminal' } });
+          return {
+            agyIcon: agy.icon.id,
+            agyChildIcon: agy.children[0].icon.id,
+            otherIcon: other.icon.id,
+            archived: agy.isArchived(),
+          };
+        };
+      `, { token: vi.fn() });
+      expect(resolveIcons()).toEqual({
+        agyIcon: 'antigravity-logo',
+        agyChildIcon: 'antigravity-logo',
+        otherIcon: 'terminal',
+        archived: true,
+      });
     }
   });
 
