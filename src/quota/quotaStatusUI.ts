@@ -60,7 +60,10 @@ function formatResetTimeLabel(resetTime?: string, resetsAtEpochSec?: number, sho
   }
 
   const date = new Intl.DateTimeFormat(vscode.env.language, {
-    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
   }).format(targetDate);
   return `Resets ${date}`;
 }
@@ -386,9 +389,7 @@ export class QuotaStatusUI implements vscode.Disposable {
         `**${snapshot.email ?? snapshot.displayName ?? 'Antigravity'}**${snapshot.tierName !== undefined ? ` · ${snapshot.tierName}` : ''}\n\n`,
       );
       for (const pool of snapshot.pools) {
-        tooltip.appendMarkdown(
-          `- ${formatPoolSummary(pool, true)}\n`,
-        );
+        tooltip.appendMarkdown(`- ${formatPoolSummary(pool, true)}\n`);
       }
     } else {
       tooltip.appendMarkdown('Google Antigravity — Not signed in');
@@ -410,9 +411,7 @@ export class QuotaStatusUI implements vscode.Disposable {
         snapshot.tierName !== undefined && snapshot.tierName.length > 0 ? ` (${snapshot.tierName})` : '';
       this.chatStatusItem.description = `${snapshot.email ?? snapshot.displayName ?? 'Signed in'}${tierSuffix}`;
       this.chatStatusItem.detail =
-        snapshot.pools.length > 0
-          ? snapshot.pools.map((pool) => formatPoolSummary(pool)).join(' · ')
-          : 'Active';
+        snapshot.pools.length > 0 ? snapshot.pools.map((pool) => formatPoolSummary(pool)).join(' · ') : 'Active';
     } else {
       this.chatStatusItem.description = 'Not signed in';
       this.chatStatusItem.detail = snapshot.errorMessage ?? 'Sign in with Google Antigravity';

@@ -253,26 +253,26 @@ export function clusterModelQuotas(models: readonly ModelQuotaInfo[]): QuotaPool
   const summaries: QuotaPoolSummary[] = [];
   const usedIds = new Set<string>();
   for (const group of groups.values()) {
-      const modelLabels = group.models.map((model) => model.label);
-      const groupName = inferPrimaryGroupName(modelLabels);
-      const baseId = `default-${slugifyPoolSuffix(groupName)}`;
-      let uniqueId = baseId;
-      let suffix = 2;
-      while (usedIds.has(uniqueId)) {
-        uniqueId = `${baseId}-${suffix}`;
-        suffix += 1;
-      }
-      usedIds.add(uniqueId);
+    const modelLabels = group.models.map((model) => model.label);
+    const groupName = inferPrimaryGroupName(modelLabels);
+    const baseId = `default-${slugifyPoolSuffix(groupName)}`;
+    let uniqueId = baseId;
+    let suffix = 2;
+    while (usedIds.has(uniqueId)) {
+      uniqueId = `${baseId}-${suffix}`;
+      suffix += 1;
+    }
+    usedIds.add(uniqueId);
 
-      summaries.push({
-        id: uniqueId,
-        label: groupName,
-        remainingFraction: group.remainingFraction,
-        usedPercent: Math.round((1 - group.remainingFraction) * 100),
-        resetTime: group.resetTime,
-        resetsAtEpochSec: toEpochSeconds(group.resetTime),
-        modelLabels,
-      });
+    summaries.push({
+      id: uniqueId,
+      label: groupName,
+      remainingFraction: group.remainingFraction,
+      usedPercent: Math.round((1 - group.remainingFraction) * 100),
+      resetTime: group.resetTime,
+      resetsAtEpochSec: toEpochSeconds(group.resetTime),
+      modelLabels,
+    });
   }
 
   summaries.sort((a, b) => {
@@ -313,16 +313,25 @@ export function parseQuotaSummary(payload: unknown): QuotaPoolSummary[] {
       }
       const displayName = getNonEmptyString(bucket.displayName) ?? id;
       const period = getNonEmptyString(bucket.window) ?? id;
-      const windowLabel = /weekly|^(?:7d|168h)$/i.test(period) ? 'Weekly' : /(?:^|[-_\s])5[-_\s]*h(?:ours?)?$/i.test(period) ? '5-Hour' : undefined;
+      const windowLabel = /weekly|^(?:7d|168h)$/i.test(period)
+        ? 'Weekly'
+        : /(?:^|[-_\s])5[-_\s]*h(?:ours?)?$/i.test(period)
+          ? '5-Hour'
+          : undefined;
       const name = groupName ?? displayName;
       const label = name.replace(/\s*\((?:weekly|5[-\s]*hours?)\)\s*$/i, '').trim();
       const fraction = getFiniteNumber(bucket.remainingFraction);
       const remainingFraction = fraction === undefined ? undefined : clampFraction(fraction);
       const resetTime = getNonEmptyString(bucket.resetTime);
       pools.set(id, {
-        id, label, windowLabel, remainingFraction,
+        id,
+        label,
+        windowLabel,
+        remainingFraction,
         usedPercent: remainingFraction === undefined ? undefined : Math.round((1 - remainingFraction) * 100),
-        resetTime, resetsAtEpochSec: toEpochSeconds(resetTime), modelLabels: [],
+        resetTime,
+        resetsAtEpochSec: toEpochSeconds(resetTime),
+        modelLabels: [],
       });
     }
   };
@@ -653,7 +662,11 @@ export class AgyQuotaService implements QuotaServiceInterface, vscode.Disposable
         `http://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary`,
         {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Connect-Protocol-Version': '1', 'x-codeium-csrf-token': csrfToken },
+          headers: {
+            'Content-Type': 'application/json',
+            'Connect-Protocol-Version': '1',
+            'x-codeium-csrf-token': csrfToken,
+          },
           body: '{}',
           signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
         },
