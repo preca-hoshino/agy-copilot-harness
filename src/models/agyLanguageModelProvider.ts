@@ -125,6 +125,31 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
     return Math.ceil(textLen / 4);
   }
 
+  public getModelDisplayName(modelId: string | undefined): string | undefined {
+    if (modelId === undefined || modelId.trim().length === 0) {
+      return undefined;
+    }
+    const stripped = stripVendorPrefix(modelId.trim());
+    const configOptions = this.backend.getLastKnownConfigOptions();
+    const modelConfig = findConfigOption(configOptions, 'model');
+    const snapshot = this.quotaService.latestSnapshot;
+    const modelOptions = getModelChoices(modelConfig, snapshot.models);
+    const groups = getModelVariantGroups(modelOptions);
+    const groupMatch = groups.get(modelId.trim()) ?? groups.get(stripped);
+    if (groupMatch !== undefined) {
+      return groupMatch.name;
+    }
+    const choiceMatch = modelOptions.find((choice) => choice.value === modelId.trim() || choice.value === stripped);
+    if (choiceMatch !== undefined && choiceMatch.name.trim().length > 0) {
+      return choiceMatch.name.replace(EFFORT_SUFFIX, '').trim();
+    }
+    const quotaMatch = snapshot.models.find((m) => m.modelId === modelId.trim() || m.modelId === stripped);
+    if (quotaMatch !== undefined && quotaMatch.label.trim().length > 0) {
+      return quotaMatch.label.replace(EFFORT_SUFFIX, '').trim();
+    }
+    return stripped;
+  }
+
   public resolveModelAndEffort(
     selectedModelId: string | undefined,
     modelConfiguration?: Record<string, unknown>,

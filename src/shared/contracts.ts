@@ -48,12 +48,20 @@ export interface AgyTokenGroupUsage {
   readonly numTokens: number;
 }
 
+export interface AgyModelTokenTotal {
+  readonly model: string;
+  readonly inputTokens: number;
+  readonly cachedTokens: number;
+  readonly outputTokens: number;
+}
+
 export interface AgyContextWindowUsage {
   readonly estimatedTokensUsed: number;
   readonly maxContextTokens: number;
   readonly estimatedAfterCompaction?: number | undefined;
   readonly completionTokens?: number | undefined;
   readonly tokenGroups: readonly AgyTokenGroupUsage[];
+  readonly modelTotals?: readonly AgyModelTokenTotal[] | undefined;
 }
 
 export interface ModelQuotaInfo {
