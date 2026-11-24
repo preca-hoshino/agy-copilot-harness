@@ -1,3 +1,4 @@
+import * as fsPromises from 'node:fs/promises';
 import * as os from 'node:os';
 import * as nodePath from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -31,14 +32,23 @@ vi.mock('vscode', () => {
     public readonly authority: string;
     public readonly path: string;
     public readonly fsPath: string;
+    public readonly query: string;
     private readonly serialized: string;
 
-    private constructor(scheme: string, authority: string, uriPath: string, fsPath: string, serialized: string) {
+    private constructor(
+      scheme: string,
+      authority: string,
+      uriPath: string,
+      fsPath: string,
+      serialized: string,
+      query = '',
+    ) {
       this.scheme = scheme;
       this.authority = authority;
       this.path = uriPath;
       this.fsPath = fsPath;
       this.serialized = serialized;
+      this.query = query;
     }
 
     public static file(filePath: string): MockUri {
@@ -47,10 +57,42 @@ vi.mock('vscode', () => {
       return new MockUri('file', '', uriPath, filePath, `file://${encodeURI(uriPath)}`);
     }
 
-    public static from(components: { readonly scheme: string; readonly path?: string; readonly authority?: string }): MockUri {
+    public static from(components: {
+      readonly scheme: string;
+      readonly path?: string;
+      readonly authority?: string;
+      readonly query?: string;
+    }): MockUri {
       const uriPath = components.path ?? '/';
       const authority = components.authority ?? '';
-      return new MockUri(components.scheme, authority, uriPath, uriPath, `${components.scheme}:${uriPath}`);
+      const query = components.query ?? '';
+      const querySuffix = query.length > 0 ? `?${query}` : '';
+      return new MockUri(
+        components.scheme,
+        authority,
+        uriPath,
+        uriPath,
+        `${components.scheme}:${uriPath}${querySuffix}`,
+        query,
+      );
+    }
+
+    public static parse(raw: string): MockUri {
+      const noHash = raw.split('#')[0] ?? raw;
+      const qIdx = noHash.indexOf('?');
+      const beforeQuery = qIdx >= 0 ? noHash.slice(0, qIdx) : noHash;
+      const query = qIdx >= 0 ? noHash.slice(qIdx + 1) : '';
+      const cIdx = beforeQuery.indexOf(':');
+      const scheme = cIdx >= 0 ? beforeQuery.slice(0, cIdx) : 'file';
+      let rest = cIdx >= 0 ? beforeQuery.slice(cIdx + 1) : beforeQuery;
+      let authority = '';
+      if (rest.startsWith('//')) {
+        rest = rest.slice(2);
+        const slashIdx = rest.indexOf('/');
+        authority = slashIdx >= 0 ? rest.slice(0, slashIdx) : rest;
+        rest = slashIdx >= 0 ? rest.slice(slashIdx) : '/';
+      }
+      return new MockUri(scheme, authority, rest, rest, raw, query);
     }
 
     public toString(): string {
@@ -206,6 +248,9 @@ vi.mock('vscode', () => {
     },
     ChatResponseMarkdownPart: class {
       public constructor(public readonly value: unknown) {}
+    },
+    ChatResponseThinkingProgressPart: class {
+      public constructor(public readonly value: string | string[]) {}
     },
     ChatToolInvocationPart: class {
       public isComplete = false;
@@ -2026,6 +2071,265 @@ describe('AgySessionController inputState & workspace filtering', () => {
       source.dispose();
       reopenedStop.dispose();
       historyToken.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('waits until active thinking and in-flight tool calls complete at a step boundary before yielding to steering', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'step-yield-sess', cwd: 'D:\\repo', title: 'Step Yield' },
+    ]);
+    const firstFinish = Promise.withResolvers<AcpSessionPromptResult>();
+    const secondFinish = Promise.withResolvers<AcpSessionPromptResult>();
+    const prompt = vi.spyOn(backend, 'prompt')
+      .mockReturnValueOnce(firstFinish.promise)
+      .mockReturnValueOnce(secondFinish.promise);
+    vi.spyOn(backend, 'waitForConversationFullyIdle').mockResolvedValue();
+    const updates = new vscode.EventEmitter<{ sessionId: string; update: AcpSessionUpdate }>();
+    Object.assign(backend, { onDidChangeUpdate: updates.event });
+
+    const output = createFakeOutputChannel();
+    const controller = new AgySessionController(backend, output, nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(
+      backend, controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer,
+      output,
+    );
+
+    const resource = buildSessionResource('step-yield-sess');
+    const source1 = new vscode.CancellationTokenSource();
+    const source2 = new vscode.CancellationTokenSource();
+    const yieldableContext1: vscode.ChatContext & { yieldRequested?: boolean } = {
+      history: [],
+      yieldRequested: false,
+      chatSessionContext: { chatSessionItem: { resource, label: 'Step Yield' }, isUntitled: false },
+    };
+
+    const turn1 = participant.createHandler()(
+      { prompt: 'Analyze code', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+      yieldableContext1,
+      { push: vi.fn() } as unknown as vscode.ChatResponseStream,
+      source1.token,
+    );
+    let turn2: vscode.ProviderResult<void | vscode.ChatResult>;
+
+    try {
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(1));
+
+      // Active thinking followed by an in-progress tool call.
+      updates.fire({
+        sessionId: 'step-yield-sess',
+        update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'Planning verification...' } },
+      });
+      updates.fire({
+        sessionId: 'step-yield-sess',
+        update: {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'tool-step-1',
+          kind: 'execute',
+          name: 'run_command',
+          status: 'in_progress',
+          rawInput: { CommandLine: 'npm test' },
+        },
+      });
+
+      // User queues a Steering ("引导") message mid-tool-call.
+      yieldableContext1.yieldRequested = true;
+      turn2 = participant.createHandler()(
+        { prompt: 'Focus on shader path', references: [], toolReferences: [] } as unknown as vscode.ChatRequest,
+        { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Step Yield' }, isUntitled: false } },
+        { push: vi.fn() } as unknown as vscode.ChatResponseStream,
+        source2.token,
+      );
+
+      // Must NOT interrupt while the tool call is still in_progress.
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      expect(prompt).toHaveBeenCalledTimes(1);
+
+      // Complete the tool call -> hits safe step boundary and yields immediately!
+      updates.fire({
+        sessionId: 'step-yield-sess',
+        update: {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tool-step-1',
+          status: 'completed',
+          rawOutput: { exitCode: 0 },
+        },
+      });
+
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+      const res1 = await turn1;
+      expect(res1?.metadata).toMatchObject({ sessionId: 'step-yield-sess', yielded: true });
+
+      secondFinish.resolve({ stopReason: 'end_turn' });
+      const res2 = await turn2;
+      expect(res2?.errorDetails).toBeUndefined();
+    } finally {
+      firstFinish.resolve({ stopReason: 'end_turn' });
+      secondFinish.resolve({ stopReason: 'end_turn' });
+      await turn1;
+      await turn2;
+      source1.dispose();
+      source2.dispose();
+      updates.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('filters registered subagent IDs from controller items and loads subagent transcripts on demand', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const tmpBrain = await fsPromises.mkdtemp(nodePath.join(os.tmpdir(), 'agy-sub-brain-'));
+    const subId = 'sub-hidden-1';
+    const subLogDir = nodePath.join(tmpBrain, subId, '.system_generated', 'logs');
+    await fsPromises.mkdir(subLogDir, { recursive: true });
+    await fsPromises.writeFile(
+      nodePath.join(subLogDir, 'transcript.jsonl'),
+      [
+        JSON.stringify({
+          step_index: 0,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          content: '<SYSTEM_MESSAGE>\ncontent=Find shader uniform bug\n</SYSTEM_MESSAGE>',
+          created_at: '2026-11-24T11:00:00.000Z',
+        }),
+        JSON.stringify({
+          step_index: 1,
+          model: 'Gemini 4 Neon',
+          input_tokens: 900,
+          cache_read_tokens: 100,
+          output_tokens: 60,
+          created_at: '2026-11-24T11:00:02.000Z',
+          content: 'Verified shader uniform binding.',
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'main-parent-1', cwd: 'D:\\repo', title: 'Main Parent' },
+      { sessionId: subId, cwd: 'D:\\repo', title: 'Hidden Child Subagent' },
+    ]);
+    const output = createFakeOutputChannel();
+    const controller = new AgySessionController(backend, output, nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    controller.registerSubagentSessionId(subId);
+    await controller.refreshSessions();
+
+    expect(controller.controller.items.get(buildSessionResource('main-parent-1'))).toBeDefined();
+    expect(controller.controller.items.get(buildSessionResource(subId))).toBeUndefined();
+
+    const contentProvider = new AgySessionContentProvider(
+      backend,
+      controller,
+      { isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer,
+      output,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      tmpBrain,
+    );
+    const tokenSource = new vscode.CancellationTokenSource();
+    try {
+      const subDirect = await contentProvider.provideChatSessionContent(
+        vscode.Uri.parse(`antigravity:/subagent/${subId}`),
+        tokenSource.token,
+        { inputState: controller.controller.createChatSessionInputState([]) },
+      );
+      expect(subDirect.title).toBe('Find shader uniform bug');
+      expect(subDirect.history).toHaveLength(2);
+      const resp = subDirect.history[1] as { result?: { details?: string } };
+      expect(resp.result?.details).toBe('Gemini 4 Neon');
+
+      const subViaQuery = await contentProvider.provideChatSessionContent(
+        vscode.Uri.parse(`antigravity:/main-parent-1?subagentChatResource=${encodeURIComponent(`antigravity:/subagent/${subId}`)}`),
+        tokenSource.token,
+        { inputState: controller.controller.createChatSessionInputState([]) },
+      );
+      expect(subViaQuery.title).toBe('Find shader uniform bug');
+    } finally {
+      tokenSource.dispose();
+      contentProvider.dispose();
+      controller.dispose();
+      disposeBackend();
+      await fsPromises.rm(tmpBrain, { recursive: true, force: true });
+    }
+  });
+
+  it('populates ChatResult.details and per-turn __agyTurnStats metadata on live turns', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'stats-sess', cwd: 'D:\\repo', title: 'Stats Session' },
+    ]);
+    const finish = Promise.withResolvers<AcpSessionPromptResult>();
+    vi.spyOn(backend, 'prompt').mockReturnValue(finish.promise);
+    vi.spyOn(backend, 'waitForConversationFullyIdle').mockResolvedValue();
+    let usageCall = 0;
+    backend.getSessionContextUsage = vi.fn(async () => {
+      usageCall += 1;
+      if (usageCall === 1) {
+        return {
+          estimatedTokensUsed: 1000,
+          maxContextTokens: 1048576,
+          completionTokens: 100,
+          tokenGroups: [],
+          modelTotals: [{ model: 'gemini-4-neon', inputTokens: 1000, cachedTokens: 200, outputTokens: 100 }],
+        };
+      }
+      return {
+        estimatedTokensUsed: 3500,
+        maxContextTokens: 1048576,
+        completionTokens: 250,
+        tokenGroups: [],
+        modelTotals: [{ model: 'gemini-4-neon', inputTokens: 3500, cachedTokens: 800, outputTokens: 250 }],
+      };
+    });
+
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(
+      backend,
+      controller,
+      {
+        resolveModelAndEffort: () => ({ modelValue: 'gemini-4-neon', thoughtLevel: 'high' }),
+        getModelDisplayName: (id: string | undefined) => (id?.includes('gemini-4-neon') ? 'Gemini 4 Neon' : id),
+        recordContextWindow: vi.fn(),
+      } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer,
+      createFakeOutputChannel(),
+    );
+
+    const resource = buildSessionResource('stats-sess');
+    const source = new vscode.CancellationTokenSource();
+    const turnPromise = participant.createHandler()(
+      { prompt: 'Compute metrics', references: [], toolReferences: [], model: { id: 'gemini-4-neon', name: 'Gemini 4 Neon' } } as unknown as vscode.ChatRequest,
+      { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Stats Session' }, isUntitled: false } },
+      { push: vi.fn(), usage: vi.fn() } as unknown as vscode.ChatResponseStream,
+      source.token,
+    );
+
+    try {
+      await vi.waitFor(() => expect(backend.prompt).toHaveBeenCalledOnce());
+      finish.resolve({ stopReason: 'end_turn' });
+      const result = (await turnPromise) as { details?: string; metadata?: Record<string, unknown> };
+      expect(result.details).toBe('Gemini 4 Neon (High)');
+      expect(result.metadata?.__agyTurnStats).toMatchObject({
+        modelTotals: [{ model: 'Gemini 4 Neon', inputTokens: 2500, cachedTokens: 600, outputTokens: 150 }],
+      });
+    } finally {
+      source.dispose();
       participant.dispose();
       controller.dispose();
       disposeBackend();

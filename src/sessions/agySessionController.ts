@@ -214,6 +214,7 @@ export class AgySessionController implements vscode.Disposable {
   private readonly sessionInputStates = new Map<string, vscode.ChatSessionInputState>();
   private readonly sideChatMetadataBySessionId = new Map<string, SideChatContextMetadata>();
   private readonly sessionRecentTurnSummaries = new Map<string, string[]>();
+  private readonly knownSubagentSessionIds = new Set<string>();
   private activeTurnSnapshotProvider: ((sessionId: string) => ActiveTurnSnapshot | undefined) | undefined;
 
   private watcher: fs.FSWatcher | undefined;
@@ -346,7 +347,11 @@ export class AgySessionController implements vscode.Disposable {
     const seenIds = new Set<string>();
 
     for (const summary of sortedSummaries) {
-      if (summary.sessionId.length === 0 || seenIds.has(summary.sessionId)) {
+      if (
+        summary.sessionId.length === 0 ||
+        seenIds.has(summary.sessionId) ||
+        this.knownSubagentSessionIds.has(summary.sessionId)
+      ) {
         continue;
       }
       seenIds.add(summary.sessionId);
@@ -657,6 +662,25 @@ export class AgySessionController implements vscode.Disposable {
     }
   }
 
+  public registerSubagentSessionId(sessionId: string): void {
+    const cleanId = sessionId.trim();
+    if (cleanId.length === 0) {
+      return;
+    }
+    const isNew = !this.knownSubagentSessionIds.has(cleanId);
+    this.knownSubagentSessionIds.add(cleanId);
+    if (isNew && !this.disposed) {
+      const targetUri = buildSessionResource(cleanId);
+      if (this.controller.items.get(targetUri) !== undefined) {
+        void this.refreshSessions();
+      }
+    }
+  }
+
+  public isSubagentSessionId(sessionId: string): boolean {
+    return this.knownSubagentSessionIds.has(sessionId);
+  }
+
   public registerActiveTurnSnapshotProvider(provider: (sessionId: string) => ActiveTurnSnapshot | undefined): void {
     this.activeTurnSnapshotProvider = provider;
   }
@@ -872,6 +896,7 @@ export class AgySessionController implements vscode.Disposable {
     this.sessionInputStates.clear();
     this.sideChatMetadataBySessionId.clear();
     this.sessionRecentTurnSummaries.clear();
+    this.knownSubagentSessionIds.clear();
   }
 
   private handleNewChatSessionItem(

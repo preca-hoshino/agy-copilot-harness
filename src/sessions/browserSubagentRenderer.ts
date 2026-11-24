@@ -3,6 +3,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { AcpToolCallContentItem, AcpToolCallUpdatePayload } from '../acp/acpTypes.js';
+import {
+  buildSubagentChatResource,
+  extractSubagentCallMetadata,
+  isSubagentInvokeCall,
+  parseGeneralTranscriptRecord,
+  type SubagentCallMetadata,
+} from './subagentTranscript.js';
 
 const IMAGE_MIME_BY_EXT: Readonly<Record<string, string>> = {
   '.png': 'image/png',
@@ -61,11 +68,35 @@ interface ParsedTranscriptStep {
 interface LiveBrowserCallState {
   readonly sessionId: string;
   readonly toolCallId: string;
-  readonly role: string;
-  readonly prompt: string;
+  readonly isBrowser: boolean;
+  role: string;
+  readonly typeName: string;
+  prompt: string;
+  startedAt: number;
+  latestTranscriptMs?: number | undefined;
+  modelName: string | undefined;
+  subagentId: string | undefined;
+  deferredInvokeComplete?: boolean | undefined;
+  deferredResultText?: string | undefined;
+  stream?: Pick<vscode.ChatResponseStream, 'push'> | undefined;
   readonly parentPart: vscode.ChatToolInvocationPart;
   watcher: BrowserTrajectoryWatcher | undefined;
   readonly emittedWebmPaths: Set<string>;
+}
+
+export interface SubagentWatcherOptions {
+  readonly browserOnly?: boolean | undefined;
+  readonly subAgentName?: string | undefined;
+  readonly subagentIdHint?: string | undefined;
+  readonly onDiscoveredSubagentId?: ((subagentId: string) => void) | undefined;
+  readonly onTranscriptMeta?:
+    | ((meta: {
+        readonly modelName?: string | undefined;
+        readonly earliestCreatedAtMs?: number | undefined;
+        readonly latestCreatedAtMs?: number | undefined;
+        readonly isTerminalAssistantTurn?: boolean | undefined;
+      }) => void)
+    | undefined;
 }
 
 export function openMediaPreviewPanel(mediaPath: string, title?: string): void {
@@ -117,6 +148,18 @@ export function openMediaPreviewPanel(mediaPath: string, title?: string): void {
 
 export class BrowserTrajectoryWatcher {
   private readonly brainRootDir: string;
+  private readonly browserOnly: boolean;
+  private readonly subAgentName: string;
+  private subagentIdHint: string | undefined;
+  private readonly onDiscoveredSubagentId: ((subagentId: string) => void) | undefined;
+  private readonly onTranscriptMeta:
+    | ((meta: {
+        readonly modelName?: string | undefined;
+        readonly earliestCreatedAtMs?: number | undefined;
+        readonly latestCreatedAtMs?: number | undefined;
+        readonly isTerminalAssistantTurn?: boolean | undefined;
+      }) => void)
+    | undefined;
   private parentToolCallId = '';
   private promptHint = '';
   private sessionIdHint: string | undefined;
@@ -125,6 +168,13 @@ export class BrowserTrajectoryWatcher {
   private startedAtMs = 0;
   private stopped = false;
   private matchedSubagentDir: string | undefined;
+  private discoveredSubagentId: string | undefined;
+  private reportedDiscovery = false;
+  private observedModelName: string | undefined;
+  private earliestTranscriptMs: number | undefined;
+  private latestTranscriptMs: number | undefined;
+  private terminalAssistantTurnObserved = false;
+  private hasInProgressGeneralStep = false;
   private transcriptFilePath: string | undefined;
   private transcriptByteOffset = 0;
   private pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -132,12 +182,18 @@ export class BrowserTrajectoryWatcher {
   private dirFsWatcher: fs.FSWatcher | undefined;
   private stepSequence = 0;
   private readonly emittedStepKeys = new Set<string>();
+  private readonly emittedGeneralParts = new Map<string, vscode.ChatToolInvocationPart>();
   private readonly emittedImagePaths = new Set<string>();
   private readonly discoveredWebmPaths = new Set<string>();
   private readonly reportedNeedsInputReasons = new Set<string>();
 
-  public constructor(brainRootDir?: string) {
+  public constructor(brainRootDir?: string, options?: SubagentWatcherOptions) {
     this.brainRootDir = brainRootDir ?? path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+    this.browserOnly = options?.browserOnly !== false;
+    this.subAgentName = options?.subAgentName ?? 'Browser';
+    this.subagentIdHint = options?.subagentIdHint;
+    this.onDiscoveredSubagentId = options?.onDiscoveredSubagentId;
+    this.onTranscriptMeta = options?.onTranscriptMeta;
   }
 
   public startWatching(
@@ -156,10 +212,18 @@ export class BrowserTrajectoryWatcher {
     this.onNeedsInputCallback = onNeedsInput;
     this.startedAtMs = Date.now();
     this.matchedSubagentDir = undefined;
+    this.discoveredSubagentId = undefined;
+    this.reportedDiscovery = false;
+    this.observedModelName = undefined;
+    this.earliestTranscriptMs = undefined;
+    this.latestTranscriptMs = undefined;
+    this.terminalAssistantTurnObserved = false;
+    this.hasInProgressGeneralStep = false;
     this.transcriptFilePath = undefined;
     this.transcriptByteOffset = 0;
     this.stepSequence = 0;
     this.emittedStepKeys.clear();
+    this.emittedGeneralParts.clear();
     this.emittedImagePaths.clear();
     this.discoveredWebmPaths.clear();
     this.reportedNeedsInputReasons.clear();
@@ -176,6 +240,44 @@ export class BrowserTrajectoryWatcher {
     return new vscode.Disposable(() => {
       this.stop();
     });
+  }
+
+  public setSubagentIdHint(subagentId: string): void {
+    const trimmed = subagentId.trim();
+    if (trimmed.length === 0 || this.subagentIdHint === trimmed) {
+      return;
+    }
+    this.subagentIdHint = trimmed;
+    if (!this.stopped) {
+      this.scanOnce(false);
+    }
+  }
+
+  public getMatchedSubagentId(): string | undefined {
+    return this.discoveredSubagentId ?? this.subagentIdHint;
+  }
+
+  public hasTranscriptFile(): boolean {
+    return this.transcriptFilePath !== undefined && fs.existsSync(this.transcriptFilePath);
+  }
+
+  public hasCompletedAssistantTurn(): boolean {
+    return this.terminalAssistantTurnObserved;
+  }
+
+  public hasPendingSteps(): boolean {
+    return this.hasInProgressGeneralStep;
+  }
+
+  public getTranscriptElapsedMs(): number | undefined {
+    if (
+      this.earliestTranscriptMs !== undefined &&
+      this.latestTranscriptMs !== undefined &&
+      this.latestTranscriptMs >= this.earliestTranscriptMs
+    ) {
+      return this.latestTranscriptMs - this.earliestTranscriptMs;
+    }
+    return undefined;
   }
 
   public flush(): void {
@@ -253,6 +355,14 @@ export class BrowserTrajectoryWatcher {
     if (this.matchedSubagentDir === undefined) {
       this.matchedSubagentDir = this.discoverMatchingDir();
       if (this.matchedSubagentDir !== undefined) {
+        const dirName = path.basename(this.matchedSubagentDir);
+        if (dirName.length > 0 && (this.subagentIdHint === dirName || dirName !== this.sessionIdHint)) {
+          this.discoveredSubagentId = dirName;
+          if (!this.reportedDiscovery) {
+            this.reportedDiscovery = true;
+            this.onDiscoveredSubagentId?.(dirName);
+          }
+        }
         this.attachSubagentDirWatcher(this.matchedSubagentDir);
       }
     }
@@ -260,7 +370,9 @@ export class BrowserTrajectoryWatcher {
     const dirsToScan = this.collectDirsToScan();
     for (const dirPath of dirsToScan) {
       this.tailTranscriptInDir(dirPath, flushTrailingLine);
-      this.scanMediaFilesInDir(dirPath);
+      if (this.browserOnly) {
+        this.scanMediaFilesInDir(dirPath);
+      }
     }
   }
 
@@ -269,7 +381,13 @@ export class BrowserTrajectoryWatcher {
     if (this.matchedSubagentDir !== undefined && fs.existsSync(this.matchedSubagentDir)) {
       dirs.push(this.matchedSubagentDir);
     }
-    if (this.sessionIdHint !== undefined && this.sessionIdHint.length > 0) {
+    if (this.subagentIdHint !== undefined && this.subagentIdHint.length > 0) {
+      const hintDir = path.join(this.brainRootDir, this.subagentIdHint);
+      if (fs.existsSync(hintDir) && !dirs.includes(hintDir)) {
+        dirs.push(hintDir);
+      }
+    }
+    if (this.browserOnly && this.sessionIdHint !== undefined && this.sessionIdHint.length > 0) {
       const sessionDir = path.join(this.brainRootDir, this.sessionIdHint);
       if (fs.existsSync(sessionDir) && !dirs.includes(sessionDir)) {
         dirs.push(sessionDir);
@@ -295,6 +413,10 @@ export class BrowserTrajectoryWatcher {
       return undefined;
     }
 
+    if (this.subagentIdHint !== undefined && subdirs.includes(this.subagentIdHint)) {
+      return path.join(this.brainRootDir, this.subagentIdHint);
+    }
+
     if (subdirs.includes(this.parentToolCallId)) {
       return path.join(this.brainRootDir, this.parentToolCallId);
     }
@@ -303,6 +425,9 @@ export class BrowserTrajectoryWatcher {
     const candidates: Array<{ readonly dirPath: string; readonly mtimeMs: number; readonly hasContent: boolean }> = [];
 
     for (const name of subdirs) {
+      if (!this.browserOnly && name === this.sessionIdHint) {
+        continue;
+      }
       const dirPath = path.join(this.brainRootDir, name);
       const transcriptPath = getTranscriptPath(dirPath);
       const hasTranscript = fs.existsSync(transcriptPath);
@@ -311,13 +436,13 @@ export class BrowserTrajectoryWatcher {
       }
 
       const dirMtime = safeStatMtimeMs(hasTranscript ? transcriptPath : dirPath);
-      const hasMedia = listBrowserMediaFiles(dirPath).length > 0;
+      const hasMedia = this.browserOnly && listBrowserMediaFiles(dirPath).length > 0;
       if (hasTranscript || hasMedia) {
         candidates.push({ dirPath, mtimeMs: dirMtime, hasContent: true });
       }
     }
 
-    if (this.sessionIdHint !== undefined && subdirs.includes(this.sessionIdHint)) {
+    if (this.browserOnly && this.sessionIdHint !== undefined && subdirs.includes(this.sessionIdHint)) {
       return path.join(this.brainRootDir, this.sessionIdHint);
     }
 
@@ -388,13 +513,123 @@ export class BrowserTrajectoryWatcher {
       if (trimmed.length === 0) {
         continue;
       }
-      const steps = parseTranscriptJsonLine(trimmed, dirPath, () => {
-        this.stepSequence += 1;
-        return this.stepSequence;
-      });
-      for (const step of steps) {
-        this.emitParsedStep(step);
+      if (this.browserOnly) {
+        const steps = parseTranscriptJsonLine(trimmed, dirPath, () => {
+          this.stepSequence += 1;
+          return this.stepSequence;
+        });
+        for (const step of steps) {
+          this.emitParsedStep(step);
+        }
+      } else {
+        this.consumeGeneralTranscriptLine(trimmed);
       }
+    }
+  }
+
+  private consumeGeneralTranscriptLine(trimmedLine: string): void {
+    let rawParsed: unknown;
+    try {
+      rawParsed = JSON.parse(trimmedLine) as unknown;
+    } catch {
+      return;
+    }
+    if (!isRecord(rawParsed)) {
+      return;
+    }
+    const rawCreatedAt =
+      typeof rawParsed.created_at === 'string'
+        ? rawParsed.created_at
+        : typeof rawParsed.createdAt === 'string'
+          ? rawParsed.createdAt
+          : typeof rawParsed.timestamp === 'string'
+            ? rawParsed.timestamp
+            : undefined;
+    const rawCreatedAtMs = rawCreatedAt !== undefined ? Date.parse(rawCreatedAt) : Number.NaN;
+    if (Number.isFinite(rawCreatedAtMs)) {
+      let timeMetaChanged = false;
+      if (this.earliestTranscriptMs === undefined || rawCreatedAtMs < this.earliestTranscriptMs) {
+        this.earliestTranscriptMs = rawCreatedAtMs;
+        timeMetaChanged = true;
+      }
+      if (this.latestTranscriptMs === undefined || rawCreatedAtMs > this.latestTranscriptMs) {
+        this.latestTranscriptMs = rawCreatedAtMs;
+        timeMetaChanged = true;
+      }
+      if (timeMetaChanged) {
+        this.onTranscriptMeta?.({
+          modelName: this.observedModelName,
+          earliestCreatedAtMs: this.earliestTranscriptMs,
+          latestCreatedAtMs: this.latestTranscriptMs,
+          isTerminalAssistantTurn: this.terminalAssistantTurnObserved,
+        });
+      }
+    }
+    const steps = parseGeneralTranscriptRecord(rawParsed, () => {
+      this.stepSequence += 1;
+      return this.stepSequence;
+    });
+    for (const step of steps) {
+      let metaChanged = false;
+      if (step.modelName !== undefined && step.modelName !== this.observedModelName) {
+        this.observedModelName = step.modelName;
+        metaChanged = true;
+      }
+      if (step.createdAtMs !== undefined) {
+        if (this.earliestTranscriptMs === undefined || step.createdAtMs < this.earliestTranscriptMs) {
+          this.earliestTranscriptMs = step.createdAtMs;
+          metaChanged = true;
+        }
+        if (this.latestTranscriptMs === undefined || step.createdAtMs > this.latestTranscriptMs) {
+          this.latestTranscriptMs = step.createdAtMs;
+          metaChanged = true;
+        }
+      }
+      if (step.toolName.length > 0) {
+        this.terminalAssistantTurnObserved = false;
+        this.hasInProgressGeneralStep = !step.isComplete;
+      } else if (step.isTerminalAssistantResponse === true) {
+        this.terminalAssistantTurnObserved = true;
+        this.hasInProgressGeneralStep = false;
+        metaChanged = true;
+      } else {
+        this.terminalAssistantTurnObserved = false;
+      }
+      if (metaChanged) {
+        this.onTranscriptMeta?.({
+          modelName: this.observedModelName,
+          earliestCreatedAtMs: this.earliestTranscriptMs,
+          latestCreatedAtMs: this.latestTranscriptMs,
+          isTerminalAssistantTurn: this.terminalAssistantTurnObserved,
+        });
+      }
+      if (step.toolName.length === 0) {
+        continue;
+      }
+      const existing = this.emittedGeneralParts.get(step.stepKey);
+      if (existing !== undefined) {
+        if (
+          existing.isComplete !== step.isComplete ||
+          existing.isError !== step.isError ||
+          existing.invocationMessage !== step.summary
+        ) {
+          existing.isComplete = step.isComplete;
+          existing.isError = step.isError;
+          existing.invocationMessage = step.summary;
+          existing.pastTenseMessage = step.summary;
+          this.onStepCallback?.(existing);
+        }
+        continue;
+      }
+      const part = new vscode.ChatToolInvocationPart(step.toolName, `${this.parentToolCallId}:${step.stepKey}`);
+      part.invocationMessage = step.summary;
+      part.pastTenseMessage = step.summary;
+      part.isComplete = step.isComplete;
+      part.isError = step.isError;
+      part.subAgentInvocationId = this.parentToolCallId;
+      part.subAgentName = this.subAgentName;
+      this.emittedGeneralParts.set(step.stepKey, part);
+      this.onStepCallback?.(part);
     }
   }
 
@@ -467,10 +702,17 @@ export class BrowserTrajectoryWatcher {
 export class BrowserSubagentRenderer {
   private readonly brainRootDir: string;
   private readonly knownBrowserToolCallIds = new Set<string>();
+  private readonly knownGeneralToolCallIds = new Set<string>();
   private readonly liveCalls = new Map<string, LiveBrowserCallState>();
+  private onSubagentDiscovered: ((subagentId: string) => void) | undefined;
 
-  public constructor(brainRootDir?: string) {
+  public constructor(brainRootDir?: string, onSubagentDiscovered?: (subagentId: string) => void) {
     this.brainRootDir = brainRootDir ?? path.join(os.homedir(), '.gemini', 'antigravity', 'brain');
+    this.onSubagentDiscovered = onSubagentDiscovered;
+  }
+
+  public setOnSubagentDiscovered(listener: ((subagentId: string) => void) | undefined): void {
+    this.onSubagentDiscovered = listener;
   }
 
   public isBrowserSubagentCall(update: AcpToolCallUpdatePayload): boolean {
@@ -491,12 +733,34 @@ export class BrowserSubagentRenderer {
     return false;
   }
 
+  public isSubagentCall(update: AcpToolCallUpdatePayload): boolean {
+    if (this.isBrowserSubagentCall(update)) {
+      return true;
+    }
+    if (isSubagentInvokeCall(update)) {
+      this.knownGeneralToolCallIds.add(update.toolCallId);
+      return true;
+    }
+    return update.name === undefined && this.knownGeneralToolCallIds.has(update.toolCallId);
+  }
+
   public renderReplayToolCall(update: AcpToolCallUpdatePayload, sessionId: string): vscode.ChatResponsePart[] {
+    if (!this.isBrowserSubagentCall(update) && isSubagentInvokeCall(update)) {
+      return this.renderGeneralReplayToolCall(update, sessionId);
+    }
+    if (!this.isBrowserSubagentCall(update) && this.knownGeneralToolCallIds.has(update.toolCallId)) {
+      return this.renderGeneralReplayToolCall(update, sessionId);
+    }
+
     const inputObj = update.args ?? update.rawInput ?? {};
     const role =
       getStringProp(inputObj, 'Role') ?? getStringProp(inputObj, 'role') ?? update.title ?? 'Browser Automation';
     const prompt = getStringProp(inputObj, 'Prompt') ?? getStringProp(inputObj, 'prompt') ?? '';
     const resultText = extractToolResultText(update);
+    const meta = extractSubagentCallMetadata(update);
+    if (meta.conversationId !== undefined) {
+      this.onSubagentDiscovered?.(meta.conversationId);
+    }
 
     const parentPart = new vscode.ChatToolInvocationPart('browser', update.toolCallId);
     parentPart.invocationMessage = role;
@@ -527,8 +791,14 @@ export class BrowserSubagentRenderer {
     stream: Pick<vscode.ChatResponseStream, 'push'>,
     onNeedsInput?: (reason: string) => void,
   ): void {
-    let state = this.liveCalls.get(update.toolCallId);
+    const existingState = this.liveCalls.get(update.toolCallId);
+    const isBrowser = existingState !== undefined ? existingState.isBrowser : this.isBrowserSubagentCall(update);
+    if (!isBrowser) {
+      this.handleGeneralLiveToolCall(update, sessionId, stream);
+      return;
+    }
 
+    let state = existingState;
     if (state === undefined) {
       const inputObj = update.args ?? update.rawInput ?? {};
       const role =
@@ -547,8 +817,13 @@ export class BrowserSubagentRenderer {
       state = {
         sessionId,
         toolCallId: update.toolCallId,
+        isBrowser: true,
         role,
+        typeName: 'Browser',
         prompt,
+        startedAt: Date.now(),
+        modelName: undefined,
+        subagentId: undefined,
         parentPart,
         watcher: undefined,
         emittedWebmPaths: new Set<string>(),
@@ -638,11 +913,518 @@ export class BrowserSubagentRenderer {
     }
   }
 
+  private renderGeneralReplayToolCall(update: AcpToolCallUpdatePayload, sessionId: string): vscode.ChatResponsePart[] {
+    const meta = extractSubagentCallMetadata(update);
+    const resultText = extractToolResultText(update);
+    const isComplete = update.status !== 'pending' && update.status !== 'in_progress';
+    const isError = update.status === 'failed';
+    const replayData = this.collectGeneralReplayData(update, sessionId, meta, resultText);
+    const subagentId = replayData.subagentId ?? meta.conversationId;
+    if (subagentId !== undefined) {
+      this.onSubagentDiscovered?.(subagentId);
+    }
+
+    const parentPart = new vscode.ChatToolInvocationPart('invoke_subagent', update.toolCallId);
+    parentPart.invocationMessage = meta.role;
+    parentPart.pastTenseMessage = meta.role;
+    parentPart.isComplete = isComplete;
+    parentPart.isError = isError;
+    if (isComplete && !isError) {
+      parentPart.isConfirmed = true;
+    }
+    parentPart.toolSpecificData = buildGeneralSubagentToolData({
+      typeName: meta.typeName,
+      role: meta.role,
+      prompt: meta.prompt,
+      resultText,
+      modelName: replayData.modelName ?? meta.modelName,
+      startedAt: replayData.earliestMs,
+      duration:
+        replayData.earliestMs !== undefined && replayData.latestMs !== undefined
+          ? Math.max(0, replayData.latestMs - replayData.earliestMs)
+          : undefined,
+      isActive: !isComplete,
+      isError,
+      subagentId,
+    });
+
+    const parts: vscode.ChatResponsePart[] = [parentPart as unknown as vscode.ChatResponsePart];
+    for (const childPart of replayData.childParts) {
+      childPart.subAgentInvocationId = update.toolCallId;
+      childPart.subAgentName = meta.typeName;
+      parts.push(childPart as unknown as vscode.ChatResponsePart);
+    }
+    return parts;
+  }
+
+  private handleGeneralLiveToolCall(
+    update: AcpToolCallUpdatePayload,
+    sessionId: string,
+    stream: Pick<vscode.ChatResponseStream, 'push'>,
+  ): void {
+    const meta = extractSubagentCallMetadata(update);
+    let state = this.liveCalls.get(update.toolCallId);
+
+    if (state === undefined) {
+      const startedAt = Date.now();
+      const parentPart = new vscode.ChatToolInvocationPart('invoke_subagent', update.toolCallId);
+      parentPart.invocationMessage = meta.role;
+      parentPart.pastTenseMessage = meta.role;
+      parentPart.enablePartialUpdate = true;
+      parentPart.isComplete = false;
+      if (meta.conversationId !== undefined) {
+        this.onSubagentDiscovered?.(meta.conversationId);
+      }
+      parentPart.toolSpecificData = buildGeneralSubagentToolData({
+        typeName: meta.typeName,
+        role: meta.role,
+        prompt: meta.prompt,
+        resultText: undefined,
+        modelName: meta.modelName,
+        startedAt,
+        duration: undefined,
+        isActive: true,
+        isError: false,
+        subagentId: meta.conversationId,
+      });
+
+      stream.push(parentPart as unknown as vscode.ChatResponsePart);
+
+      state = {
+        sessionId,
+        toolCallId: update.toolCallId,
+        isBrowser: false,
+        role: meta.role,
+        typeName: meta.typeName,
+        prompt: meta.prompt,
+        startedAt,
+        modelName: meta.modelName,
+        subagentId: meta.conversationId,
+        parentPart,
+        watcher: undefined,
+        emittedWebmPaths: new Set<string>(),
+      };
+      this.liveCalls.set(update.toolCallId, state);
+    } else {
+      if (meta.role.length > 0 && meta.role !== 'Subagent') {
+        state.role = meta.role;
+        state.parentPart.invocationMessage = meta.role;
+        state.parentPart.pastTenseMessage = meta.role;
+      }
+      if (meta.modelName !== undefined && state.modelName === undefined) {
+        state.modelName = meta.modelName;
+      }
+      if (meta.conversationId !== undefined && state.subagentId === undefined) {
+        state.subagentId = meta.conversationId;
+        this.onSubagentDiscovered?.(meta.conversationId);
+        state.watcher?.setSubagentIdHint(meta.conversationId);
+      }
+    }
+
+    const activeState = state;
+    activeState.stream = stream;
+    const status = update.status ?? 'in_progress';
+
+    const ensureGeneralWatcher = (): void => {
+      if (activeState.watcher !== undefined) {
+        if (activeState.subagentId !== undefined) {
+          activeState.watcher.setSubagentIdHint(activeState.subagentId);
+        }
+        return;
+      }
+      const watcher = new BrowserTrajectoryWatcher(this.brainRootDir, {
+        browserOnly: false,
+        subAgentName: activeState.typeName,
+        subagentIdHint: activeState.subagentId,
+        onDiscoveredSubagentId: (discoveredId): void => {
+          if (activeState.subagentId === discoveredId) {
+            return;
+          }
+          activeState.subagentId = discoveredId;
+          this.onSubagentDiscovered?.(discoveredId);
+          activeState.parentPart.toolSpecificData = buildGeneralSubagentToolData({
+            typeName: activeState.typeName,
+            role: activeState.role,
+            prompt: activeState.prompt,
+            resultText: undefined,
+            modelName: activeState.modelName,
+            startedAt: activeState.startedAt,
+            duration: undefined,
+            isActive: true,
+            isError: false,
+            subagentId: discoveredId,
+          });
+          activeState.stream?.push(activeState.parentPart as unknown as vscode.ChatResponsePart);
+        },
+        onTranscriptMeta: (transcriptMeta): void => {
+          let changed = false;
+          if (transcriptMeta.modelName !== undefined && activeState.modelName === undefined) {
+            activeState.modelName = transcriptMeta.modelName;
+            changed = true;
+          }
+          if (
+            transcriptMeta.earliestCreatedAtMs !== undefined &&
+            transcriptMeta.earliestCreatedAtMs < activeState.startedAt
+          ) {
+            activeState.startedAt = transcriptMeta.earliestCreatedAtMs;
+            changed = true;
+          }
+          if (
+            transcriptMeta.latestCreatedAtMs !== undefined &&
+            (activeState.latestTranscriptMs === undefined ||
+              transcriptMeta.latestCreatedAtMs > activeState.latestTranscriptMs)
+          ) {
+            activeState.latestTranscriptMs = transcriptMeta.latestCreatedAtMs;
+          }
+          if (transcriptMeta.isTerminalAssistantTurn === true && activeState.deferredInvokeComplete === true) {
+            this.finalizeGeneralLiveCall(activeState, activeState.deferredResultText, false);
+            return;
+          }
+          if (changed && activeState.parentPart.isComplete !== true) {
+            activeState.parentPart.toolSpecificData = buildGeneralSubagentToolData({
+              typeName: activeState.typeName,
+              role: activeState.role,
+              prompt: activeState.prompt,
+              resultText: undefined,
+              modelName: activeState.modelName,
+              startedAt: activeState.startedAt,
+              duration: undefined,
+              isActive: true,
+              isError: false,
+              subagentId: activeState.subagentId,
+            });
+            activeState.stream?.push(activeState.parentPart as unknown as vscode.ChatResponsePart);
+          }
+        },
+      });
+      activeState.watcher = watcher;
+      watcher.startWatching(
+        update.toolCallId,
+        activeState.prompt,
+        (childPart) => {
+          activeState.stream?.push(childPart as unknown as vscode.ChatResponsePart);
+        },
+        undefined,
+        sessionId,
+      );
+    };
+
+    if (status === 'pending' || status === 'in_progress') {
+      ensureGeneralWatcher();
+
+      if (
+        update.title !== undefined &&
+        update.title.length > 0 &&
+        activeState.parentPart.invocationMessage !== update.title
+      ) {
+        activeState.role = update.title;
+        activeState.parentPart.invocationMessage = update.title;
+        activeState.parentPart.pastTenseMessage = update.title;
+      }
+
+      activeState.parentPart.toolSpecificData = buildGeneralSubagentToolData({
+        typeName: activeState.typeName,
+        role: activeState.role,
+        prompt: activeState.prompt,
+        resultText: undefined,
+        modelName: activeState.modelName,
+        startedAt: activeState.startedAt,
+        duration: undefined,
+        isActive: true,
+        isError: false,
+        subagentId: activeState.subagentId,
+      });
+      stream.push(activeState.parentPart as unknown as vscode.ChatResponsePart);
+      return;
+    }
+
+    const resultText = extractToolResultText(update);
+    const isError = status === 'failed';
+    activeState.deferredResultText = resultText;
+
+    if (activeState.subagentId === undefined) {
+      const fromText = extractSubagentCallMetadata({ ...update, rawOutput: update.rawOutput }).conversationId;
+      if (fromText !== undefined) {
+        activeState.subagentId = fromText;
+      } else if (resultText !== undefined) {
+        const match = /conversation:\/\/([a-zA-Z0-9_-]+)/.exec(resultText);
+        if (match?.[1] !== undefined) {
+          activeState.subagentId = match[1];
+        }
+      }
+    }
+
+    if (activeState.subagentId !== undefined) {
+      this.onSubagentDiscovered?.(activeState.subagentId);
+      if (!isError) {
+        ensureGeneralWatcher();
+      }
+    }
+
+    if (activeState.watcher !== undefined) {
+      activeState.watcher.flush();
+      const matchedId = activeState.watcher.getMatchedSubagentId();
+      if (matchedId !== undefined && activeState.subagentId === undefined) {
+        activeState.subagentId = matchedId;
+        this.onSubagentDiscovered?.(matchedId);
+      }
+    }
+
+    const shouldKeepWatching =
+      !isError &&
+      activeState.subagentId !== undefined &&
+      activeState.watcher !== undefined &&
+      !activeState.watcher.hasCompletedAssistantTurn() &&
+      (activeState.watcher.hasPendingSteps() ||
+        isAsyncSubagentLaunchResult(resultText, update.rawOutput) ||
+        (resultText === undefined && activeState.watcher.hasTranscriptFile()));
+
+    if (shouldKeepWatching) {
+      activeState.deferredInvokeComplete = true;
+      activeState.parentPart.isComplete = false;
+      activeState.parentPart.isError = false;
+      activeState.parentPart.toolSpecificData = buildGeneralSubagentToolData({
+        typeName: activeState.typeName,
+        role: activeState.role,
+        prompt: activeState.prompt,
+        resultText: undefined,
+        modelName: activeState.modelName,
+        startedAt: activeState.startedAt,
+        duration: undefined,
+        isActive: true,
+        isError: false,
+        subagentId: activeState.subagentId,
+      });
+      stream.push(activeState.parentPart as unknown as vscode.ChatResponsePart);
+      return;
+    }
+
+    this.finalizeGeneralLiveCall(activeState, resultText, isError);
+  }
+
+  private finalizeGeneralLiveCall(
+    activeState: LiveBrowserCallState,
+    resultText: string | undefined,
+    isError: boolean,
+  ): void {
+    const stream = activeState.stream;
+    let transcriptDuration: number | undefined;
+
+    if (activeState.watcher !== undefined) {
+      activeState.watcher.flush();
+      const matchedId = activeState.watcher.getMatchedSubagentId();
+      if (matchedId !== undefined && activeState.subagentId === undefined) {
+        activeState.subagentId = matchedId;
+        this.onSubagentDiscovered?.(matchedId);
+      }
+      transcriptDuration = activeState.watcher.getTranscriptElapsedMs();
+      activeState.watcher.stop();
+      activeState.watcher = undefined;
+    } else if (stream !== undefined) {
+      const replayData = this.collectGeneralReplayData(
+        {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: activeState.toolCallId,
+          rawInput: { TypeName: activeState.typeName, Role: activeState.role, Prompt: activeState.prompt },
+          rawOutput: resultText !== undefined ? { text: resultText } : undefined,
+        },
+        activeState.sessionId,
+        {
+          typeName: activeState.typeName,
+          role: activeState.role,
+          prompt: activeState.prompt,
+          modelName: activeState.modelName,
+          conversationId: activeState.subagentId,
+          isBrowser: false,
+        },
+        resultText,
+      );
+      if (replayData.subagentId !== undefined && activeState.subagentId === undefined) {
+        activeState.subagentId = replayData.subagentId;
+        this.onSubagentDiscovered?.(replayData.subagentId);
+      }
+      if (replayData.modelName !== undefined && activeState.modelName === undefined) {
+        activeState.modelName = replayData.modelName;
+      }
+      if (
+        replayData.earliestMs !== undefined &&
+        replayData.latestMs !== undefined &&
+        replayData.latestMs >= replayData.earliestMs
+      ) {
+        transcriptDuration = replayData.latestMs - replayData.earliestMs;
+      }
+      for (const childPart of replayData.childParts) {
+        childPart.subAgentInvocationId = activeState.toolCallId;
+        childPart.subAgentName = activeState.typeName;
+        stream.push(childPart as unknown as vscode.ChatResponsePart);
+      }
+    }
+
+    if (
+      transcriptDuration === undefined &&
+      activeState.latestTranscriptMs !== undefined &&
+      activeState.latestTranscriptMs >= activeState.startedAt
+    ) {
+      transcriptDuration = activeState.latestTranscriptMs - activeState.startedAt;
+    }
+
+    const duration = transcriptDuration ?? Math.max(0, Date.now() - activeState.startedAt);
+    activeState.parentPart.isComplete = true;
+    activeState.parentPart.isError = isError;
+    if (!isError) {
+      activeState.parentPart.isConfirmed = true;
+    }
+    activeState.parentPart.toolSpecificData = buildGeneralSubagentToolData({
+      typeName: activeState.typeName,
+      role: activeState.role,
+      prompt: activeState.prompt,
+      resultText,
+      modelName: activeState.modelName,
+      startedAt: activeState.startedAt,
+      duration,
+      isActive: false,
+      isError,
+      subagentId: activeState.subagentId,
+    });
+    stream?.push(activeState.parentPart as unknown as vscode.ChatResponsePart);
+  }
+
+  private collectGeneralReplayData(
+    update: AcpToolCallUpdatePayload,
+    sessionId: string,
+    meta: SubagentCallMetadata,
+    resultText: string | undefined,
+  ): {
+    readonly subagentId: string | undefined;
+    readonly childParts: vscode.ChatToolInvocationPart[];
+    readonly modelName: string | undefined;
+    readonly earliestMs: number | undefined;
+    readonly latestMs: number | undefined;
+  } {
+    const candidateDirs = this.findGeneralReplayCandidateDirs(sessionId, meta, resultText);
+    const childParts: vscode.ChatToolInvocationPart[] = [];
+    const seenKeys = new Set<string>();
+    let seq = 0;
+    let modelName = meta.modelName;
+    let earliestMs: number | undefined;
+    let latestMs: number | undefined;
+    let resolvedSubagentId = meta.conversationId;
+
+    for (const dirPath of candidateDirs) {
+      const transcriptPath = getTranscriptPath(dirPath);
+      if (!fs.existsSync(transcriptPath)) {
+        continue;
+      }
+      if (resolvedSubagentId === undefined) {
+        const candidateId = path.basename(dirPath);
+        if (candidateId !== sessionId) {
+          resolvedSubagentId = candidateId;
+        }
+      }
+      const lines = safeReadUtf8Lines(transcriptPath);
+      for (const rawLine of lines) {
+        const trimmed = rawLine.trim();
+        if (trimmed.length === 0) {
+          continue;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed) as unknown;
+        } catch {
+          continue;
+        }
+        if (!isRecord(parsed)) {
+          continue;
+        }
+        const steps = parseGeneralTranscriptRecord(parsed, () => {
+          seq += 1;
+          return seq;
+        });
+        for (const step of steps) {
+          if (step.modelName !== undefined) {
+            modelName = step.modelName;
+          }
+          if (step.createdAtMs !== undefined) {
+            earliestMs = earliestMs === undefined ? step.createdAtMs : Math.min(earliestMs, step.createdAtMs);
+            latestMs = latestMs === undefined ? step.createdAtMs : Math.max(latestMs, step.createdAtMs);
+          }
+          if (step.toolName.length === 0 || seenKeys.has(step.stepKey)) {
+            continue;
+          }
+          seenKeys.add(step.stepKey);
+          const childPart = new vscode.ChatToolInvocationPart(step.toolName, `${update.toolCallId}:${step.stepKey}`);
+          childPart.invocationMessage = step.summary;
+          childPart.pastTenseMessage = step.summary;
+          childPart.isComplete = step.isComplete;
+          childPart.isError = step.isError;
+          childParts.push(childPart);
+        }
+      }
+    }
+
+    return {
+      subagentId: resolvedSubagentId,
+      childParts,
+      modelName,
+      earliestMs,
+      latestMs,
+    };
+  }
+
+  private findGeneralReplayCandidateDirs(
+    sessionId: string,
+    meta: SubagentCallMetadata,
+    resultText: string | undefined,
+  ): string[] {
+    const dirs: string[] = [];
+    const seen = new Set<string>();
+    const addIfExists = (dirPath: string): void => {
+      const normalized = normalizeFsPath(dirPath);
+      if (!seen.has(normalized) && fs.existsSync(dirPath)) {
+        seen.add(normalized);
+        dirs.push(dirPath);
+      }
+    };
+
+    if (meta.conversationId !== undefined && meta.conversationId.length > 0) {
+      addIfExists(path.join(this.brainRootDir, meta.conversationId));
+    }
+    if (resultText !== undefined) {
+      for (const match of resultText.matchAll(/conversation:\/\/([a-zA-Z0-9_-]+)/g)) {
+        if (match[1] !== undefined && match[1].length > 0) {
+          addIfExists(path.join(this.brainRootDir, match[1]));
+        }
+      }
+    }
+    const normalizedPrompt = normalizePromptSnippet(meta.prompt);
+    if (normalizedPrompt.length > 0 && fs.existsSync(this.brainRootDir)) {
+      try {
+        for (const entry of fs.readdirSync(this.brainRootDir, { withFileTypes: true })) {
+          if (!entry.isDirectory() || entry.name === sessionId) {
+            continue;
+          }
+          const dirPath = path.join(this.brainRootDir, entry.name);
+          const transcriptPath = getTranscriptPath(dirPath);
+          if (fs.existsSync(transcriptPath) && transcriptMatchesPrompt(transcriptPath, normalizedPrompt)) {
+            addIfExists(dirPath);
+          }
+        }
+      } catch {
+        // Ignore directory read errors.
+      }
+    }
+    return dirs;
+  }
+
   public disposeSession(sessionId: string): void {
     for (const [toolCallId, state] of this.liveCalls.entries()) {
       if (state.sessionId === sessionId) {
-        state.watcher?.stop();
-        state.watcher = undefined;
+        if (!state.isBrowser && state.parentPart.isComplete !== true) {
+          this.finalizeGeneralLiveCall(state, state.deferredResultText, state.parentPart.isError === true);
+        } else {
+          state.watcher?.stop();
+          state.watcher = undefined;
+        }
         this.liveCalls.delete(toolCallId);
       }
     }
@@ -813,6 +1595,37 @@ export class BrowserSubagentRenderer {
 
     return dirs;
   }
+}
+
+function buildGeneralSubagentToolData(params: {
+  readonly typeName: string;
+  readonly role: string;
+  readonly prompt: string;
+  readonly resultText: string | undefined;
+  readonly modelName: string | undefined;
+  readonly startedAt: number | undefined;
+  readonly duration: number | undefined;
+  readonly isActive: boolean;
+  readonly isError: boolean;
+  readonly subagentId: string | undefined;
+}): Record<string, unknown> {
+  const displayName = params.typeName.length > 0 ? params.typeName : 'Subagent';
+  return {
+    kind: 'subagent',
+    description: params.role,
+    agentName: displayName,
+    agentDisplayName: displayName,
+    prompt: params.prompt,
+    ...(params.resultText !== undefined ? { result: params.resultText } : {}),
+    ...(params.modelName !== undefined ? { modelId: params.modelName, modelName: params.modelName } : {}),
+    ...(params.startedAt !== undefined ? { startedAt: params.startedAt } : {}),
+    ...(params.duration !== undefined ? { duration: params.duration } : {}),
+    isActive: params.isActive,
+    isError: params.isError,
+    ...(params.subagentId !== undefined
+      ? { chatResource: buildSubagentChatResource(params.subagentId), isChatAvailable: true }
+      : {}),
+  };
 }
 
 function createWebmPreviewButton(webmPath: string, role: string): vscode.ChatResponseCommandButtonPart {
@@ -1342,6 +2155,36 @@ function getNumberProp(record: Record<string, unknown> | undefined, key: string)
   }
   const value = record[key];
   return typeof value === 'number' ? value : undefined;
+}
+
+function isAsyncSubagentLaunchResult(
+  resultText: string | undefined,
+  rawOutput: Record<string, unknown> | undefined,
+): boolean {
+  if (rawOutput !== undefined) {
+    const hasConversationRef =
+      typeof rawOutput.conversationId === 'string' ||
+      typeof rawOutput.conversation_id === 'string' ||
+      typeof rawOutput.logAbsoluteUri === 'string';
+    const hasExplicitSummaryText =
+      typeof rawOutput.text === 'string' &&
+      rawOutput.text.trim().length > 0 &&
+      !/conversation:\/\/|\b(?:launched|started|spawned|background|running|async)\b/i.test(rawOutput.text);
+    if (hasConversationRef && !hasExplicitSummaryText) {
+      return true;
+    }
+  }
+  if (resultText === undefined) {
+    return false;
+  }
+  const trimmed = resultText.trim();
+  if (trimmed.length === 0) {
+    return true;
+  }
+  if (/conversation:\/\/|\b(?:launched|started|spawned|running|background|async(?:hronous)?)\b/i.test(trimmed)) {
+    return true;
+  }
+  return trimmed.startsWith('{') && /"conversationId"|"conversation_id"|"logAbsoluteUri"/.test(trimmed);
 }
 
 function getArrayProp(record: Record<string, unknown> | undefined, key: string): unknown[] | undefined {

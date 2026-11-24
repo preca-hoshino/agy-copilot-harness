@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import * as fs from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -304,6 +305,18 @@ async function readFileUtf8Safe(fsPath: string): Promise<string | undefined> {
   }
 }
 
+function readFileUtf8SyncSafe(fsPath: string): string | undefined {
+  try {
+    const stat = fs.statSync(fsPath);
+    if (!stat.isFile() || stat.size > 2 * 1024 * 1024) {
+      return undefined;
+    }
+    return fs.readFileSync(fsPath, 'utf8');
+  } catch {
+    return undefined;
+  }
+}
+
 export interface AgyEditTrackerOptions {
   sessionId: string;
   sessionCwd?: string | undefined;
@@ -365,10 +378,19 @@ export class AgyEditTracker {
       const pathKey = normalizeComparisonPath(fsPath);
 
       if (merged.status !== 'completed' && merged.status !== 'failed') {
+        const snapshotKey = `${merged.toolCallId}::${pathKey}`;
+        if (this.fileQueues.get(pathKey) === undefined && !this.preToolDiskSnapshot.has(snapshotKey)) {
+          // Capture synchronously on the first in_progress tick before fast agent writes race ahead.
+          const syncDisk = readFileUtf8SyncSafe(fsPath);
+          if (syncDisk !== undefined) {
+            this.preToolDiskSnapshot.set(snapshotKey, syncDisk);
+            continue;
+          }
+        }
         this.enqueueFileTask(pathKey, async () => {
-          if (!this.preToolDiskSnapshot.has(`${merged.toolCallId}::${pathKey}`)) {
+          if (!this.preToolDiskSnapshot.has(snapshotKey)) {
             const disk = await readFileUtf8Safe(fsPath);
-            this.preToolDiskSnapshot.set(`${merged.toolCallId}::${pathKey}`, disk ?? null);
+            this.preToolDiskSnapshot.set(snapshotKey, disk ?? null);
           }
         });
         continue;

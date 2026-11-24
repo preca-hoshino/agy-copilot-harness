@@ -183,7 +183,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const browserRenderer = new BrowserSubagentRenderer();
   const lmProvider = new AgyLanguageModelProvider(backend, quotaService);
   const sessionController = new AgySessionController(backend, outputChannel);
+  browserRenderer.setOnSubagentDiscovered((subagentId) => {
+    sessionController.registerSubagentSessionId(subagentId);
+  });
   const attachmentDir = path.join(context.globalStorageUri.fsPath, 'attachments');
+  const configuredAppDataDir = vscode.workspace
+    .getConfiguration('antigravityHarness')
+    .get<string>('appDataDir')
+    ?.trim();
+  const resolvedAppDataDir =
+    configuredAppDataDir !== undefined && configuredAppDataDir.length > 0 ? configuredAppDataDir : 'antigravity';
   const chatParticipant = new AgyChatParticipant(
     backend,
     sessionController,
@@ -208,16 +217,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       lmProvider.recordContextWindow(modelId, maxContextTokens, authoritative);
     },
     (modelId): number | undefined => lmProvider.getModelContextLimit(modelId),
+    (modelId): string | undefined => lmProvider.getModelDisplayName(modelId),
+    undefined,
+    resolvedAppDataDir,
   );
-  const configuredAppDataDir = vscode.workspace
-    .getConfiguration('antigravityHarness')
-    .get<string>('appDataDir')
-    ?.trim();
-  const customizationRegistration = AgyCustomizationProvider.register(
-    backend,
-    sessionController,
-    configuredAppDataDir !== undefined && configuredAppDataDir.length > 0 ? configuredAppDataDir : 'antigravity',
-  );
+  const customizationRegistration = AgyCustomizationProvider.register(backend, sessionController, resolvedAppDataDir);
   const participant = vscode.chat.createChatParticipant(ANTIGRAVITY_SCHEME, chatParticipant.createHandler());
 
   const runLogin = async (): Promise<void> => {

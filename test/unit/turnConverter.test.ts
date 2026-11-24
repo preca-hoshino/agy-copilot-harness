@@ -1161,4 +1161,372 @@ describe('TurnConverter', () => {
     const fallbackPart = pushed[2] as vscode.ChatToolInvocationPart;
     expect((fallbackPart.pastTenseMessage as { value: string }).value).toContain('Read skill [custom-dir-skill](');
   });
+
+  it('tracks live task_boundary updates without task.md and hides completed manage_todo_list pills', () => {
+    const renderer = new BrowserSubagentRenderer('D:\\unused');
+    const pushed: unknown[] = [];
+    const adapter = new LiveStreamAdapter(
+      renderer,
+      'session-task-boundary',
+      { push: (part: unknown) => pushed.push(part) } as unknown as vscode.ChatResponseStream,
+      vi.fn(),
+    );
+
+    adapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tb-1',
+      name: 'task_boundary',
+      status: 'in_progress',
+      rawInput: { TaskName: 'Research codebase', TaskStatus: 'Scanning controllers' },
+    });
+    adapter.handleUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'tb-1',
+      status: 'completed',
+    });
+
+    const firstTodoPart = pushed.find(
+      (item) => (item as { toolName?: string }).toolName === 'manage_todo_list',
+    ) as vscode.ChatToolInvocationPart;
+    expect(firstTodoPart).toBeDefined();
+    expect(firstTodoPart.presentation).toBe('hiddenAfterComplete');
+    expect(firstTodoPart.toolSpecificData).toEqual({
+      todoList: [{ id: 1, title: 'Research codebase: Scanning controllers', status: 2 }],
+    });
+
+    adapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'tb-2',
+      name: 'task_boundary',
+      status: 'in_progress',
+      rawInput: { TaskName: 'Implement fix', TaskStatus: 'Updating provider' },
+    });
+    expect(firstTodoPart.toolSpecificData).toEqual({
+      todoList: [
+        { id: 1, title: 'Research codebase', status: 3 },
+        { id: 2, title: 'Implement fix: Updating provider', status: 2 },
+      ],
+    });
+
+    adapter.flush();
+    expect(firstTodoPart.toolSpecificData).toEqual({
+      todoList: [
+        { id: 1, title: 'Research codebase', status: 3 },
+        { id: 2, title: 'Implement fix', status: 3 },
+      ],
+    });
+  });
+
+  it('renders general invoke_subagent calls with child transcript steps and antigravity:/subagent resources', async () => {
+    const tmpBrain = await makeTempBrainDir();
+    const subId = 'subagent-research-001';
+    const logDir = nodePath.join(tmpBrain, subId, '.system_generated', 'logs');
+    await fs.mkdir(logDir, { recursive: true });
+    await fs.writeFile(
+      nodePath.join(logDir, 'transcript.jsonl'),
+      [
+        JSON.stringify({
+          step_index: 0,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          content: '<SYSTEM_MESSAGE>\ncontent=Inspect controller logic and report findings\n</SYSTEM_MESSAGE>',
+          created_at: '2026-11-24T10:00:00.000Z',
+        }),
+        JSON.stringify({
+          step_index: 1,
+          model: 'gemini-4-neon',
+          input_tokens: 1200,
+          cache_read_tokens: 400,
+          output_tokens: 80,
+          created_at: '2026-11-24T10:00:01.000Z',
+          tool_calls: [{ id: 'child-read-1', name: 'read_file', arguments: { AbsolutePath: 'D:\\repo\\app.ts' } }],
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const discovered = vi.fn();
+    const renderer = new BrowserSubagentRenderer(tmpBrain, discovered);
+    const converter = new TurnConverter(renderer, 'parent-session-1');
+
+    converter.processUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Check app' } });
+    converter.processUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'sub-call-1',
+      name: 'invoke_subagent',
+      status: 'completed',
+      rawInput: {
+        TypeName: 'research',
+        Role: 'Codebase Researcher',
+        Prompt: 'Inspect controller logic and report findings',
+      },
+      rawOutput: { text: 'Findings attached' },
+    });
+    converter.processUpdate({
+      sessionUpdate: 'usage_update',
+      used: 5000,
+      size: 1000000,
+    });
+
+    const history = converter.finalizeHistory(
+      'antigravity/gemini-4-neon',
+      {
+        estimatedTokensUsed: 5000,
+        maxContextTokens: 1000000,
+        completionTokens: 80,
+        tokenGroups: [],
+        modelTotals: [{ model: 'Gemini 4 Neon', inputTokens: 1200, cachedTokens: 400, outputTokens: 80 }],
+      },
+      1000000,
+      { details: 'Gemini 4 Neon (High)', elapsedMs: 1250, completedAt: 1700000001250 },
+    );
+
+    expect(discovered).toHaveBeenCalledWith(subId);
+    const responseTurn = history.turns[1] as vscode.ChatResponseTurn2;
+    expect((responseTurn.result as { details?: string }).details).toBe('Gemini 4 Neon (High)');
+    const subParent = responseTurn.response[0] as unknown as vscode.ChatToolInvocationPart;
+    expect(subParent.toolName).toBe('invoke_subagent');
+    expect(subParent.toolSpecificData).toMatchObject({
+      kind: 'subagent',
+      agentName: 'research',
+      description: 'Codebase Researcher',
+      modelName: 'gemini-4-neon',
+      chatResource: `antigravity:/subagent/${subId}`,
+      isChatAvailable: true,
+      isActive: false,
+    });
+    const childStep = responseTurn.response[1] as unknown as vscode.ChatToolInvocationPart;
+    expect(childStep.subAgentInvocationId).toBe('sub-call-1');
+    expect(childStep.invocationMessage).toBe('Read app.ts');
+
+    const usagePart = responseTurn.response[responseTurn.response.length - 1] as vscode.ChatResponseMarkdownPart;
+    expect(usagePart.value.value).toContain('"elapsedMs":1250');
+    expect(usagePart.value.value).toContain('"responseDetails":"Gemini 4 Neon (High)"');
+    expect(usagePart.value.value).toContain('"modelTotals":[{"model":"Gemini 4 Neon"');
+  });
+
+  it('filters .gemini/antigravity scratch and out-of-workspace files from history and flush changes', async () => {
+    const renderer = new BrowserSubagentRenderer('D:\\unused');
+    const workspaceRoot = await makeTempBrainDir();
+    const workspaceFile = nodePath.join(workspaceRoot, 'src', 'kept.ts');
+    const outsideFile = nodePath.join(os.tmpdir(), 'unrelated-outside.ts');
+    const scratchFile = nodePath.join(os.homedir(), '.gemini', 'antigravity', 'scratch', 'inspect_vscode.js');
+
+    const converter = new TurnConverter(renderer, 'filter-session', undefined, undefined, {
+      sessionCwd: workspaceRoot,
+      workspaceFolderPaths: [workspaceRoot],
+    });
+    converter.processUpdate({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Work' } });
+    converter.processUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'edit-scratch',
+      kind: 'edit',
+      name: 'write_file',
+      status: 'completed',
+      rawInput: { TargetFile: scratchFile, CodeContent: 'console.log(1)\n' },
+    });
+    converter.processUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'edit-outside',
+      kind: 'edit',
+      name: 'write_file',
+      status: 'completed',
+      rawInput: { TargetFile: outsideFile, CodeContent: 'console.log(2)\n' },
+    });
+    converter.processUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'edit-ws',
+      kind: 'edit',
+      name: 'write_file',
+      status: 'completed',
+      rawInput: { TargetFile: workspaceFile, CodeContent: 'export const x = 1;\n' },
+    });
+
+    const history = converter.finalizeHistory();
+    expect(history.changes.map((c) => c.modifiedUri.fsPath)).toEqual([workspaceFile]);
+
+    const liveChanges: vscode.ChatSessionFileChange[] = [];
+    const liveAdapter = new LiveStreamAdapter(
+      renderer,
+      'live-flush-filter',
+      { push: vi.fn() } as unknown as vscode.ChatResponseStream,
+      (change) => {
+        liveChanges.push(change);
+      },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        sessionCwd: workspaceRoot,
+        workspaceFolderPaths: [workspaceRoot],
+      },
+    );
+    liveAdapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'live-scratch',
+      kind: 'edit',
+      name: 'write_file',
+      status: 'completed',
+      rawInput: { TargetFile: scratchFile, CodeContent: 'console.log(1)\n' },
+    });
+    liveAdapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'live-outside',
+      kind: 'edit',
+      name: 'write_file',
+      status: 'completed',
+      rawInput: { TargetFile: outsideFile, CodeContent: 'console.log(2)\n' },
+    });
+    liveAdapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'live-ws',
+      kind: 'edit',
+      name: 'write_file',
+      status: 'completed',
+      rawInput: { TargetFile: workspaceFile, CodeContent: 'export const x = 1;\n' },
+    });
+    // Flush must not emit skipped scratch/outside edits afterward.
+    liveAdapter.flush();
+    expect(liveChanges.map((c) => c.modifiedUri.fsPath)).toEqual([workspaceFile]);
+  });
+
+  it('ignores GENERIC stdout in subagent transcripts, unwraps quoted args, and tracks async subagent completion duration', async () => {
+    const tmpBrain = await makeTempBrainDir();
+    const subId = 'async-sub-35s';
+    const subDir = nodePath.join(tmpBrain, subId);
+    const logsDir = nodePath.join(subDir, '.system_generated', 'logs');
+    await fs.mkdir(logsDir, { recursive: true });
+    const transcriptPath = nodePath.join(logsDir, 'transcript.jsonl');
+
+    await fs.writeFile(
+      transcriptPath,
+      [
+        JSON.stringify({
+          step_index: 0,
+          source: 'SYSTEM',
+          type: 'SYSTEM_MESSAGE',
+          created_at: '2026-11-24T11:10:00Z',
+          content: '<SYSTEM_MESSAGE>\n[Message] content=Inspect logs\n</SYSTEM_MESSAGE>',
+        }),
+        JSON.stringify({
+          step_index: 1,
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          status: 'DONE',
+          created_at: '2026-11-24T11:10:01Z',
+          model: 'gemini-4-hydrogen-tiered-flash',
+          thinking: 'Checking VS Code logs',
+          tool_calls: [
+            {
+              id: 'cmd-1',
+              name: 'run_command',
+              arguments: { CommandLine: '"dir logs"', toolSummary: '"List logs"' },
+            },
+          ],
+        }),
+        JSON.stringify({
+          step_index: 2,
+          source: 'MODEL',
+          type: 'GENERIC',
+          status: 'DONE',
+          created_at: '2026-11-24T11:10:15Z',
+          content: 'RAW COMMAND OUTPUT SHOULD NOT RENDER AS MARKDOWN',
+        }),
+      ].join('\n') + '\n',
+      'utf8',
+    );
+
+    const { loadSubagentTranscriptHistory } = await import('../../src/sessions/subagentTranscript.js');
+    const preLoaded = loadSubagentTranscriptHistory(subId, tmpBrain);
+    expect(preLoaded).toBeDefined();
+    const preResp = preLoaded?.turns[1] as vscode.ChatResponseTurn2;
+    const preMarkdowns = preResp.response.filter((p) => p instanceof vscode.ChatResponseMarkdownPart);
+    expect(
+      preMarkdowns.some((p) => (p as vscode.ChatResponseMarkdownPart).value.value.includes('RAW COMMAND OUTPUT')),
+    ).toBe(false);
+    const cmdPart = preResp.response.find((p) => p instanceof vscode.ChatToolInvocationPart) as unknown as
+      | vscode.ChatToolInvocationPart
+      | undefined;
+    expect(cmdPart?.invocationMessage).toBe('Run dir logs');
+
+    const renderer = new BrowserSubagentRenderer(tmpBrain);
+    const pushed: unknown[] = [];
+    const liveAdapter = new LiveStreamAdapter(
+      renderer,
+      'parent-async-live',
+      { push: (p: unknown) => pushed.push(p) } as unknown as vscode.ChatResponseStream,
+      () => {},
+    );
+
+    liveAdapter.handleUpdate({
+      sessionUpdate: 'tool_call',
+      toolCallId: 'sub-async-1',
+      name: 'invoke_subagent',
+      status: 'in_progress',
+      rawInput: { TypeName: 'research', Role: 'Log Investigator', Prompt: 'Inspect logs' },
+    });
+
+    // Antigravity returns completed immediately with conversationId while subagent still runs.
+    liveAdapter.handleUpdate({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'sub-async-1',
+      status: 'completed',
+      rawOutput: {
+        conversationId: subId,
+        logAbsoluteUri: `file:///${transcriptPath.replace(/\\/g, '/')}`,
+      },
+    });
+
+    const parentUpdates = pushed.filter(
+      (p): p is vscode.ChatToolInvocationPart =>
+        p instanceof vscode.ChatToolInvocationPart && p.toolCallId === 'sub-async-1',
+    );
+    const midParent = parentUpdates[parentUpdates.length - 1];
+    expect(midParent?.isComplete).toBe(false);
+    expect((midParent?.toolSpecificData as { isActive?: boolean; duration?: number }).isActive).toBe(true);
+    expect((midParent?.toolSpecificData as { duration?: number }).duration).toBeUndefined();
+
+    // Now the subagent writes its final PLANNER_RESPONSE at +35s.
+    await fs.appendFile(
+      transcriptPath,
+      `${JSON.stringify({
+        step_index: 3,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-24T11:10:35Z',
+        model: 'gemini-4-hydrogen-tiered-flash',
+        content: 'Found root cause in logs.',
+      })}\n`,
+      'utf8',
+    );
+
+    await vi.waitFor(
+      () => {
+        const latest = pushed
+          .filter(
+            (p): p is vscode.ChatToolInvocationPart =>
+              p instanceof vscode.ChatToolInvocationPart && p.toolCallId === 'sub-async-1',
+          )
+          .at(-1);
+        expect(latest?.isComplete).toBe(true);
+        const data = latest?.toolSpecificData as { isActive?: boolean; duration?: number } | undefined;
+        expect(data?.isActive).toBe(false);
+        expect(data?.duration).toBe(35_000);
+      },
+      { timeout: 3000 },
+    );
+
+    const postLoaded = loadSubagentTranscriptHistory(subId, tmpBrain);
+    const postResp = postLoaded?.turns[1] as vscode.ChatResponseTurn2;
+    const postMarkdowns = postResp.response
+      .filter((p): p is vscode.ChatResponseMarkdownPart => p instanceof vscode.ChatResponseMarkdownPart)
+      .map((p) => p.value.value);
+    expect(postMarkdowns).toContain('Found root cause in logs.');
+    expect(postMarkdowns.some((m) => m.includes('RAW COMMAND OUTPUT'))).toBe(false);
+    liveAdapter.flush();
+  });
 });

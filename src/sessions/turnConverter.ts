@@ -11,21 +11,43 @@ import type {
   AcpToolCallUpdatePayload,
   AcpUsageUpdatePayload,
 } from '../acp/acpTypes.js';
-import type { AgyContextWindowUsage, ChatPromptTokenDetail } from '../shared/contracts.js';
+import type { AgyContextWindowUsage, AgyModelTokenTotal, ChatPromptTokenDetail } from '../shared/contracts.js';
 import {
   formatSkillReadMarkdownLink,
   isSkillMarkdownPath,
   resolveSkillDisplayNameSync,
 } from './agyCustomizationProvider.js';
-import { type AgyEditTracker, extractEditTargetPaths, isInternalAntigravityPath } from './agyEditTracker.js';
+import {
+  type AgyEditTracker,
+  extractEditTargetPaths,
+  isInternalAntigravityPath,
+  isWorkspaceTrackedPath,
+} from './agyEditTracker.js';
+import { AgyTaskListTracker, buildTodoToolPart, isTaskBoundaryCall } from './agyTaskTracker.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
 import { mapTokenGroupsToPromptDetails } from './contextUsageBreakdown.js';
+
+export interface WorkspaceTrackFilter {
+  readonly sessionCwd?: string | undefined;
+  readonly workspaceFolderPaths?: readonly string[] | undefined;
+  readonly appDataDir?: string | undefined;
+}
 
 export interface ConvertedHistoryUsage {
   readonly used: number;
   readonly size: number;
   readonly completionTokens?: number | undefined;
   readonly details?: readonly ChatPromptTokenDetail[] | undefined;
+  readonly modelTotals?: readonly AgyModelTokenTotal[] | undefined;
+  readonly elapsedMs?: number | undefined;
+  readonly completedAt?: number | undefined;
+  readonly responseDetails?: string | undefined;
+}
+
+export interface FinalizeHistoryOptions {
+  readonly details?: string | undefined;
+  readonly elapsedMs?: number | undefined;
+  readonly completedAt?: number | undefined;
 }
 
 export interface ConvertedHistory {
@@ -104,13 +126,16 @@ export class TurnConverter {
   private markdownBuffer = '';
   private currentTurnSlots: ResponseTurnSlot[] = [];
   private readonly currentTurnToolIds = new Set<string>();
+  private readonly taskTracker = new AgyTaskListTracker();
+  private sawTaskBoundaryInCurrentTurn = false;
   private latestUsage: { readonly used: number; readonly size: number } | undefined;
 
   public constructor(
     browserRenderer: BrowserSubagentRenderer,
     sessionId: string,
     participantId?: string,
-    private readonly attachmentDir?: string,
+    private readonly attachmentDir?: string | undefined,
+    private readonly workspaceFilter?: WorkspaceTrackFilter | undefined,
   ) {
     this.browserRenderer = browserRenderer;
     this.sessionId = sessionId;
@@ -168,8 +193,10 @@ export class TurnConverter {
     modelId?: string,
     detailedUsage?: AgyContextWindowUsage,
     fallbackContextLimit?: number,
+    options?: FinalizeHistoryOptions,
   ): ConvertedHistory {
     this.flushPendingUserTurn();
+    this.taskTracker.completeActiveTaskPhases();
     this.flushCurrentResponseTurn();
 
     const turns = [...this.turns];
@@ -192,22 +219,62 @@ export class TurnConverter {
       }
     }
 
-    const resolvedUsage = buildConvertedHistoryUsage(this.latestUsage, detailedUsage, fallbackContextLimit);
+    const baseUsage = buildConvertedHistoryUsage(this.latestUsage, detailedUsage, fallbackContextLimit);
+    const hasFooterStats =
+      (detailedUsage?.modelTotals !== undefined && detailedUsage.modelTotals.length > 0) ||
+      options?.details !== undefined ||
+      options?.elapsedMs !== undefined ||
+      options?.completedAt !== undefined;
+    const resolvedUsage: ConvertedHistoryUsage | undefined =
+      baseUsage !== undefined
+        ? {
+            ...baseUsage,
+            ...(detailedUsage?.modelTotals !== undefined && detailedUsage.modelTotals.length > 0
+              ? { modelTotals: detailedUsage.modelTotals }
+              : {}),
+            ...(options?.elapsedMs !== undefined ? { elapsedMs: options.elapsedMs } : {}),
+            ...(options?.completedAt !== undefined ? { completedAt: options.completedAt } : {}),
+            ...(options?.details !== undefined && options.details.length > 0
+              ? { responseDetails: options.details }
+              : {}),
+          }
+        : hasFooterStats
+          ? {
+              used: 0,
+              size:
+                fallbackContextLimit !== undefined && Number.isFinite(fallbackContextLimit) && fallbackContextLimit > 0
+                  ? fallbackContextLimit
+                  : 0,
+              ...(detailedUsage?.modelTotals !== undefined && detailedUsage.modelTotals.length > 0
+                ? { modelTotals: detailedUsage.modelTotals }
+                : {}),
+              ...(options?.elapsedMs !== undefined ? { elapsedMs: options.elapsedMs } : {}),
+              ...(options?.completedAt !== undefined ? { completedAt: options.completedAt } : {}),
+              ...(options?.details !== undefined && options.details.length > 0
+                ? { responseDetails: options.details }
+                : {}),
+            }
+          : undefined;
 
-    if (resolvedUsage !== undefined && turns.length > 0) {
+    if (
+      turns.length > 0 &&
+      (resolvedUsage !== undefined || (options?.details !== undefined && options.details.length > 0))
+    ) {
       const lastIndex = turns.length - 1;
       const lastTurn = turns[lastIndex];
       if (lastTurn instanceof vscode.ChatResponseTurn2) {
-        const serializedUsage = JSON.stringify(resolvedUsage).replaceAll('>', '\\u003e');
-        const usagePart = new vscode.ChatResponseMarkdownPart(
-          new vscode.MarkdownString(`<!--AGY_USAGE:${serializedUsage}-->`),
-        );
-        turns[lastIndex] = new vscode.ChatResponseTurn2(
-          [...lastTurn.response, usagePart],
-          lastTurn.result,
-          lastTurn.participant,
-          lastTurn.command,
-        );
+        const nextParts = [...lastTurn.response];
+        if (resolvedUsage !== undefined) {
+          const serializedUsage = JSON.stringify(resolvedUsage).replaceAll('>', '\\u003e');
+          nextParts.push(
+            new vscode.ChatResponseMarkdownPart(new vscode.MarkdownString(`<!--AGY_USAGE:${serializedUsage}-->`)),
+          );
+        }
+        const nextResult: vscode.ChatResult & { details?: string } =
+          options?.details !== undefined && options.details.length > 0
+            ? { ...lastTurn.result, details: options.details }
+            : lastTurn.result;
+        turns[lastIndex] = new vscode.ChatResponseTurn2(nextParts, nextResult, lastTurn.participant, lastTurn.command);
       }
     }
 
@@ -221,6 +288,9 @@ export class TurnConverter {
         continue;
       }
       for (const change of extractFileChangesFromToolCall(merged)) {
+        if (!isTrackableChangeUri(change.modifiedUri, this.workspaceFilter)) {
+          continue;
+        }
         accumulateFileChange(aggregatedChanges, change);
       }
     }
@@ -288,6 +358,7 @@ export class TurnConverter {
     this.flushPendingUserTurn();
     this.flushThinkingBuffer();
     this.flushMarkdownBuffer();
+    this.taskTracker.applyPlanUpdate(update.entries);
 
     const existingPlanSlot = this.currentTurnSlots.find(
       (slot): slot is Extract<ResponseTurnSlot, { readonly kind: 'plan' }> => slot.kind === 'plan',
@@ -310,6 +381,10 @@ export class TurnConverter {
       this.orderedToolCallIds.push(update.toolCallId);
     }
     this.toolCallsById.set(update.toolCallId, merged);
+
+    if (isTaskBoundaryCall(merged) && this.taskTracker.applyTaskBoundary(merged) !== undefined) {
+      this.sawTaskBoundaryInCurrentTurn = true;
+    }
 
     if (!this.currentTurnToolIds.has(update.toolCallId)) {
       this.currentTurnToolIds.add(update.toolCallId);
@@ -371,10 +446,12 @@ export class TurnConverter {
     }
 
     const parts: ReplayPart[] = [];
+    let hasPlanSlot = false;
     for (const slot of this.currentTurnSlots) {
       if (slot.kind === 'part') {
         parts.push(slot.part);
       } else if (slot.kind === 'plan') {
+        hasPlanSlot = true;
         const planPart = buildPlanToolPart(slot.entries, `plan-${this.sessionId}`);
         parts.push(planPart as unknown as vscode.ChatResponsePart);
       } else {
@@ -382,7 +459,7 @@ export class TurnConverter {
         if (merged === undefined) {
           continue;
         }
-        if (this.browserRenderer.isBrowserSubagentCall(merged)) {
+        if (isAnySubagentCall(this.browserRenderer, merged)) {
           const browserParts = this.browserRenderer.renderReplayToolCall(merged, this.sessionId);
           for (const browserPart of browserParts) {
             parts.push(browserPart);
@@ -394,8 +471,23 @@ export class TurnConverter {
       }
     }
 
+    if (!hasPlanSlot && this.sawTaskBoundaryInCurrentTurn) {
+      const todoList = this.taskTracker.getTodoList();
+      if (todoList.length > 0) {
+        parts.push(
+          buildTodoToolPart(
+            todoList,
+            `todo-${this.sessionId}`,
+            undefined,
+            'hiddenAfterComplete',
+          ) as unknown as vscode.ChatResponsePart,
+        );
+      }
+    }
+
     this.currentTurnSlots = [];
     this.currentTurnToolIds.clear();
+    this.sawTaskBoundaryInCurrentTurn = false;
 
     this.turns.push(new vscode.ChatResponseTurn2(parts, {}, this.participantId));
   }
@@ -414,10 +506,24 @@ export class LiveStreamAdapter {
 
   private readonly toolCallsById = new Map<string, AcpToolCallUpdatePayload>();
   private readonly liveToolParts = new Map<string, vscode.ChatToolInvocationPart>();
+  private readonly inFlightToolCallIds = new Set<string>();
   private readonly reportedEditToolIds = new Set<string>();
   private readonly externallyTrackedToolIds = new Set<string>();
   private readonly accumulatedMessageChunks: string[] = [];
+  private readonly taskTracker = new AgyTaskListTracker();
   private livePlanPart: vscode.ChatToolInvocationPart | undefined;
+  private isInThoughtStream = false;
+  private lastThoughtAt = 0;
+  private isStreamingMessage = false;
+  private lastMessageAt = 0;
+  private turnSettled = false;
+
+  private readonly attachmentDir: string | undefined;
+  private readonly onUsageUpdate: ((usage: AcpUsageUpdatePayload) => void) | undefined;
+  private readonly editTracker: AgyEditTracker | undefined;
+  private readonly formatUsage: ((usage: AcpUsageUpdatePayload) => vscode.ChatResponseUsage) | undefined;
+  private readonly onStepBoundary: (() => void) | undefined;
+  private readonly workspaceFilter: WorkspaceTrackFilter | undefined;
 
   public constructor(
     browserRenderer: BrowserSubagentRenderer,
@@ -425,20 +531,58 @@ export class LiveStreamAdapter {
     stream: LiveResponseStream,
     onFileChange: (change: vscode.ChatSessionFileChange) => void,
     onNeedsInput?: (reason: string) => void,
-    private readonly attachmentDir?: string,
-    private readonly onUsageUpdate?: (usage: AcpUsageUpdatePayload) => void,
-    private readonly editTracker?: AgyEditTracker | undefined,
-    private readonly formatUsage?: ((usage: AcpUsageUpdatePayload) => vscode.ChatResponseUsage) | undefined,
+    attachmentDir?: string,
+    onUsageUpdate?: (usage: AcpUsageUpdatePayload) => void,
+    editTracker?: AgyEditTracker,
+    formatUsage?: (usage: AcpUsageUpdatePayload) => vscode.ChatResponseUsage,
+    onStepBoundary?: () => void,
+    workspaceFilter?: WorkspaceTrackFilter,
   ) {
     this.browserRenderer = browserRenderer;
     this.sessionId = sessionId;
     this.stream = stream;
     this.onFileChange = onFileChange;
     this.onNeedsInput = onNeedsInput;
+    this.attachmentDir = attachmentDir;
+    this.onUsageUpdate = onUsageUpdate;
+    this.editTracker = editTracker;
+    this.formatUsage = formatUsage;
+    this.onStepBoundary = onStepBoundary;
+    this.workspaceFilter = workspaceFilter;
   }
 
   public getAccumulatedMessageText(): string {
     return this.accumulatedMessageChunks.join('');
+  }
+
+  public hasInFlightToolCalls(): boolean {
+    return this.inFlightToolCallIds.size > 0;
+  }
+
+  public isAtSafeYieldBoundary(now?: number): boolean {
+    const timestamp = now ?? Date.now();
+    if (this.inFlightToolCallIds.size > 0) {
+      return false;
+    }
+    if (this.turnSettled) {
+      return true;
+    }
+    if (this.isInThoughtStream && timestamp - this.lastThoughtAt < 1200) {
+      return false;
+    }
+    if (this.isStreamingMessage && timestamp - this.lastMessageAt < 800) {
+      return false;
+    }
+    return true;
+  }
+
+  public markTurnSettled(): void {
+    this.turnSettled = true;
+    this.isInThoughtStream = false;
+    this.isStreamingMessage = false;
+    if (this.inFlightToolCallIds.size === 0) {
+      this.onStepBoundary?.();
+    }
   }
 
   public handleUpdate(update: AcpSessionUpdate): void {
@@ -447,6 +591,9 @@ export class LiveStreamAdapter {
         if (isMessageChunkPayload(update)) {
           const text = extractContentBlockText(update.content);
           if (text.length > 0) {
+            this.isInThoughtStream = true;
+            this.isStreamingMessage = false;
+            this.lastThoughtAt = Date.now();
             const thoughtPart = new vscode.ChatResponseThinkingProgressPart(text);
             this.stream.push(thoughtPart as unknown as vscode.ChatResponsePart);
           }
@@ -455,6 +602,7 @@ export class LiveStreamAdapter {
       }
       case 'agent_message_chunk': {
         if (isMessageChunkPayload(update)) {
+          this.isInThoughtStream = false;
           const part = buildStandaloneAgentMessagePart(update.content, this.attachmentDir);
           if (part !== undefined) {
             this.stream.push(part);
@@ -462,6 +610,8 @@ export class LiveStreamAdapter {
           }
           const text = extractContentBlockText(update.content);
           if (text.length > 0) {
+            this.isStreamingMessage = true;
+            this.lastMessageAt = Date.now();
             this.accumulatedMessageChunks.push(text);
             const mdPart = new vscode.ChatResponseMarkdownPart(new vscode.MarkdownString(text));
             this.stream.push(mdPart);
@@ -471,7 +621,13 @@ export class LiveStreamAdapter {
       }
       case 'plan': {
         if (isPlanUpdatePayload(update)) {
-          const planPart = buildPlanToolPart(update.entries, `plan-${this.sessionId}`, this.livePlanPart);
+          const todoList = this.taskTracker.applyPlanUpdate(update.entries);
+          const planPart = buildTodoToolPart(
+            todoList,
+            `plan-${this.sessionId}`,
+            this.livePlanPart,
+            'hiddenAfterComplete',
+          );
           planPart.enablePartialUpdate = true;
           planPart.isComplete = update.entries.every((entry) => entry.status === 'completed');
           this.livePlanPart = planPart;
@@ -556,7 +712,9 @@ export class LiveStreamAdapter {
       if (merged.status !== 'completed' || classifyToolCall(merged, this.browserRenderer) !== 'edit') {
         continue;
       }
-      const changes = extractFileChangesFromToolCall(merged);
+      const changes = extractFileChangesFromToolCall(merged).filter((change) =>
+        isTrackableChangeUri(change.modifiedUri, this.workspaceFilter, this.editTracker),
+      );
       if (changes.length > 0) {
         this.reportedEditToolIds.add(toolCallId);
         for (const change of changes) {
@@ -565,6 +723,19 @@ export class LiveStreamAdapter {
       }
     }
     if (options?.preserveBrowserSession !== true) {
+      const completedTodos = this.taskTracker.completeActiveTaskPhases();
+      if (completedTodos !== undefined && completedTodos.length > 0) {
+        const todoPart = buildTodoToolPart(
+          completedTodos,
+          `todo-${this.sessionId}`,
+          this.livePlanPart,
+          'hiddenAfterComplete',
+        );
+        todoPart.enablePartialUpdate = true;
+        todoPart.isComplete = true;
+        this.livePlanPart = todoPart;
+        this.stream.push(todoPart as unknown as vscode.ChatResponsePart);
+      }
       this.browserRenderer.disposeSession(this.sessionId);
     }
   }
@@ -574,8 +745,36 @@ export class LiveStreamAdapter {
     const merged = mergeToolCallUpdate(previous, update);
     this.toolCallsById.set(update.toolCallId, merged);
 
-    if (this.browserRenderer.isBrowserSubagentCall(merged)) {
+    this.isInThoughtStream = false;
+    this.isStreamingMessage = false;
+    const isTerminalStatus = merged.status === 'completed' || merged.status === 'failed';
+    if (isTerminalStatus) {
+      this.inFlightToolCallIds.delete(merged.toolCallId);
+    } else {
+      this.inFlightToolCallIds.add(merged.toolCallId);
+    }
+
+    if (isTaskBoundaryCall(merged)) {
+      const updatedTodos = this.taskTracker.applyTaskBoundary(merged);
+      if (updatedTodos !== undefined && updatedTodos.length > 0) {
+        const todoPart = buildTodoToolPart(
+          updatedTodos,
+          `todo-${this.sessionId}`,
+          this.livePlanPart,
+          'hiddenAfterComplete',
+        );
+        todoPart.enablePartialUpdate = true;
+        todoPart.isComplete = updatedTodos.every((item) => item.status === 3);
+        this.livePlanPart = todoPart;
+        this.stream.push(todoPart as unknown as vscode.ChatResponsePart);
+      }
+    }
+
+    if (isAnySubagentCall(this.browserRenderer, merged)) {
       this.browserRenderer.handleLiveToolCall(merged, this.sessionId, this.stream, this.onNeedsInput);
+      if (isTerminalStatus && this.inFlightToolCallIds.size === 0) {
+        this.onStepBoundary?.();
+      }
       return;
     }
 
@@ -603,23 +802,44 @@ export class LiveStreamAdapter {
     this.stream.push(part as unknown as vscode.ChatResponsePart);
 
     if (category === 'edit' && merged.status === 'completed' && !this.reportedEditToolIds.has(merged.toolCallId)) {
-      const hasOnlyInternalPaths =
-        targetPaths.length > 0 && targetPaths.every((targetPath) => isInternalAntigravityPath(targetPath));
-      const allowChangeReport =
-        this.editTracker !== undefined
-          ? targetPaths.some((targetPath) => this.editTracker?.shouldTrackInWorkingSet(targetPath) === true)
-          : !hasOnlyInternalPaths;
-      if (allowChangeReport) {
-        const changes = extractFileChangesFromToolCall(merged);
-        if (changes.length > 0) {
-          this.reportedEditToolIds.add(merged.toolCallId);
-          for (const change of changes) {
-            this.onFileChange(change);
-          }
+      const changes = extractFileChangesFromToolCall(merged).filter((change) =>
+        isTrackableChangeUri(change.modifiedUri, this.workspaceFilter, this.editTracker),
+      );
+      if (changes.length > 0) {
+        this.reportedEditToolIds.add(merged.toolCallId);
+        for (const change of changes) {
+          this.onFileChange(change);
         }
       }
     }
+
+    if (isTerminalStatus && this.inFlightToolCallIds.size === 0) {
+      this.onStepBoundary?.();
+    }
   }
+}
+
+function isTrackableChangeUri(
+  uri: vscode.Uri,
+  workspaceFilter?: WorkspaceTrackFilter,
+  editTracker?: AgyEditTracker,
+): boolean {
+  const filePath = uri.fsPath.length > 0 ? uri.fsPath : uri.path;
+  if (filePath.length === 0) {
+    return false;
+  }
+  if (editTracker !== undefined) {
+    return editTracker.shouldTrackInWorkingSet(filePath);
+  }
+  if (workspaceFilter !== undefined) {
+    return isWorkspaceTrackedPath(
+      filePath,
+      workspaceFilter.sessionCwd,
+      workspaceFilter.workspaceFolderPaths ?? [],
+      workspaceFilter.appDataDir,
+    );
+  }
+  return !isInternalAntigravityPath(filePath);
 }
 
 function mergeToolCallUpdate(
@@ -657,11 +877,19 @@ function mergeToolCallUpdate(
   };
 }
 
+function isAnySubagentCall(renderer: BrowserSubagentRenderer, merged: AcpToolCallUpdatePayload): boolean {
+  const maybeGeneral = (renderer as { readonly isSubagentCall?: (update: AcpToolCallUpdatePayload) => boolean })
+    .isSubagentCall;
+  return typeof maybeGeneral === 'function'
+    ? maybeGeneral.call(renderer, merged)
+    : renderer.isBrowserSubagentCall(merged);
+}
+
 function classifyToolCall(
   merged: AcpToolCallUpdatePayload,
   browserRenderer: BrowserSubagentRenderer,
 ): ToolCallCategory {
-  if (browserRenderer.isBrowserSubagentCall(merged)) {
+  if (isAnySubagentCall(browserRenderer, merged)) {
     return 'browser';
   }
 
@@ -893,6 +1121,7 @@ function buildPlanToolPart(
   part.invocationMessage = 'Updating plan';
   part.pastTenseMessage = 'Updated plan';
   part.isComplete = true;
+  part.presentation = 'hiddenAfterComplete';
   part.toolSpecificData = {
     todoList: entries.map((entry, idx) => ({
       id: idx + 1,

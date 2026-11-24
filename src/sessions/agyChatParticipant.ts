@@ -15,6 +15,7 @@ import type { AgyLanguageModelProvider } from '../models/agyLanguageModelProvide
 import type {
   AcpBackendInterface,
   AgyContextWindowUsage,
+  AgyModelTokenTotal,
   ElicitationPrompt,
   PermissionPrompt,
   QuotaServiceInterface,
@@ -27,6 +28,7 @@ import { extractSessionIdFromUri } from './agySessionController.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
 import { buildChatResponseUsage } from './contextUsageBreakdown.js';
 import { acquireSessionOperation } from './sessionOperationCoordinator.js';
+import { formatResponseDetails } from './subagentTranscript.js';
 import { LiveStreamAdapter } from './turnConverter.js';
 
 interface SyncedSessionConfig {
@@ -102,6 +104,7 @@ class RunningTurnState {
   private needsInput = false;
   private disconnected: Error | undefined;
   private detachHandlers: (() => void) | undefined;
+  private yieldContextAccessor: (() => boolean) | undefined;
   private stateDisposed = false;
 
   public constructor(
@@ -183,6 +186,27 @@ class RunningTurnState {
     );
   }
 
+  public canYieldAtStepBoundary(now?: number): boolean {
+    return this.canBeSuperseded() && this.liveAdapter.isAtSafeYieldBoundary(now);
+  }
+
+  public setYieldContextAccessor(accessor: () => boolean): void {
+    this.yieldContextAccessor = accessor;
+  }
+
+  public isReadyForSuccessor(now?: number): boolean {
+    if (!this.canBeSuperseded()) {
+      return false;
+    }
+    if (this.isTurnYielded()) {
+      return true;
+    }
+    if (this.yieldContextAccessor?.() === true) {
+      return this.liveAdapter.isAtSafeYieldBoundary(now);
+    }
+    return true;
+  }
+
   public notifyStateChanged(): void {
     if (!this.stateDisposed) {
       this.stateChanged.fire();
@@ -190,7 +214,7 @@ class RunningTurnState {
   }
 
   public async waitUntilSteerableOrSettled(token: vscode.CancellationToken): Promise<void> {
-    if (this.phase === 'finished' || this.superseded || this.canBeSuperseded()) {
+    if (this.phase === 'finished' || this.superseded || this.isReadyForSuccessor()) {
       return;
     }
     if (isTokenCancelled(token)) {
@@ -203,7 +227,7 @@ class RunningTurnState {
         this.settled.promise,
         new Promise<void>((resolve) => {
           stateSub = this.stateChanged.event(() => {
-            if (this.phase === 'finished' || this.superseded || this.canBeSuperseded()) {
+            if (this.phase === 'finished' || this.superseded || this.isReadyForSuccessor()) {
               resolve();
             }
           });
@@ -488,7 +512,7 @@ export class AgyChatParticipant implements vscode.Disposable {
           return {};
         }
         const existing = this.runningTurns.get(sessionId);
-        if (existing !== undefined && !existing.canBeSuperseded()) {
+        if (existing !== undefined && !existing.isReadyForSuccessor()) {
           if (releaseSession !== undefined) {
             releaseSession();
             releaseSession = undefined;
@@ -498,7 +522,7 @@ export class AgyChatParticipant implements vscode.Disposable {
         }
         releaseSession ??= await acquireSessionOperation(this.backend, sessionId, token);
         const current = this.runningTurns.get(sessionId);
-        if (current !== undefined && !current.canBeSuperseded()) {
+        if (current !== undefined && !current.isReadyForSuccessor()) {
           releaseSession();
           releaseSession = undefined;
           continue;
@@ -587,15 +611,40 @@ export class AgyChatParticipant implements vscode.Disposable {
         outputChannel: this.outputChannel,
       });
 
+      const turnStartedAt = Date.now();
       let runningRef: RunningTurnState | undefined;
       let latestBreakdown: AgyContextWindowUsage | undefined;
+      let baselineTotalsByKey:
+        | Map<string, { readonly input: number; readonly cached: number; readonly output: number }>
+        | undefined;
       let lastBreakdownFetchAt = 0;
       let inFlightBreakdown: Promise<void> | undefined;
       let sawUsageUpdate = false;
       let latestAcpUsed = 0;
+      let promptDispatched = false;
+      let maybeYieldRef: (() => void) | undefined;
+
+      const recordBaseline = (totals: readonly AgyModelTokenTotal[] | undefined): void => {
+        if (baselineTotalsByKey !== undefined || totals === undefined) {
+          return;
+        }
+        const map = new Map<string, { readonly input: number; readonly cached: number; readonly output: number }>();
+        for (const entry of totals) {
+          const prev = map.get(entry.model);
+          map.set(entry.model, {
+            input: (prev?.input ?? 0) + entry.inputTokens,
+            cached: (prev?.cached ?? 0) + entry.cachedTokens,
+            output: (prev?.output ?? 0) + entry.outputTokens,
+          });
+        }
+        baselineTotalsByKey = map;
+      };
 
       const applyBreakdown = (breakdown: AgyContextWindowUsage, emitToTurn: boolean): void => {
         latestBreakdown = breakdown;
+        if (!promptDispatched) {
+          recordBaseline(breakdown.modelTotals);
+        }
         if (breakdown.maxContextTokens > 0) {
           this.lmProvider.recordContextWindow(modelKey, breakdown.maxContextTokens, true);
           if (resolvedModel.modelValue.length > 0 && resolvedModel.modelValue !== modelKey) {
@@ -673,17 +722,21 @@ export class AgyChatParticipant implements vscode.Disposable {
         (usage): vscode.ChatResponseUsage => {
           return buildChatResponseUsage({ totalUsed: usage.used, breakdown: latestBreakdown });
         },
+        () => {
+          runningRef?.notifyStateChanged();
+          maybeYieldRef?.();
+        },
       );
       const running = new RunningTurnState(sessionId, turn, liveAdapter, request.prompt);
+      running.setYieldContextAccessor(() => context.yieldRequested === true);
       runningRef = running;
-      if (!this.controller.isNewSession(rawSessionId)) {
-        void refreshUsageBreakdown(true, false);
-      }
+      const initialBreakdownPromise = !this.controller.isNewSession(rawSessionId)
+        ? refreshUsageBreakdown(true, false)
+        : Promise.resolve();
 
       let resetDrainTimer: (() => void) | undefined;
       let rejectDrain: ((error: Error) => void) | undefined;
       let yieldPollTimer: ReturnType<typeof setInterval> | undefined;
-      let promptDispatched = false;
       const yielded = Promise.withResolvers<void>();
 
       const stopYieldPolling = (): void => {
@@ -759,7 +812,7 @@ export class AgyChatParticipant implements vscode.Disposable {
         if (
           !promptDispatched ||
           context.yieldRequested !== true ||
-          !running.canBeSuperseded() ||
+          !running.canYieldAtStepBoundary() ||
           running.getDisconnectError() !== undefined ||
           !this.backend.isReady
         ) {
@@ -775,6 +828,7 @@ export class AgyChatParticipant implements vscode.Disposable {
         });
         yielded.resolve();
       };
+      maybeYieldRef = maybeYield;
 
       const handoff =
         predecessor !== undefined && !predecessor.isTurnFinished()
@@ -889,7 +943,16 @@ export class AgyChatParticipant implements vscode.Disposable {
       }
 
       const runTurnLifecycle = async (): Promise<vscode.ChatResult> => {
+        let refreshedFinalUsage = false;
         try {
+          if (!this.controller.isNewSession(rawSessionId)) {
+            await Promise.race([
+              initialBreakdownPromise,
+              new Promise<void>((resolve) => {
+                setTimeout(resolve, 150);
+              }),
+            ]);
+          }
           const promptResult = await this.sendPromptWithTransientRetry(sessionId, contentBlocks, running, () => {
             promptDispatched = true;
           });
@@ -904,6 +967,11 @@ export class AgyChatParticipant implements vscode.Disposable {
             const promptDisconnect = running.getDisconnectError();
             if (promptDisconnect !== undefined) {
               throw promptDisconnect;
+            }
+            liveAdapter.markTurnSettled();
+            maybeYield();
+            if (running.isTurnYielded()) {
+              return { metadata: { sessionId, yielded: true } };
             }
             running.setPhase('idle-wait');
             await this.backend.waitForConversationFullyIdle(sessionId, running.idleWaitCts.token);
@@ -964,11 +1032,41 @@ export class AgyChatParticipant implements vscode.Disposable {
             this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.Completed);
           }
 
+          if (promptDispatched && !this.disposed && this.backend.isReady) {
+            await refreshUsageBreakdown(true, true);
+            refreshedFinalUsage = true;
+          }
+
+          const modelDisplayName =
+            resolveLmDisplayName(
+              this.lmProvider,
+              resolvedModel.modelValue.length > 0 ? resolvedModel.modelValue : selectedModelId,
+            ) ?? (resolvedModel.modelValue.length > 0 ? resolvedModel.modelValue : selectedModelId);
+          const responseDetails = formatResponseDetails(modelDisplayName, resolvedModel.thoughtLevel);
+          const completedAt = Date.now();
+          const elapsedMs = Math.max(0, completedAt - turnStartedAt);
+          const turnModelTotals = computeTurnModelTotals({
+            latestTotals: latestBreakdown?.modelTotals,
+            baselineTotalsByKey,
+            formatModelName: (id) => resolveLmDisplayName(this.lmProvider, id) ?? id,
+            fallbackInputTokens: latestAcpUsed,
+            fallbackOutputTokens: latestBreakdown?.completionTokens,
+            fallbackModelName: responseDetails ?? modelDisplayName,
+          });
+
           const metadata: Record<string, unknown> = {
             sessionId,
             ...(promptResult.stopReason !== undefined ? { stopReason: promptResult.stopReason } : {}),
+            __agyTurnStats: {
+              elapsedMs,
+              completedAt,
+              ...(turnModelTotals.length > 0 ? { modelTotals: turnModelTotals } : {}),
+            },
           };
-          return { metadata };
+          return {
+            ...(responseDetails !== undefined ? { details: responseDetails } : {}),
+            metadata,
+          };
         } catch (error: unknown) {
           if (running.isTurnSuperseded()) {
             return { metadata: { sessionId, superseded: true } };
@@ -1020,10 +1118,12 @@ export class AgyChatParticipant implements vscode.Disposable {
             try {
               await editTracker.flush();
               liveAdapter.flush();
-              if (promptDispatched && !this.disposed && this.backend.isReady) {
-                await refreshUsageBreakdown(true, true);
-              } else if (sawUsageUpdate && latestBreakdown !== undefined) {
-                turn.usage(buildChatResponseUsage({ totalUsed: latestAcpUsed, breakdown: latestBreakdown }));
+              if (!refreshedFinalUsage) {
+                if (promptDispatched && !this.disposed && this.backend.isReady) {
+                  await refreshUsageBreakdown(true, true);
+                } else if (sawUsageUpdate && latestBreakdown !== undefined) {
+                  turn.usage(buildChatResponseUsage({ totalUsed: latestAcpUsed, breakdown: latestBreakdown }));
+                }
               }
               this.controller.recordTurnContext(sessionId, request.prompt, liveAdapter.getAccumulatedMessageText());
             } finally {
@@ -2033,6 +2133,75 @@ async function waitWithCancellation(ms: number, token: vscode.CancellationToken)
       });
     }
   });
+}
+
+interface TurnModelTotalsInput {
+  readonly latestTotals: readonly AgyModelTokenTotal[] | undefined;
+  readonly baselineTotalsByKey:
+    | ReadonlyMap<string, { readonly input: number; readonly cached: number; readonly output: number }>
+    | undefined;
+  readonly formatModelName: (modelId: string) => string;
+  readonly fallbackInputTokens: number;
+  readonly fallbackOutputTokens: number | undefined;
+  readonly fallbackModelName: string | undefined;
+}
+
+function computeTurnModelTotals(input: TurnModelTotalsInput): AgyModelTokenTotal[] {
+  const byDisplayModel = new Map<
+    string,
+    { model: string; inputTokens: number; cachedTokens: number; outputTokens: number }
+  >();
+
+  if (input.latestTotals !== undefined && input.latestTotals.length > 0) {
+    for (const entry of input.latestTotals) {
+      const base = input.baselineTotalsByKey?.get(entry.model);
+      const deltaInput = Math.max(0, entry.inputTokens - (base?.input ?? 0));
+      const deltaCached = Math.max(0, entry.cachedTokens - (base?.cached ?? 0));
+      const deltaOutput = Math.max(0, entry.outputTokens - (base?.output ?? 0));
+      if (deltaInput === 0 && deltaCached === 0 && deltaOutput === 0) {
+        continue;
+      }
+      const displayModel = input.formatModelName(entry.model);
+      const acc = byDisplayModel.get(displayModel) ?? {
+        model: displayModel,
+        inputTokens: 0,
+        cachedTokens: 0,
+        outputTokens: 0,
+      };
+      acc.inputTokens += deltaInput;
+      acc.cachedTokens += deltaCached;
+      acc.outputTokens += deltaOutput;
+      byDisplayModel.set(displayModel, acc);
+    }
+  }
+
+  if (byDisplayModel.size > 0) {
+    return Array.from(byDisplayModel.values());
+  }
+
+  const outTokens =
+    input.fallbackOutputTokens !== undefined && Number.isFinite(input.fallbackOutputTokens)
+      ? Math.max(0, Math.round(input.fallbackOutputTokens))
+      : 0;
+  const inTokens = Number.isFinite(input.fallbackInputTokens) ? Math.max(0, Math.round(input.fallbackInputTokens)) : 0;
+  if (inTokens > 0 || outTokens > 0) {
+    return [
+      {
+        model: input.fallbackModelName ?? 'Antigravity',
+        inputTokens: inTokens,
+        cachedTokens: 0,
+        outputTokens: outTokens,
+      },
+    ];
+  }
+
+  return [];
+}
+
+function resolveLmDisplayName(lmProvider: AgyLanguageModelProvider, modelId: string | undefined): string | undefined {
+  const maybeFn = (lmProvider as { readonly getModelDisplayName?: (id: string | undefined) => string | undefined })
+    .getModelDisplayName;
+  return typeof maybeFn === 'function' ? maybeFn.call(lmProvider, modelId) : undefined;
 }
 
 function formatError(error: unknown): string {

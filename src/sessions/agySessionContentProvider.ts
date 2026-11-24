@@ -7,6 +7,11 @@ import type { AgySessionController } from './agySessionController.js';
 import { extractSessionIdFromUri } from './agySessionController.js';
 import type { BrowserSubagentRenderer } from './browserSubagentRenderer.js';
 import { acquireSessionOperation } from './sessionOperationCoordinator.js';
+import {
+  formatResponseDetails,
+  loadSubagentTranscriptHistory,
+  parseSubagentIdFromResource,
+} from './subagentTranscript.js';
 import { TurnConverter } from './turnConverter.js';
 
 const REPLAY_QUIET_MS = 250;
@@ -44,6 +49,9 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
       authoritative: boolean,
     ) => void,
     private readonly getModelContextLimit?: (modelId: string | undefined) => number | undefined,
+    private readonly resolveModelDisplayName?: (modelId: string | undefined) => string | undefined,
+    private readonly brainRootDir?: string,
+    private readonly appDataDir?: string,
   ) {
     this.backend = backend;
     this.controller = controller;
@@ -61,6 +69,35 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
     _context: vscode.ChatSessionContentContext,
   ): Promise<vscode.ChatSession> {
     const rawSessionId = extractSessionIdFromUri(resource);
+
+    const subagentId = parseSubagentIdFromResource(resource);
+    if (subagentId !== undefined) {
+      this.controller.registerSubagentSessionId(subagentId);
+      const transcript = loadSubagentTranscriptHistory(subagentId, this.brainRootDir);
+      if (transcript !== undefined) {
+        if (transcript.modelId !== undefined && detailedModelNameMissing(this.resolveModelDisplayName, transcript)) {
+          // Keep transcript details untouched if model resolver has no display name override.
+        }
+        return {
+          ...(transcript.title.length > 0 ? { title: transcript.title } : {}),
+          history: transcript.turns as (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[],
+          options: { mode: this.controller.getSessionMode(subagentId) },
+        };
+      }
+      if (isTokenCancelled(token)) {
+        throw createCancellationError();
+      }
+      let subagentCwd = '';
+      try {
+        subagentCwd = await raceWithCancellation(this.controller.getSessionCwd(subagentId), token);
+      } catch (err: unknown) {
+        if (isCancellationError(err)) {
+          throw err;
+        }
+        subagentCwd = '';
+      }
+      return await raceWithCancellation(this.loadSessionContent(subagentId, subagentCwd, token), token);
+    }
 
     if (this.controller.isNewSession(rawSessionId)) {
       const mode = this.controller.getSessionMode(rawSessionId);
@@ -125,7 +162,14 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
       };
     }
 
-    const converter = new TurnConverter(this.browserRenderer, sessionId, ANTIGRAVITY_SCHEME, this.attachmentDir);
+    const workspaceFolderPaths = ((vscode.workspace as Partial<typeof vscode.workspace>).workspaceFolders ?? [])
+      .filter((folder) => folder.uri.scheme === 'file')
+      .map((folder) => folder.uri.fsPath);
+    const converter = new TurnConverter(this.browserRenderer, sessionId, ANTIGRAVITY_SCHEME, this.attachmentDir, {
+      sessionCwd: cwd,
+      workspaceFolderPaths,
+      ...(this.appDataDir !== undefined ? { appDataDir: this.appDataDir } : {}),
+    });
     let resetQuietTimer: (() => void) | undefined;
     let collectUpdates = true;
     let disconnected: Error | undefined;
@@ -231,7 +275,15 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
       this.onContextWindowResolved?.(loadedModelId, detailedUsage.maxContextTokens, true);
     }
     const fallbackContextLimit = this.getModelContextLimit?.(loadedModelId);
-    const converted = converter.finalizeHistory(loadedModelId, detailedUsage, fallbackContextLimit);
+    const modelDisplayName = this.resolveModelDisplayName?.(loadedModelId) ?? loadedModelId;
+    const loadedThoughtLevel = findConfigOption(loadResult.configOptions, 'thought_level')?.currentValue;
+    const responseDetails = formatResponseDetails(modelDisplayName, loadedThoughtLevel);
+    const converted = converter.finalizeHistory(
+      loadedModelId,
+      detailedUsage,
+      fallbackContextLimit,
+      responseDetails !== undefined ? { details: responseDetails } : undefined,
+    );
     if (
       (detailedUsage === undefined || detailedUsage.maxContextTokens <= 0) &&
       converted.usage !== undefined &&
@@ -415,6 +467,13 @@ async function raceWithCancellation<T>(promise: Promise<T>, token: vscode.Cancel
   } finally {
     disposable?.dispose();
   }
+}
+
+function detailedModelNameMissing(
+  _resolver: ((modelId: string | undefined) => string | undefined) | undefined,
+  _transcript: { readonly modelId: string | undefined },
+): boolean {
+  return false;
 }
 
 function formatError(error: unknown): string {
