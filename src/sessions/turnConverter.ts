@@ -164,7 +164,11 @@ export class TurnConverter {
     }
   }
 
-  public finalizeHistory(modelId?: string, detailedUsage?: AgyContextWindowUsage): ConvertedHistory {
+  public finalizeHistory(
+    modelId?: string,
+    detailedUsage?: AgyContextWindowUsage,
+    fallbackContextLimit?: number,
+  ): ConvertedHistory {
     this.flushPendingUserTurn();
     this.flushCurrentResponseTurn();
 
@@ -188,7 +192,7 @@ export class TurnConverter {
       }
     }
 
-    const resolvedUsage = buildConvertedHistoryUsage(this.latestUsage, detailedUsage);
+    const resolvedUsage = buildConvertedHistoryUsage(this.latestUsage, detailedUsage, fallbackContextLimit);
 
     if (resolvedUsage !== undefined && turns.length > 0) {
       const lastIndex = turns.length - 1;
@@ -1383,9 +1387,18 @@ function getFirstNumber(record: Record<string, unknown> | undefined, keys: reado
 function buildConvertedHistoryUsage(
   acpUsage: { readonly used: number; readonly size: number } | undefined,
   detailedUsage: AgyContextWindowUsage | undefined,
+  fallbackContextLimit?: number,
 ): ConvertedHistoryUsage | undefined {
+  const normalizedFallback =
+    fallbackContextLimit !== undefined && Number.isFinite(fallbackContextLimit) && fallbackContextLimit > 0
+      ? fallbackContextLimit
+      : 0;
   if (detailedUsage === undefined) {
-    return acpUsage;
+    if (acpUsage === undefined) {
+      return undefined;
+    }
+    const size = acpUsage.size > 0 ? acpUsage.size : normalizedFallback;
+    return { used: acpUsage.used, size };
   }
   const used =
     Number.isFinite(detailedUsage.estimatedTokensUsed) && detailedUsage.estimatedTokensUsed > 0
@@ -1397,7 +1410,9 @@ function buildConvertedHistoryUsage(
   const size =
     Number.isFinite(detailedUsage.maxContextTokens) && detailedUsage.maxContextTokens > 0
       ? detailedUsage.maxContextTokens
-      : (acpUsage?.size ?? 0);
+      : acpUsage !== undefined && acpUsage.size > 0
+        ? acpUsage.size
+        : normalizedFallback;
   const details = mapTokenGroupsToPromptDetails(detailedUsage, used);
   const rawCompletion = detailedUsage.completionTokens;
   const completionTokens =

@@ -130,14 +130,10 @@ describe('contextUsageBreakdown', () => {
           category: 'model',
           name: 'Model',
           currentValue: 'claude-sonnet-4-6-high',
-          options: [{ value: 'claude-sonnet-4-6-high', name: 'Claude Sonnet 4.6 (high)' }],
-        },
-        {
-          id: 'model_gemini',
-          category: 'model',
-          name: 'Model',
-          currentValue: 'gemini-3-pro',
-          options: [{ value: 'gemini-3-pro', name: 'Gemini 3 Pro' }],
+          options: [
+            { value: 'claude-sonnet-4-6-high', name: 'Claude Sonnet 4.6 (high)' },
+            { value: 'gemini-3-pro', name: 'Gemini 3 Pro' },
+          ],
         },
       ],
     } as unknown as AcpBackendInterface;
@@ -178,7 +174,17 @@ describe('contextUsageBreakdown', () => {
 
     expect(claude?.maxContextWindowTokens).toBe(256_000);
     expect(claude?.maxInputTokens).toBe(256_000);
+    expect(provider.getModelContextLimit('antigravity/claude-sonnet-4-6-high')).toBe(256_000);
     expect(changes).toHaveBeenCalledTimes(2);
+
+    // ACP usage_update above old hardcoded 200K/128K heuristics must never be clamped down.
+    provider.recordContextWindow('antigravity/gemini-3-pro', 2_000_000, false);
+    const updatedInfos = provider.provideLanguageModelChatInformation({ silent: true }, token) as vscode.LanguageModelChatInformation[];
+    const gemini = updatedInfos.find((info) => info.id === 'gemini-3-pro');
+    expect(gemini?.maxContextWindowTokens).toBe(2_000_000);
+    expect(gemini?.maxInputTokens).toBe(2_000_000);
+    expect(gemini?.maxOutputTokens).toBe(0);
+
     provider.dispose();
   });
 });

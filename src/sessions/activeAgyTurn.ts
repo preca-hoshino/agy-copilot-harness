@@ -3,8 +3,24 @@ import { AGY_BEFORE_QUERY_PARAM, stripAgyBeforeQuery } from './agyEditTracker.js
 
 type ChatPart = Parameters<vscode.ChatResponseStream['push']>[0];
 
+export interface CarouselPromptResolution {
+  readonly answered: boolean;
+  readonly answers: Record<string, unknown> | undefined;
+}
+
+interface PendingCarouselInteraction {
+  readonly questions: readonly vscode.ChatQuestion[];
+  readonly allowSkip: boolean;
+  readonly questionIds: ReadonlySet<string>;
+  readonly deferred: PromiseWithResolvers<CarouselPromptResolution>;
+  readonly emittedStreams: WeakSet<vscode.ChatResponseStream>;
+  settled: boolean;
+  stopSubscription?: vscode.Disposable | undefined;
+}
+
 export class ActiveAgyTurn {
   private readonly parts = new Set<ChatPart>();
+  private readonly pendingCarousels = new Map<string, PendingCarouselInteraction>();
   private readonly completed = Promise.withResolvers<void>();
   private readonly switchedView = Promise.withResolvers<void>();
   private readonly stopSource = new vscode.CancellationTokenSource();
@@ -12,6 +28,7 @@ export class ActiveAgyTurn {
   private requestStream: vscode.ChatResponseStream | undefined;
   private interruptionToken: vscode.CancellationToken | undefined;
   private lastUsage: vscode.ChatResponseUsage | undefined;
+  private reattached = false;
   private finished = false;
 
   public constructor(
@@ -25,6 +42,14 @@ export class ActiveAgyTurn {
 
   public get permissionStream(): vscode.ChatResponseStream | undefined {
     return this.stopToken.isCancellationRequested ? undefined : this.requestStream;
+  }
+
+  public get isReattached(): boolean {
+    return this.reattached;
+  }
+
+  public hasInteractiveQuestionCarousel(): boolean {
+    return typeof this.stream?.questionCarousel === 'function';
   }
 
   public get stopToken(): vscode.CancellationToken {
@@ -105,9 +130,15 @@ export class ActiveAgyTurn {
     stream: vscode.ChatResponseStream,
     token: vscode.CancellationToken,
   ): Promise<void> => {
+    const supportsInteractiveCarousel = typeof stream.questionCarousel === 'function';
     if (!this.finished) {
-      this.requestStream = undefined;
-      this.switchedView.resolve();
+      this.reattached = true;
+      if (supportsInteractiveCarousel) {
+        this.requestStream = stream;
+      } else {
+        this.requestStream = undefined;
+        this.switchedView.resolve();
+      }
     }
     this.stream = stream;
     for (const part of this.parts) {
@@ -119,6 +150,14 @@ export class ActiveAgyTurn {
     if (this.finished) {
       this.stream = undefined;
       return;
+    }
+
+    for (const entry of this.pendingCarousels.values()) {
+      if (supportsInteractiveCarousel) {
+        this.presentCarouselOnStream(stream, entry);
+      } else {
+        this.settlePendingCarousel(entry, { answered: false, answers: undefined });
+      }
     }
 
     // VS Code defers disposal of a live active response until it is interrupted.
@@ -139,16 +178,127 @@ export class ActiveAgyTurn {
     }
   };
 
+  public async requestQuestionCarousel(
+    interactionId: string,
+    questions: readonly vscode.ChatQuestion[],
+    allowSkip: boolean,
+  ): Promise<CarouselPromptResolution> {
+    if (this.finished || this.stopToken.isCancellationRequested) {
+      return { answered: false, answers: undefined };
+    }
+
+    const questionIds = new Set(questions.map((question) => question.id));
+    const entry: PendingCarouselInteraction = {
+      questions: [...questions],
+      allowSkip,
+      questionIds,
+      deferred: Promise.withResolvers<CarouselPromptResolution>(),
+      emittedStreams: new WeakSet<vscode.ChatResponseStream>(),
+      settled: false,
+    };
+    this.pendingCarousels.set(interactionId, entry);
+    entry.stopSubscription = this.stopToken.onCancellationRequested(() => {
+      this.settlePendingCarousel(entry, { answered: false, answers: undefined });
+    });
+
+    const activeStream = this.stream;
+    if (activeStream !== undefined && typeof activeStream.questionCarousel === 'function') {
+      this.presentCarouselOnStream(activeStream, entry);
+    }
+
+    return await entry.deferred.promise;
+  }
+
+  public resolvePendingCarousel(payload: {
+    readonly questionIds?: readonly string[] | undefined;
+    readonly answers?: Record<string, unknown> | undefined;
+  }): boolean {
+    const answerKeys = payload.answers !== undefined ? Object.keys(payload.answers) : [];
+    const candidateIds =
+      payload.questionIds !== undefined && payload.questionIds.length > 0 ? payload.questionIds : answerKeys;
+
+    for (const entry of this.pendingCarousels.values()) {
+      if (candidateIds.some((id) => entry.questionIds.has(id))) {
+        this.settlePendingCarousel(entry, { answered: true, answers: payload.answers });
+        return true;
+      }
+    }
+
+    if (candidateIds.length === 0 && this.pendingCarousels.size === 1) {
+      const onlyEntry = this.pendingCarousels.values().next().value;
+      if (onlyEntry !== undefined) {
+        this.settlePendingCarousel(onlyEntry, { answered: true, answers: payload.answers });
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private presentCarouselOnStream(targetStream: vscode.ChatResponseStream, entry: PendingCarouselInteraction): void {
+    if (entry.settled || this.finished || typeof targetStream.questionCarousel !== 'function') {
+      return;
+    }
+    if (entry.emittedStreams.has(targetStream)) {
+      return;
+    }
+    entry.emittedStreams.add(targetStream);
+
+    let carouselPromise: Thenable<Record<string, unknown> | undefined>;
+    try {
+      carouselPromise = targetStream.questionCarousel([...entry.questions], entry.allowSkip);
+    } catch {
+      return;
+    }
+
+    void Promise.resolve(carouselPromise).then(
+      (answers) => {
+        if (entry.settled) {
+          return;
+        }
+        if (answers !== undefined && Object.keys(answers).length > 0) {
+          this.settlePendingCarousel(entry, { answered: true, answers });
+          return;
+        }
+        if (this.stream !== targetStream || this.stopToken.isCancellationRequested) {
+          return;
+        }
+        this.settlePendingCarousel(entry, { answered: true, answers: undefined });
+      },
+      () => {
+        // Stream failure / detachment must keep the interaction pending until reattached or answered.
+      },
+    );
+  }
+
+  private settlePendingCarousel(entry: PendingCarouselInteraction, resolution: CarouselPromptResolution): void {
+    if (entry.settled) {
+      return;
+    }
+    entry.settled = true;
+    entry.stopSubscription?.dispose();
+    entry.stopSubscription = undefined;
+    for (const [key, candidate] of this.pendingCarousels.entries()) {
+      if (candidate === entry) {
+        this.pendingCarousels.delete(key);
+      }
+    }
+    entry.deferred.resolve(resolution);
+  }
+
   public stop(): void {
     if (!this.finished && !this.stopToken.isCancellationRequested) {
       this.stopSource.cancel();
       this.switchedView.resolve();
+      for (const entry of [...this.pendingCarousels.values()]) {
+        this.settlePendingCarousel(entry, { answered: false, answers: undefined });
+      }
       this.stopPrompt();
     }
   }
 
   public stopRequestStream(stream: vscode.ChatResponseStream): void {
-    if (this.requestStream === stream) {
+    if (this.requestStream === stream && !this.reattached) {
       this.stop();
     }
   }
@@ -164,6 +314,9 @@ export class ActiveAgyTurn {
     this.stopSource.cancel();
     this.stopSource.dispose();
     this.switchedView.resolve();
+    for (const entry of [...this.pendingCarousels.values()]) {
+      this.settlePendingCarousel(entry, { answered: false, answers: undefined });
+    }
     this.completed.resolve();
   }
 

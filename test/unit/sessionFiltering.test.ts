@@ -229,9 +229,9 @@ vi.mock('vscode', () => {
     LanguageModelToolResult: class {
       public constructor(public readonly content: unknown[]) {}
     },
-    ChatQuestionType: { SingleSelect: 2 },
+    ChatQuestionType: { Text: 1, SingleSelect: 2, MultiSelect: 3 },
     lm: { invokeTool: vi.fn() },
-    window: { showQuickPick: vi.fn() },
+    window: { showQuickPick: vi.fn(), showInputBox: vi.fn() },
     CancellationToken: { None: { isCancellationRequested: false } },
     chat: {
       createChatSessionItemController: createController,
@@ -272,7 +272,14 @@ vi.mock('vscode', () => {
 });
 
 import * as vscode from 'vscode';
-import type { AcpRequestPermissionParams, AcpSessionPromptResult, AcpSessionSummary, AcpSessionUpdate } from '../../src/acp/acpTypes.js';
+import type {
+  AcpElicitRequestParams,
+  AcpElicitResult,
+  AcpRequestPermissionParams,
+  AcpSessionPromptResult,
+  AcpSessionSummary,
+  AcpSessionUpdate,
+} from '../../src/acp/acpTypes.js';
 import type { AgyLanguageModelProvider } from '../../src/models/agyLanguageModelProvider.js';
 import { AgyChatParticipant } from '../../src/sessions/agyChatParticipant.js';
 import { AgySessionContentProvider } from '../../src/sessions/agySessionContentProvider.js';
@@ -283,7 +290,12 @@ import {
   normalizeAcpCwd,
 } from '../../src/sessions/agySessionController.js';
 import type { BrowserSubagentRenderer } from '../../src/sessions/browserSubagentRenderer.js';
-import type { AcpBackendInterface, PermissionPrompt, QuotaServiceInterface } from '../../src/shared/contracts.js';
+import type {
+  AcpBackendInterface,
+  ElicitationPrompt,
+  PermissionPrompt,
+  QuotaServiceInterface,
+} from '../../src/shared/contracts.js';
 
 interface TestMockWorkspace extends Record<string, unknown> {
   workspaceFolders: vscode.WorkspaceFolder[] | undefined;
@@ -1851,6 +1863,169 @@ describe('AgySessionController inputState & workspace filtering', () => {
       expect(acknowledgeCalls[0]).toMatchObject({ id: 'main-sess-1', accept: false });
     } finally {
       source.dispose();
+      participant.dispose();
+      controller.dispose();
+      disposeBackend();
+    }
+  });
+
+  it('preserves pending invokeTool command permission and ask_question elicitation across exit and re-entry without auto-rejecting', async () => {
+    const ws = getMockWorkspace();
+    ws.workspaceFolders = [makeWorkspaceFolder('D:\\repo', 'repo')];
+    const { backend, disposeBackend } = createFakeBackend([
+      { sessionId: 'persist-sess', cwd: 'D:\\repo', title: 'Persist Session' },
+    ]);
+    const finish = Promise.withResolvers<AcpSessionPromptResult>();
+    vi.spyOn(backend, 'prompt').mockReturnValue(finish.promise);
+    vi.spyOn(backend, 'waitForConversationFullyIdle').mockResolvedValue();
+
+    let askPermission: PermissionPrompt | undefined;
+    backend.registerPermissionPrompt = (_id, handler) => {
+      askPermission = handler;
+      return { dispose: () => { askPermission = undefined; } };
+    };
+    let askElicitation: ElicitationPrompt | undefined;
+    backend.registerElicitationPrompt = (_id, handler) => {
+      askElicitation = handler;
+      return { dispose: () => { askElicitation = undefined; } };
+    };
+
+    const controller = new AgySessionController(backend, createFakeOutputChannel(), nodePath.join(os.tmpdir(), 'nonexistent-convs'));
+    await controller.refreshSessions();
+    const participant = new AgyChatParticipant(
+      backend,
+      controller,
+      { resolveModelAndEffort: () => ({ modelValue: '', thoughtLevel: '' }) } as unknown as AgyLanguageModelProvider,
+      { refresh: vi.fn() } as unknown as QuotaServiceInterface,
+      { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer,
+      createFakeOutputChannel(),
+    );
+    const contentProvider = new AgySessionContentProvider(
+      backend,
+      controller,
+      { disposeSession: vi.fn(), isBrowserSubagentCall: () => false } as unknown as BrowserSubagentRenderer,
+      createFakeOutputChannel(),
+      undefined,
+      (id) => participant.getActiveSession(id),
+    );
+
+    const resource = buildSessionResource('persist-sess');
+    const source = new vscode.CancellationTokenSource();
+    const reopenedStop = new vscode.CancellationTokenSource();
+    const historyToken = new vscode.CancellationTokenSource();
+    const toolToken = { token: 'tool-tok-1' } as unknown as vscode.ChatParticipantToolToken;
+    const initialCarouselDeferred = Promise.withResolvers<Record<string, unknown> | undefined>();
+    const reopenedCarouselDeferred = Promise.withResolvers<Record<string, unknown> | undefined>();
+    const firstStream = {
+      push: vi.fn(),
+      questionCarousel: vi.fn(() => initialCarouselDeferred.promise),
+    } as unknown as vscode.ChatResponseStream;
+    const reopenedStream = {
+      push: vi.fn(),
+      questionCarousel: vi.fn(() => reopenedCarouselDeferred.promise),
+    } as unknown as vscode.ChatResponseStream;
+
+    const invokeToolMock = vi.mocked(vscode.lm.invokeTool);
+    invokeToolMock.mockReset();
+    const pendingTool = Promise.withResolvers<vscode.LanguageModelToolResult>();
+    invokeToolMock.mockReturnValueOnce(pendingTool.promise);
+
+    const turnPromise = participant.createHandler()(
+      { prompt: 'Deploy & ask', references: [], toolReferences: [], toolInvocationToken: toolToken } as unknown as vscode.ChatRequest,
+      { history: [], chatSessionContext: { chatSessionItem: { resource, label: 'Persist Session' }, isUntitled: false } },
+      firstStream,
+      source.token,
+    );
+
+    let attached: Promise<void> | undefined;
+    try {
+      await vi.waitFor(() => expect(askPermission).toBeDefined());
+      await vi.waitFor(() => expect(askElicitation).toBeDefined());
+
+      let settledPermission: string | undefined;
+      const permPromise = askPermission?.({
+        sessionId: 'persist-sess',
+        toolCall: { toolCallId: 'cmd-persist', kind: 'execute', name: 'run_command', rawInput: { CommandLine: 'npm run build' } },
+        options: [
+          { optionId: 'allow-1', kind: 'allow_once', name: 'Allow' },
+          { optionId: 'reject-1', kind: 'reject_once', name: 'Reject' },
+        ],
+      }).then((choice) => {
+        settledPermission = choice;
+        return choice;
+      });
+      await vi.waitFor(() => expect(invokeToolMock).toHaveBeenCalledOnce());
+
+      // User exits the session while confirmation is open -> invokeTool rejects with Canceled, but MUST NOT auto-reject.
+      pendingTool.reject(new vscode.CancellationError());
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(settledPermission).toBeUndefined();
+
+      // Elicitation (ask_question) arrives cleanly too.
+      const elicitReq: AcpElicitRequestParams = {
+        sessionId: 'persist-sess',
+        mode: 'form',
+        message: 'The agent has a question.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            q0: {
+              type: 'string',
+              title: 'Framework?',
+              oneOf: [
+                { const: 'vitest', title: 'Vitest' },
+                { const: 'jest', title: 'Jest' },
+              ],
+            },
+            q0_other: { type: 'string', description: 'Optional free-form answer to: Framework?' },
+          },
+          required: ['q0'],
+        },
+      };
+      const elicitPromise = askElicitation?.(elicitReq);
+
+      // Re-enter session -> ActiveAgyTurn.attach re-emits BOTH interactive carousels on reopenedStream!
+      const content = await contentProvider.provideChatSessionContent(resource, historyToken.token, {
+        inputState: controller.controller.createChatSessionInputState([]),
+      });
+      attached = Promise.resolve(content.activeResponseCallback?.(reopenedStream, reopenedStop.token));
+
+      await vi.waitFor(() => expect(reopenedStream.questionCarousel).toHaveBeenCalledTimes(2));
+      const permQuestions = (reopenedStream.questionCarousel as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as vscode.ChatQuestion[];
+      const elicitQuestions = (reopenedStream.questionCarousel as ReturnType<typeof vi.fn>).mock.calls[1]?.[0] as vscode.ChatQuestion[];
+      const permQId = permQuestions[0]?.id ?? '';
+      const elicitQId = elicitQuestions[0]?.id ?? '';
+      expect(permQId.startsWith('agy-terminal:')).toBe(true);
+      expect(elicitQuestions[0]?.allowFreeformInput).toBe(true);
+
+      // Answer both via the restored UI command bridge!
+      expect(participant.resolvePendingCarousel({ questionIds: [permQId], answers: { [permQId]: 'allow-1' } })).toBe(true);
+      expect(
+        participant.resolvePendingCarousel({
+          questionIds: [elicitQId],
+          answers: { [elicitQId]: { selectedValue: 'vitest', freeformValue: 'with coverage' } },
+        }),
+      ).toBe(true);
+
+      await expect(permPromise).resolves.toBe('allow-1');
+      await expect(elicitPromise).resolves.toEqual({
+        action: 'accept',
+        content: { q0: 'vitest', q0_other: 'with coverage' },
+      } satisfies AcpElicitResult);
+
+      finish.resolve({ stopReason: 'end_turn' });
+      await turnPromise;
+      await attached;
+    } finally {
+      initialCarouselDeferred.resolve(undefined);
+      reopenedCarouselDeferred.resolve(undefined);
+      pendingTool.reject(new vscode.CancellationError());
+      finish.resolve({ stopReason: 'end_turn' });
+      await turnPromise;
+      await attached;
+      source.dispose();
+      reopenedStop.dispose();
+      historyToken.dispose();
       participant.dispose();
       controller.dispose();
       disposeBackend();

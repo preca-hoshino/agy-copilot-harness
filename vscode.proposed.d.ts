@@ -2,7 +2,9 @@
 
 declare module 'vscode' {
   export enum ChatQuestionType {
-    SingleSelect = 2
+    Text = 1,
+    SingleSelect = 2,
+    MultiSelect = 3
   }
 
   export interface ChatQuestion {
@@ -12,6 +14,7 @@ declare module 'vscode' {
     message?: string | MarkdownString;
     options?: Array<{ id: string; label: string; value: unknown }>;
     defaultValue?: string | string[];
+    allowFreeformInput?: boolean;
   }
 
   export interface ChatResponsePromptTokenDetail {

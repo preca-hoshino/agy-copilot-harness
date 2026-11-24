@@ -128,4 +128,48 @@ describe('ActiveAgyTurn external edits', () => {
     await attached;
     source.dispose();
   });
+
+  it('preserves pending question carousels across multiple exit/re-attach cycles without dropping them', async () => {
+    const deferred1 = Promise.withResolvers<Record<string, unknown> | undefined>();
+    const deferred2 = Promise.withResolvers<Record<string, unknown> | undefined>();
+    const deferred3 = Promise.withResolvers<Record<string, unknown> | undefined>();
+    const stream1 = {
+      push: vi.fn(),
+      questionCarousel: vi.fn(() => deferred1.promise),
+    } as unknown as vscode.ChatResponseStream;
+    const stream2 = {
+      push: vi.fn(),
+      questionCarousel: vi.fn(() => deferred2.promise),
+    } as unknown as vscode.ChatResponseStream;
+    const stream3 = {
+      push: vi.fn(),
+      questionCarousel: vi.fn(() => deferred3.promise),
+    } as unknown as vscode.ChatResponseStream;
+
+    const turn = new ActiveAgyTurn([], stream1, () => {});
+    const questions = [{ id: 'q-1', type: 2, title: 'Approve?', options: [] }] as unknown as vscode.ChatQuestion[];
+    const pendingPromise = turn.requestQuestionCarousel('req-1', questions, true);
+    expect(stream1.questionCarousel).toHaveBeenCalledOnce();
+
+    // User exits before answering and re-enters once (still doesn't answer), then stream1 settles undefined
+    const source2 = new vscode.CancellationTokenSource();
+    const attach2 = turn.attach(stream2, source2.token);
+    expect(stream2.questionCarousel).toHaveBeenCalledOnce();
+    deferred1.resolve(undefined);
+
+    // User exits again and re-enters on stream3, then resolves via the UI command bridge
+    const source3 = new vscode.CancellationTokenSource();
+    const attach3 = turn.attach(stream3, source3.token);
+    expect(stream3.questionCarousel).toHaveBeenCalledOnce();
+
+    expect(turn.resolvePendingCarousel({ questionIds: ['q-1'], answers: { 'q-1': 'allow_once' } })).toBe(true);
+    await expect(pendingPromise).resolves.toEqual({ answered: true, answers: { 'q-1': 'allow_once' } });
+
+    turn.finish();
+    deferred2.resolve(undefined);
+    deferred3.resolve(undefined);
+    await Promise.all([attach2, attach3]);
+    source2.dispose();
+    source3.dispose();
+  });
 });

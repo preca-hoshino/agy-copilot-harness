@@ -38,7 +38,12 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
     outputChannel: vscode.OutputChannel,
     private readonly attachmentDir?: string,
     private readonly getActiveSession?: (sessionId: string) => ActiveAgySession | undefined,
-    private readonly onContextWindowResolved?: (modelId: string | undefined, size: number) => void,
+    private readonly onContextWindowResolved?: (
+      modelId: string | undefined,
+      size: number,
+      authoritative: boolean,
+    ) => void,
+    private readonly getModelContextLimit?: (modelId: string | undefined) => number | undefined,
   ) {
     this.backend = backend;
     this.controller = controller;
@@ -223,9 +228,17 @@ export class AgySessionContentProvider implements vscode.ChatSessionContentProvi
 
     const loadedModelId = extractModelIdFromLoadResult(loadResult);
     if (detailedUsage !== undefined && detailedUsage.maxContextTokens > 0) {
-      this.onContextWindowResolved?.(loadedModelId, detailedUsage.maxContextTokens);
+      this.onContextWindowResolved?.(loadedModelId, detailedUsage.maxContextTokens, true);
     }
-    const converted = converter.finalizeHistory(loadedModelId, detailedUsage);
+    const fallbackContextLimit = this.getModelContextLimit?.(loadedModelId);
+    const converted = converter.finalizeHistory(loadedModelId, detailedUsage, fallbackContextLimit);
+    if (
+      (detailedUsage === undefined || detailedUsage.maxContextTokens <= 0) &&
+      converted.usage !== undefined &&
+      converted.usage.size > 0
+    ) {
+      this.onContextWindowResolved?.(loadedModelId, converted.usage.size, false);
+    }
 
     const loadedMode = extractModeFromLoadResult(loadResult);
     if (loadedMode !== undefined && loadedMode.length > 0) {

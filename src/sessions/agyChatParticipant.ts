@@ -3,6 +3,9 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type {
   AcpContentBlock,
+  AcpElicitRequestParams,
+  AcpElicitResult,
+  AcpElicitSchemaProperty,
   AcpRequestPermissionParams,
   AcpSessionPromptResult,
   AcpSessionUpdate,
@@ -12,6 +15,7 @@ import type { AgyLanguageModelProvider } from '../models/agyLanguageModelProvide
 import type {
   AcpBackendInterface,
   AgyContextWindowUsage,
+  ElicitationPrompt,
   PermissionPrompt,
   QuotaServiceInterface,
 } from '../shared/contracts.js';
@@ -384,6 +388,35 @@ export class AgyChatParticipant implements vscode.Disposable {
     return turn === undefined ? undefined : { history: turn.history, activeResponseCallback: turn.attach };
   }
 
+  public resolvePendingCarousel(rawPayload: unknown): boolean {
+    if (!isRecordObject(rawPayload)) {
+      return false;
+    }
+    const questionIds = Array.isArray(rawPayload.questionIds)
+      ? rawPayload.questionIds.filter((item): item is string => typeof item === 'string')
+      : undefined;
+    const answers = isRecordObject(rawPayload.answers) ? rawPayload.answers : undefined;
+    const rawSessionResource = typeof rawPayload.sessionResource === 'string' ? rawPayload.sessionResource : undefined;
+    if (rawSessionResource !== undefined && rawSessionResource.length > 0) {
+      try {
+        const parsedUri = vscode.Uri.parse(rawSessionResource);
+        const sessionId = this.controller.resolveSessionId(extractSessionIdFromUri(parsedUri));
+        const turn = this.activeTurns.get(sessionId);
+        if (turn !== undefined) {
+          return turn.resolvePendingCarousel({ questionIds, answers });
+        }
+      } catch {
+        // Fall through to scanning active turns by question ID.
+      }
+    }
+    for (const turn of this.activeTurns.values()) {
+      if (turn.resolvePendingCarousel({ questionIds, answers })) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   public dispose(): void {
     this.disposed = true;
     for (const running of this.runningTurns.values()) {
@@ -478,24 +511,41 @@ export class AgyChatParticipant implements vscode.Disposable {
 
       const selectedModelId = getModelIdSafely(request.model);
       const resolvedModel = this.lmProvider.resolveModelAndEffort(selectedModelId, request.modelConfiguration);
+      const modelKey = selectedModelId ?? resolvedModel.modelValue;
       const previousConfig = this.syncedConfigs.get(sessionId);
       const isFirstTurn = previousConfig === undefined;
 
-      if (resolvedModel.modelValue.length > 0 && (isFirstTurn || previousConfig.model !== resolvedModel.modelValue)) {
-        await this.safeSetConfigOption(sessionId, 'model', resolvedModel.modelValue);
-      }
+      const preTurnUsageSubscription = this.backend.onDidChangeUpdate((event) => {
+        if (event.sessionId !== sessionId || event.update.sessionUpdate !== 'usage_update') {
+          return;
+        }
+        const update = event.update as { readonly size?: unknown };
+        if (typeof update.size === 'number' && Number.isFinite(update.size) && update.size > 0) {
+          this.lmProvider.recordContextWindow(modelKey, update.size, false);
+          if (resolvedModel.modelValue.length > 0 && resolvedModel.modelValue !== modelKey) {
+            this.lmProvider.recordContextWindow(resolvedModel.modelValue, update.size, false);
+          }
+        }
+      });
+      try {
+        if (resolvedModel.modelValue.length > 0 && (isFirstTurn || previousConfig.model !== resolvedModel.modelValue)) {
+          await this.safeSetConfigOption(sessionId, 'model', resolvedModel.modelValue);
+        }
 
-      if (
-        resolvedModel.thoughtLevel.length > 0 &&
-        (isFirstTurn || previousConfig.thoughtLevel !== resolvedModel.thoughtLevel)
-      ) {
-        await this.safeSetConfigOption(sessionId, 'thought_level', resolvedModel.thoughtLevel);
-      }
+        if (
+          resolvedModel.thoughtLevel.length > 0 &&
+          (isFirstTurn || previousConfig.thoughtLevel !== resolvedModel.thoughtLevel)
+        ) {
+          await this.safeSetConfigOption(sessionId, 'thought_level', resolvedModel.thoughtLevel);
+        }
 
-      if (effectiveMode.length > 0 && (isFirstTurn || previousConfig.mode !== effectiveMode)) {
-        const options = await this.backend.setConfigOption(sessionId, 'mode', effectiveMode);
-        const mode = options?.find((option) => option.id === 'mode')?.currentValue ?? effectiveMode;
-        this.controller.setSessionMode(sessionId, mode);
+        if (effectiveMode.length > 0 && (isFirstTurn || previousConfig.mode !== effectiveMode)) {
+          const options = await this.backend.setConfigOption(sessionId, 'mode', effectiveMode);
+          const mode = options?.find((option) => option.id === 'mode')?.currentValue ?? effectiveMode;
+          this.controller.setSessionMode(sessionId, mode);
+        }
+      } finally {
+        preTurnUsageSubscription.dispose();
       }
 
       this.syncedConfigs.set(sessionId, {
@@ -538,7 +588,6 @@ export class AgyChatParticipant implements vscode.Disposable {
       });
 
       let runningRef: RunningTurnState | undefined;
-      const modelKey = selectedModelId ?? resolvedModel.modelValue;
       let latestBreakdown: AgyContextWindowUsage | undefined;
       let lastBreakdownFetchAt = 0;
       let inFlightBreakdown: Promise<void> | undefined;
@@ -549,6 +598,9 @@ export class AgyChatParticipant implements vscode.Disposable {
         latestBreakdown = breakdown;
         if (breakdown.maxContextTokens > 0) {
           this.lmProvider.recordContextWindow(modelKey, breakdown.maxContextTokens, true);
+          if (resolvedModel.modelValue.length > 0 && resolvedModel.modelValue !== modelKey) {
+            this.lmProvider.recordContextWindow(resolvedModel.modelValue, breakdown.maxContextTokens, true);
+          }
         }
         if (emitToTurn && runningRef?.isTurnSuperseded() !== true && runningRef?.isTurnFinished() !== true) {
           turn.usage(buildChatResponseUsage({ totalUsed: breakdown.estimatedTokensUsed, breakdown }));
@@ -611,6 +663,9 @@ export class AgyChatParticipant implements vscode.Disposable {
           latestAcpUsed = usage.used;
           if (typeof usage.size === 'number' && Number.isFinite(usage.size) && usage.size > 0) {
             this.lmProvider.recordContextWindow(modelKey, usage.size, false);
+            if (resolvedModel.modelValue.length > 0 && resolvedModel.modelValue !== modelKey) {
+              this.lmProvider.recordContextWindow(resolvedModel.modelValue, usage.size, false);
+            }
           }
           void refreshUsageBreakdown(false, true);
         },
@@ -658,6 +713,32 @@ export class AgyChatParticipant implements vscode.Disposable {
         } catch (error: unknown) {
           this.outputChannel.appendLine(`[AgyChatParticipant] Permission prompt failed: ${formatError(error)}`);
           return undefined;
+        } finally {
+          const remaining = running.decrementPermissions();
+          if (
+            remaining === 0 &&
+            !running.isTurnSuperseded() &&
+            !running.hasTurnNeedsInput() &&
+            !isTokenCancelled(turn.stopToken) &&
+            this.backend.isReady
+          ) {
+            this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.InProgress);
+          }
+          maybeYield();
+        }
+      };
+
+      const elicitationHandler: ElicitationPrompt = async (elicitation): Promise<AcpElicitResult> => {
+        if (running.isTurnSuperseded() || running.isTurnFinished()) {
+          return { action: 'cancel' };
+        }
+        running.incrementPermissions();
+        this.controller.setSessionStatus(sessionId, vscode.ChatSessionStatus.NeedsInput);
+        try {
+          return await askTurnElicitation(turn, elicitation, this.outputChannel);
+        } catch (error: unknown) {
+          this.outputChannel.appendLine(`[AgyChatParticipant] Elicitation prompt failed: ${formatError(error)}`);
+          return { action: 'decline' };
         } finally {
           const remaining = running.decrementPermissions();
           if (
@@ -741,6 +822,7 @@ export class AgyChatParticipant implements vscode.Disposable {
       });
 
       const permissionSubscription = this.backend.registerPermissionPrompt?.(sessionId, permissionHandler);
+      const elicitationSubscription = this.backend.registerElicitationPrompt?.(sessionId, elicitationHandler);
 
       const fileWriteSubscription = this.backend.registerFileWriteHandler?.(sessionId, async (uri, write) => {
         if (!editTracker.shouldTrackInWorkingSet(uri.fsPath)) {
@@ -771,6 +853,9 @@ export class AgyChatParticipant implements vscode.Disposable {
       ];
       if (permissionSubscription !== undefined) {
         turnDisposables.push(permissionSubscription);
+      }
+      if (elicitationSubscription !== undefined) {
+        turnDisposables.push(elicitationSubscription);
       }
       if (fileWriteSubscription !== undefined) {
         turnDisposables.push(fileWriteSubscription);
@@ -1176,7 +1261,9 @@ async function askTurnPermission(
     message.appendText(`\nWorking directory: ${cwd}`);
   }
 
+  let detachedFromInvokeTool = false;
   if (
+    !turn.isReattached &&
     toolInvocationToken !== undefined &&
     typeof (vscode.lm as { invokeTool?: unknown } | undefined)?.invokeTool === 'function'
   ) {
@@ -1221,8 +1308,13 @@ async function askTurnPermission(
         outputChannel.appendLine(
           `[AgyChatParticipant] Built-in confirmation tool "${toolName}" unavailable, falling back: ${formatError(error)}`,
         );
-      } else if (isCancellationError(error)) {
-        return pickRejectOptionId(permission.options);
+      } else if (isCancellationError(error) || isDetachedToolRequestError(error)) {
+        // Exiting or switching a session disposes the old request and cancels invokeTool without user rejection;
+        // preserve the pending prompt in ActiveAgyTurn so re-entering re-displays it cleanly.
+        detachedFromInvokeTool = true;
+        outputChannel.appendLine(
+          `[AgyChatParticipant] Confirmation tool "${toolName}" detached while session exited; preserving pending prompt.`,
+        );
       } else {
         outputChannel.appendLine(`[AgyChatParticipant] Confirmation tool "${toolName}" failed: ${formatError(error)}`);
         return pickRejectOptionId(permission.options);
@@ -1241,10 +1333,10 @@ async function askTurnPermission(
         })}`
       : requestId;
 
-  const stream = turn.permissionStream;
-  if (typeof stream?.questionCarousel === 'function') {
-    const answers = await Promise.race([
-      askInChat(stream, [
+  if (turn.hasInteractiveQuestionCarousel() || detachedFromInvokeTool) {
+    const resolution = await turn.requestQuestionCarousel(
+      requestId,
+      [
         {
           id,
           type: vscode.ChatQuestionType.SingleSelect,
@@ -1257,19 +1349,20 @@ async function askTurnPermission(
           })),
           defaultValue: permission.options.find((option) => option.kind === 'reject_once')?.optionId ?? '',
         },
-      ]),
-      turn.onViewSwitched.then(() => undefined),
-    ]);
-    if (answers !== undefined && turn.permissionStream === stream) {
-      const choice = answers[id];
-      return typeof choice === 'string' ? choice : undefined;
+      ],
+      true,
+    );
+    if (turn.stopToken.isCancellationRequested) {
+      return undefined;
+    }
+    if (resolution.answered) {
+      return extractSingleSelectChoice(resolution.answers?.[id]);
     }
   }
 
   if (turn.stopToken.isCancellationRequested) {
     return undefined;
   }
-  // Restored chat streams cannot answer the original request's carousel; require a fresh, explicit choice.
   const picked = await vscode.window.showQuickPick(
     permission.options.map((option) => ({
       label: option.name,
@@ -1284,6 +1377,234 @@ async function askTurnPermission(
     turn.stopToken,
   );
   return isTokenCancelled(turn.stopToken) ? undefined : picked?.optionId;
+}
+
+interface ParsedElicitEntry {
+  readonly propKey: string;
+  readonly questionId: string;
+  readonly hasOtherKey: boolean;
+  readonly isMultiSelect: boolean;
+  readonly isSelect: boolean;
+  readonly title: string;
+  readonly description: string | undefined;
+  readonly options: ReadonlyArray<{ readonly id: string; readonly label: string }>;
+  readonly defaultValue: string | string[] | undefined;
+}
+
+function buildElicitEntry(
+  promptKey: string,
+  propKey: string,
+  prop: AcpElicitSchemaProperty,
+  allProperties: Readonly<Record<string, AcpElicitSchemaProperty>>,
+  index: number,
+): ParsedElicitEntry {
+  const hasOtherKey = Object.hasOwn(allProperties, `${propKey}_other`);
+  const isMultiSelect = prop.type === 'array';
+  const choiceSource = isMultiSelect ? prop.items : prop;
+  const options: Array<{ id: string; label: string }> = [];
+  if (choiceSource?.oneOf !== undefined) {
+    for (const item of choiceSource.oneOf) {
+      options.push({ id: item.const, label: item.title ?? item.const });
+    }
+  } else if (choiceSource?.anyOf !== undefined) {
+    for (const item of choiceSource.anyOf) {
+      options.push({ id: item.const, label: item.title ?? item.const });
+    }
+  } else if (choiceSource?.enum !== undefined) {
+    choiceSource.enum.forEach((value, idx) => {
+      options.push({ id: value, label: choiceSource.enumNames?.[idx] ?? value });
+    });
+  }
+  const isSelect = options.length > 0;
+  let defaultValue: string | string[] | undefined;
+  if (typeof prop.default === 'string') {
+    defaultValue = prop.default;
+  } else if (Array.isArray(prop.default) && prop.default.every((item) => typeof item === 'string')) {
+    defaultValue = [...prop.default];
+  }
+
+  return {
+    propKey,
+    questionId: `agy-elicit:${promptKey}:${propKey}`,
+    hasOtherKey,
+    isMultiSelect,
+    isSelect,
+    title: prop.title ?? `Question ${index + 1}`,
+    description: prop.description,
+    options,
+    defaultValue,
+  };
+}
+
+async function askTurnElicitation(
+  turn: ActiveAgyTurn,
+  elicitation: AcpElicitRequestParams,
+  outputChannel: vscode.OutputChannel,
+): Promise<AcpElicitResult> {
+  const promptKey = crypto.randomUUID();
+  const rawProperties = elicitation.requestedSchema.properties;
+  const entries = Object.entries(rawProperties)
+    .filter(([key]) => !(key.endsWith('_other') && Object.hasOwn(rawProperties, key.slice(0, -6))))
+    .map(([key, prop], index) => buildElicitEntry(promptKey, key, prop, rawProperties, index));
+
+  if (entries.length === 0) {
+    outputChannel.appendLine('[AgyChatParticipant] Received empty elicitation schema; declining.');
+    return { action: 'decline' };
+  }
+
+  if (turn.hasInteractiveQuestionCarousel()) {
+    const questions: vscode.ChatQuestion[] = entries.map((entry, index) => {
+      const messageText =
+        entry.description ?? (index === 0 && elicitation.message.length > 0 ? elicitation.message : undefined);
+      const questionType = !entry.isSelect
+        ? vscode.ChatQuestionType.Text
+        : entry.isMultiSelect
+          ? vscode.ChatQuestionType.MultiSelect
+          : vscode.ChatQuestionType.SingleSelect;
+      return {
+        id: entry.questionId,
+        type: questionType,
+        title: entry.title,
+        ...(messageText !== undefined ? { message: new vscode.MarkdownString(messageText) } : {}),
+        ...(entry.options.length > 0
+          ? {
+              options: entry.options.map((opt) => ({
+                id: opt.id,
+                label: opt.label,
+                value: opt.id,
+              })),
+            }
+          : {}),
+        ...(entry.defaultValue !== undefined ? { defaultValue: entry.defaultValue } : {}),
+        ...(entry.hasOtherKey ? { allowFreeformInput: true } : {}),
+      };
+    });
+
+    const resolution = await turn.requestQuestionCarousel(promptKey, questions, true);
+    if (turn.stopToken.isCancellationRequested) {
+      return { action: 'cancel' };
+    }
+    if (resolution.answered) {
+      if (resolution.answers === undefined) {
+        return { action: 'decline' };
+      }
+      const content = extractElicitationContent(entries, resolution.answers);
+      return Object.keys(content).length > 0 ? { action: 'accept', content } : { action: 'decline' };
+    }
+  }
+
+  if (turn.stopToken.isCancellationRequested) {
+    return { action: 'cancel' };
+  }
+
+  const content: Record<string, unknown> = {};
+  for (const entry of entries) {
+    if (entry.isSelect) {
+      const picked = entry.isMultiSelect
+        ? await vscode.window.showQuickPick(
+            entry.options.map((opt) => ({ label: opt.label, optionId: opt.id })),
+            { canPickMany: true, placeHolder: entry.description ?? entry.title, ignoreFocusOut: true },
+            turn.stopToken,
+          )
+        : await vscode.window.showQuickPick(
+            entry.options.map((opt) => ({ label: opt.label, optionId: opt.id })),
+            { placeHolder: entry.description ?? entry.title, ignoreFocusOut: true },
+            turn.stopToken,
+          );
+      if (isTokenCancelled(turn.stopToken)) {
+        return { action: 'cancel' };
+      }
+      if (picked === undefined) {
+        return { action: 'decline' };
+      }
+      content[entry.propKey] = Array.isArray(picked)
+        ? picked.map((item) => (item as { optionId: string }).optionId)
+        : (picked as { optionId: string }).optionId;
+    } else {
+      const text = await vscode.window.showInputBox(
+        {
+          prompt: entry.description ?? entry.title,
+          placeHolder: entry.title,
+          ignoreFocusOut: true,
+        },
+        turn.stopToken,
+      );
+      if (isTokenCancelled(turn.stopToken)) {
+        return { action: 'cancel' };
+      }
+      if (text === undefined) {
+        return { action: 'decline' };
+      }
+      content[entry.propKey] = text;
+    }
+  }
+
+  return { action: 'accept', content };
+}
+
+function extractElicitationContent(
+  entries: readonly ParsedElicitEntry[],
+  answers: Record<string, unknown>,
+): Record<string, unknown> {
+  const content: Record<string, unknown> = {};
+  for (const entry of entries) {
+    const raw = answers[entry.questionId];
+    if (raw === undefined) {
+      continue;
+    }
+    if (entry.isMultiSelect) {
+      if (Array.isArray(raw)) {
+        const selected = raw.filter((item): item is string => typeof item === 'string');
+        if (selected.length > 0) {
+          content[entry.propKey] = selected;
+        }
+      } else if (isRecordObject(raw)) {
+        const selected = Array.isArray(raw.selectedValues)
+          ? raw.selectedValues.filter((item): item is string => typeof item === 'string')
+          : [];
+        if (selected.length > 0) {
+          content[entry.propKey] = selected;
+        }
+        if (typeof raw.freeformValue === 'string' && raw.freeformValue.trim().length > 0) {
+          content[entry.hasOtherKey ? `${entry.propKey}_other` : entry.propKey] = raw.freeformValue;
+        }
+      }
+      continue;
+    }
+
+    if (entry.isSelect) {
+      if (typeof raw === 'string' && raw.length > 0) {
+        content[entry.propKey] = raw;
+      } else if (isRecordObject(raw)) {
+        if (typeof raw.selectedValue === 'string' && raw.selectedValue.length > 0) {
+          content[entry.propKey] = raw.selectedValue;
+        }
+        if (typeof raw.freeformValue === 'string' && raw.freeformValue.trim().length > 0) {
+          content[entry.hasOtherKey ? `${entry.propKey}_other` : entry.propKey] = raw.freeformValue;
+        }
+      }
+      continue;
+    }
+
+    if (typeof raw === 'string' && raw.length > 0) {
+      content[entry.propKey] = raw;
+    }
+  }
+  return content;
+}
+
+function extractSingleSelectChoice(raw: unknown): string | undefined {
+  if (typeof raw === 'string') {
+    return raw.length > 0 ? raw : undefined;
+  }
+  if (isRecordObject(raw) && typeof raw.selectedValue === 'string' && raw.selectedValue.length > 0) {
+    return raw.selectedValue;
+  }
+  return undefined;
+}
+
+function isDetachedToolRequestError(error: unknown): boolean {
+  return /unknown chat (session|request)/i.test(formatError(error));
 }
 
 function pickApproveOptionId(options: readonly AcpRequestPermissionParams['options'][number][]): string | undefined {
@@ -1322,17 +1643,6 @@ function isCancellationError(error: unknown): boolean {
     return true;
   }
   return error instanceof Error && (error.name === 'Canceled' || error.message === 'Canceled');
-}
-
-async function askInChat(
-  stream: vscode.ChatResponseStream,
-  questions: vscode.ChatQuestion[],
-): Promise<Record<string, unknown> | undefined> {
-  try {
-    return (await stream.questionCarousel(questions, true)) ?? {};
-  } catch {
-    return undefined;
-  }
 }
 
 function reconstructSlashCommandPrompt(request: vscode.ChatRequest): string {

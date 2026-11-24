@@ -204,9 +204,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     outputChannel,
     attachmentDir,
     (sessionId) => chatParticipant.getActiveSession(sessionId),
-    (modelId, maxContextTokens): void => {
-      lmProvider.recordContextWindow(modelId, maxContextTokens, true);
+    (modelId, maxContextTokens, authoritative): void => {
+      lmProvider.recordContextWindow(modelId, maxContextTokens, authoritative);
     },
+    (modelId): number | undefined => lmProvider.getModelContextLimit(modelId),
   );
   const configuredAppDataDir = vscode.workspace
     .getConfiguration('antigravityHarness')
@@ -323,6 +324,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await sessionController.handleEditingAction(sessionResourceRaw, actionRaw);
       },
     ),
+    vscode.commands.registerCommand('antigravityHarness._resolveQuestionCarousel', (payload?: unknown): boolean => {
+      return chatParticipant.resolvePendingCarousel(payload);
+    }),
     vscode.commands.registerCommand(
       'antigravityHarness.openMediaPreview',
       async (mediaArg?: unknown, titleArg?: unknown): Promise<void> => {
