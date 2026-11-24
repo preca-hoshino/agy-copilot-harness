@@ -38,7 +38,13 @@ vi.mock('vscode', () => {
 import type * as vscode from 'vscode';
 import type { AcpSessionUpdate } from '../../src/acp/acpTypes.js';
 import { AgyLanguageModelProvider } from '../../src/models/agyLanguageModelProvider.js';
-import { AgyQuotaService, clusterModelQuotas, parseGetUserStatusPayload, parseQuotaSummary } from '../../src/quota/agyQuotaService.js';
+import {
+  AgyQuotaService,
+  clusterModelQuotas,
+  parseAvailableModelsPayload,
+  parseGetUserStatusPayload,
+  parseQuotaSummary,
+} from '../../src/quota/agyQuotaService.js';
 import type { AcpBackendInterface, ModelQuotaInfo } from '../../src/shared/contracts.js';
 
 const NOW_MS = Date.parse('2026-11-19T12:00:00.000Z');
@@ -586,9 +592,17 @@ describe('AgyQuotaService', () => {
 
       expect(snapshot.signedIn).toBe(true);
       expect(snapshot.source).toBe('daemon-hub');
-      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
       expect(fetchMock).toHaveBeenCalledWith(
         'http://127.0.0.1:52345/exa.language_server_pb.LanguageServerService/GetUserStatus',
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            'x-codeium-csrf-token': 'alive-hub-csrf',
+          }),
+        }),
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        'http://127.0.0.1:52345/exa.language_server_pb.LanguageServerService/GetAvailableModels',
         expect.objectContaining({
           headers: expect.objectContaining({
             'x-codeium-csrf-token': 'alive-hub-csrf',
@@ -600,5 +614,68 @@ describe('AgyQuotaService', () => {
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it('merges maxTokens and maxOutputTokens from agy.exe GetAvailableModels without hardcoded limits', async () => {
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith('/GetUserStatus')) {
+        return new Response(JSON.stringify(buildRealisticPayload()), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.endsWith('/GetAvailableModels')) {
+        return new Response(
+          JSON.stringify({
+            response: {
+              models: {
+                'gemini-4-neon-high': {
+                  displayName: 'Gemini 4 Neon',
+                  model: 'MODEL_GEMINI_4_NEON',
+                  maxTokens: 2_000_000,
+                  maxOutputTokens: 131_072,
+                },
+                'claude-opus-5-5': {
+                  displayName: 'Claude Opus 5.5 (Thinking)',
+                  model: 'MODEL_CLAUDE_OPUS_5_5',
+                  maxTokens: 512_000,
+                  maxOutputTokens: 64_000,
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response(JSON.stringify({ response: { groups: [] } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const parsed = parseAvailableModelsPayload({
+      response: { models: { custom: { displayName: 'Custom', maxTokens: 384_000, maxOutputTokens: 48_000 } } },
+    });
+    expect(parsed).toEqual([
+      { modelKey: 'custom', displayName: 'Custom', maxTokens: 384_000, maxOutputTokens: 48_000 },
+    ]);
+
+    const backend = createMockBackend(45123, 'secret-csrf');
+    const service = new AgyQuotaService(backend, createMockOutputChannel(), path.join(os.tmpdir(), 'missing-daemon'));
+    await service.refresh(true);
+    const provider = new AgyLanguageModelProvider(backend, service);
+    const infos = await provider.provideLanguageModelChatInformation(
+      { silent: true },
+      { isCancellationRequested: false } as vscode.CancellationToken,
+    );
+    const opus = infos?.find((entry) => entry.id === 'MODEL_CLAUDE_OPUS_5_5');
+    expect(opus?.maxContextWindowTokens).toBe(512_000);
+    expect(opus?.maxInputTokens).toBe(512_000);
+    expect(opus?.maxOutputTokens).toBe(64_000);
+
+    provider.dispose();
+    service.dispose();
   });
 });

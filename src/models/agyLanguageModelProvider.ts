@@ -24,12 +24,6 @@ interface ModelVariantGroup {
   readonly variants: EffortVariant[];
 }
 
-interface TokenLimits {
-  readonly maxInputTokens: number;
-  readonly maxOutputTokens: number;
-  readonly maxContextWindowTokens: number;
-}
-
 export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvider, vscode.Disposable {
   private readonly backend: AcpBackendInterface;
   private readonly quotaService: QuotaServiceInterface;
@@ -212,6 +206,23 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
     }
   }
 
+  public getModelContextLimit(modelId: string | undefined): number | undefined {
+    if (modelId === undefined || modelId.trim().length === 0) {
+      return undefined;
+    }
+    const normalized = stripVendorPrefix(modelId).trim().toLowerCase();
+    const authoritative = this.authoritativeContextWindows.get(normalized);
+    if (authoritative !== undefined) {
+      return authoritative;
+    }
+    const snapshot = this.quotaService.latestSnapshot;
+    const quota = this.findMatchingQuotaInfo(normalized, normalized, snapshot.models);
+    if (quota?.maxTokens !== undefined && quota.maxTokens > 0) {
+      return quota.maxTokens;
+    }
+    return this.reportedContextWindows.get(normalized);
+  }
+
   public dispose(): void {
     for (const disposable of this.disposables) {
       disposable.dispose();
@@ -230,12 +241,38 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
       return direct;
     }
 
-    const normalizedId = modelId.toLowerCase();
+    const normalizedId = stripVendorPrefix(modelId).toLowerCase();
     const normalizedName = modelName.toLowerCase();
-    return models.find(
+    const exactMatch = models.find(
       (candidate) =>
-        candidate.modelId.toLowerCase() === normalizedId || candidate.label.toLowerCase() === normalizedName,
+        stripVendorPrefix(candidate.modelId).toLowerCase() === normalizedId ||
+        candidate.label.toLowerCase() === normalizedName,
     );
+    if (exactMatch !== undefined) {
+      return exactMatch;
+    }
+    const baseName = normalizedName.replace(EFFORT_SUFFIX, '').trim();
+    return models.find((candidate) => candidate.label.replace(EFFORT_SUFFIX, '').trim().toLowerCase() === baseName);
+  }
+
+  private resolveCatalogTokenLimits(params: {
+    readonly quotaInfo: ModelQuotaInfo | undefined;
+    readonly effortVariants: readonly EffortVariant[];
+  }): { readonly maxTokens?: number | undefined; readonly maxOutputTokens?: number | undefined } {
+    const models = this.quotaService.latestSnapshot.models;
+    let maxTokens = params.quotaInfo?.maxTokens;
+    let maxOutputTokens = params.quotaInfo?.maxOutputTokens;
+    for (const variant of params.effortVariants) {
+      if (maxTokens !== undefined && maxOutputTokens !== undefined) {
+        break;
+      }
+      const match = this.findMatchingQuotaInfo(variant.model.value, variant.model.name, models);
+      if (match !== undefined) {
+        maxTokens ??= match.maxTokens;
+        maxOutputTokens ??= match.maxOutputTokens;
+      }
+    }
+    return { maxTokens, maxOutputTokens };
   }
 
   private buildModelInformation(params: {
@@ -249,7 +286,7 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
     readonly effortVariants: readonly EffortVariant[];
     readonly signedIn: boolean;
   }): vscode.LanguageModelChatInformation {
-    const limits = inferTokenLimits(params.id, params.name);
+    const catalogLimits = this.resolveCatalogTokenLimits(params);
     const authoritativeSize =
       this.authoritativeContextWindows.get(params.id.toLowerCase()) ??
       params.effortVariants
@@ -257,14 +294,14 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
         .find((value): value is number => value !== undefined);
     const reportedSize =
       authoritativeSize ??
+      catalogLimits.maxTokens ??
       this.reportedContextWindows.get(params.id.toLowerCase()) ??
       params.effortVariants
         .map((variant) => this.reportedContextWindows.get(variant.model.value.toLowerCase()))
         .find((value): value is number => value !== undefined);
-    const maxContextWindowTokens = reportedSize ?? limits.maxContextWindowTokens;
-    const fallbackMaxInputTokens =
-      reportedSize !== undefined ? Math.min(limits.maxInputTokens, reportedSize) : limits.maxInputTokens;
-    const maxInputTokens = authoritativeSize ?? fallbackMaxInputTokens;
+    const maxContextWindowTokens = reportedSize;
+    const maxInputTokens = reportedSize ?? 0;
+    const maxOutputTokens = catalogLimits.maxOutputTokens ?? 0;
     const family = inferModelFamily(params.id, params.name);
     const icon = MODEL_FAMILY_ICONS[family];
     const efforts = [...new Set(params.effortVariants.map((variant) => variant.effort))];
@@ -279,8 +316,8 @@ export class AgyLanguageModelProvider implements vscode.LanguageModelChatProvide
       ...(icon !== undefined && icon.length > 0 ? { statusIcon: new vscode.ThemeIcon(icon) } : {}),
       version: '1.0.0',
       maxInputTokens,
-      maxOutputTokens: limits.maxOutputTokens,
-      maxContextWindowTokens,
+      maxOutputTokens,
+      ...(maxContextWindowTokens !== undefined ? { maxContextWindowTokens } : {}),
       tooltip,
       isUserSelectable: true,
       targetChatSessionType: 'antigravity',
@@ -494,34 +531,6 @@ function inferModelFamily(id: string, name: string): string {
     return 'gpt';
   }
   return 'antigravity';
-}
-
-function inferTokenLimits(id: string, name: string): TokenLimits {
-  const combined = `${id} ${name}`.toLowerCase();
-  if (
-    combined.includes('gemini') ||
-    combined.includes('argon') ||
-    combined.includes('neon') ||
-    combined.includes('hydrogen')
-  ) {
-    return {
-      maxInputTokens: 1_000_000,
-      maxOutputTokens: 65_536,
-      maxContextWindowTokens: 1_048_576,
-    };
-  }
-  if (combined.includes('claude') || combined.includes('opus') || combined.includes('sonnet')) {
-    return {
-      maxInputTokens: 200_000,
-      maxOutputTokens: 32_768,
-      maxContextWindowTokens: 200_000,
-    };
-  }
-  return {
-    maxInputTokens: 128_000,
-    maxOutputTokens: 32_768,
-    maxContextWindowTokens: 128_000,
-  };
 }
 
 function buildModelDetail(description: string | undefined, quotaInfo: ModelQuotaInfo | undefined): string | undefined {

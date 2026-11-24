@@ -26,6 +26,18 @@ interface HubDaemonInfo {
   mtimeMs: number;
 }
 
+export interface AvailableModelLimits {
+  readonly modelKey: string;
+  readonly modelId?: string | undefined;
+  readonly displayName?: string | undefined;
+  readonly maxTokens?: number | undefined;
+  readonly maxOutputTokens?: number | undefined;
+  readonly remainingFraction?: number | undefined;
+  readonly resetTime?: string | undefined;
+  readonly supportsThinking?: boolean | undefined;
+  readonly supportsImages?: boolean | undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -213,7 +225,9 @@ function snapshotsEqual(prev: AccountQuotaSnapshot, next: AccountQuotaSnapshot):
       a.modelId !== b.modelId ||
       a.description !== b.description ||
       a.remainingFraction !== b.remainingFraction ||
-      a.resetTime !== b.resetTime
+      a.resetTime !== b.resetTime ||
+      a.maxTokens !== b.maxTokens ||
+      a.maxOutputTokens !== b.maxOutputTokens
     ) {
       return false;
     }
@@ -348,6 +362,107 @@ export function parseQuotaSummary(payload: unknown): QuotaPoolSummary[] {
   return [...pools.values()];
 }
 
+/** Parses `LanguageServerService/GetAvailableModels` payload to extract real per-model token limits from `agy.exe`. */
+export function parseAvailableModelsPayload(payload: unknown): AvailableModelLimits[] {
+  if (!isRecord(payload)) {
+    return [];
+  }
+  const inner = isRecord(payload.response) ? payload.response : payload;
+  if (!isRecord(inner.models)) {
+    return [];
+  }
+
+  const parsed: AvailableModelLimits[] = [];
+  for (const [modelKey, rawDetails] of Object.entries(inner.models)) {
+    if (!isRecord(rawDetails)) {
+      continue;
+    }
+    const maxTokens = getFiniteNumber(rawDetails.maxTokens);
+    const maxOutputTokens = getFiniteNumber(rawDetails.maxOutputTokens);
+    const modelId = getNonEmptyString(rawDetails.model);
+    const displayName = getNonEmptyString(rawDetails.displayName);
+    const quotaInfo = isRecord(rawDetails.quotaInfo) ? rawDetails.quotaInfo : undefined;
+    const rawRemaining = quotaInfo !== undefined ? getFiniteNumber(quotaInfo.remainingFraction) : undefined;
+    const resetTime = quotaInfo !== undefined ? getNonEmptyString(quotaInfo.resetTime) : undefined;
+    const supportsThinking = typeof rawDetails.supportsThinking === 'boolean' ? rawDetails.supportsThinking : undefined;
+    const supportsImages = typeof rawDetails.supportsImages === 'boolean' ? rawDetails.supportsImages : undefined;
+
+    parsed.push({
+      modelKey,
+      ...(modelId !== undefined ? { modelId } : {}),
+      ...(displayName !== undefined ? { displayName } : {}),
+      ...(maxTokens !== undefined && maxTokens > 0 ? { maxTokens } : {}),
+      ...(maxOutputTokens !== undefined && maxOutputTokens > 0 ? { maxOutputTokens } : {}),
+      ...(rawRemaining !== undefined ? { remainingFraction: clampFraction(rawRemaining) } : {}),
+      ...(resetTime !== undefined ? { resetTime } : {}),
+      ...(supportsThinking !== undefined ? { supportsThinking } : {}),
+      ...(supportsImages !== undefined ? { supportsImages } : {}),
+    });
+  }
+  return parsed;
+}
+
+function normalizeModelLookupKey(value: string): string {
+  return value
+    .replace(/\s*\([^)]*\)\s*/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function mergeAvailableModelLimits(models: ModelQuotaInfo[], available: readonly AvailableModelLimits[]): void {
+  const unmatched = new Set<AvailableModelLimits>(available);
+
+  for (const quotaModel of models) {
+    const exactId = quotaModel.modelId.trim().toLowerCase();
+    const exactLabel = quotaModel.label.trim().toLowerCase();
+    const baseLabel = normalizeModelLookupKey(quotaModel.label);
+
+    const match =
+      available.find(
+        (entry) =>
+          entry.modelKey.trim().toLowerCase() === exactId ||
+          entry.modelId?.trim().toLowerCase() === exactId ||
+          entry.displayName?.trim().toLowerCase() === exactLabel ||
+          entry.modelKey.trim().toLowerCase() === exactLabel,
+      ) ??
+      available.find((entry) => {
+        const displayBase = entry.displayName !== undefined ? normalizeModelLookupKey(entry.displayName) : undefined;
+        const keyBase = normalizeModelLookupKey(entry.modelKey);
+        return (displayBase !== undefined && displayBase === baseLabel) || keyBase === baseLabel;
+      });
+
+    if (match === undefined) {
+      continue;
+    }
+    unmatched.delete(match);
+    if (match.maxTokens !== undefined && match.maxTokens > 0) {
+      quotaModel.maxTokens = match.maxTokens;
+    }
+    if (match.maxOutputTokens !== undefined && match.maxOutputTokens > 0) {
+      quotaModel.maxOutputTokens = match.maxOutputTokens;
+    }
+  }
+
+  for (const extra of unmatched) {
+    if (extra.maxTokens === undefined && extra.maxOutputTokens === undefined) {
+      continue;
+    }
+    const id = extra.modelId ?? extra.modelKey;
+    const label = extra.displayName ?? extra.modelKey;
+    models.push({
+      label,
+      modelId: id,
+      remainingFraction: extra.remainingFraction ?? 1,
+      ...(extra.resetTime !== undefined ? { resetTime: extra.resetTime } : {}),
+      ...(extra.supportsThinking !== undefined ? { supportsThinking: extra.supportsThinking } : {}),
+      ...(extra.supportsImages !== undefined ? { supportsImages: extra.supportsImages } : {}),
+      ...(extra.maxTokens !== undefined ? { maxTokens: extra.maxTokens } : {}),
+      ...(extra.maxOutputTokens !== undefined ? { maxOutputTokens: extra.maxOutputTokens } : {}),
+    });
+  }
+}
+
 /**
  * Parses a raw `LanguageServerService/GetUserStatus` JSON payload into an `AccountQuotaSnapshot`.
  */
@@ -430,6 +545,8 @@ export function parseGetUserStatusPayload(
     const supportsThinking = typeof item.supportsThinking === 'boolean' ? item.supportsThinking : undefined;
     const supportsImages =
       typeof item.supportsImages === 'boolean' ? item.supportsImages : inferSupportsImages(item.supportedMimeTypes);
+    const maxTokens = getFiniteNumber(item.maxTokens);
+    const maxOutputTokens = getFiniteNumber(item.maxOutputTokens);
 
     models.push({
       label,
@@ -439,6 +556,8 @@ export function parseGetUserStatusPayload(
       resetTime,
       supportsThinking,
       supportsImages,
+      ...(maxTokens !== undefined && maxTokens > 0 ? { maxTokens } : {}),
+      ...(maxOutputTokens !== undefined && maxOutputTokens > 0 ? { maxOutputTokens } : {}),
     });
   }
 
@@ -645,14 +764,41 @@ export class AgyQuotaService implements QuotaServiceInterface, vscode.Disposable
 
       const snapshot = parseGetUserStatusPayload(parsed ?? {}, source);
       if (snapshot.signedIn) {
-        const pools = await this.fetchQuotaSummary(port, csrfToken);
+        const [pools, availableLimits] = await Promise.all([
+          this.fetchQuotaSummary(port, csrfToken),
+          this.fetchAvailableModels(port, csrfToken),
+        ]);
         if (pools.length > 0) {
           snapshot.pools = pools;
+        }
+        if (availableLimits.length > 0) {
+          mergeAvailableModelLimits(snapshot.models, availableLimits);
         }
       }
       return snapshot;
     } finally {
       clearTimeout(timeoutId);
+    }
+  }
+
+  private async fetchAvailableModels(port: number, csrfToken: string): Promise<AvailableModelLimits[]> {
+    try {
+      const response = await fetch(
+        `http://127.0.0.1:${port}/exa.language_server_pb.LanguageServerService/GetAvailableModels`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Connect-Protocol-Version': '1',
+            'x-codeium-csrf-token': csrfToken,
+          },
+          body: '{}',
+          signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
+        },
+      );
+      return response.ok ? parseAvailableModelsPayload(await response.json()) : [];
+    } catch {
+      return [];
     }
   }
 
