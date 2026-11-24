@@ -4,8 +4,15 @@ import { randomUUID } from 'node:crypto';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import type { FileWriteHandler, PermissionPrompt } from '../shared/contracts.js';
-import type { AcpPermissionOption, AcpRequestPermissionParams } from './acpTypes.js';
+import type { ElicitationPrompt, FileWriteHandler, PermissionPrompt } from '../shared/contracts.js';
+import type {
+  AcpElicitRequestParams,
+  AcpElicitRequestedSchema,
+  AcpElicitResult,
+  AcpElicitSchemaProperty,
+  AcpPermissionOption,
+  AcpRequestPermissionParams,
+} from './acpTypes.js';
 import { JsonRpcError } from './jsonRpcTransport.js';
 
 const DEFAULT_OUTPUT_BYTE_LIMIT = 1024 * 1024;
@@ -235,6 +242,106 @@ function parseRequestPermissionParams(params: unknown): AcpRequestPermissionPara
           : undefined,
     },
     options: parsePermissionOptions(params.options),
+  };
+}
+
+function parseElicitEnumOptions(prop: Record<string, unknown>): {
+  readonly enumValues?: string[];
+  readonly enumNames?: string[];
+  readonly oneOf?: Array<{ const: string; title?: string }>;
+} {
+  const result: { enumValues?: string[]; enumNames?: string[]; oneOf?: Array<{ const: string; title?: string }> } = {};
+  if (Array.isArray(prop.enum) && prop.enum.every((item) => typeof item === 'string')) {
+    result.enumValues = [...prop.enum];
+  }
+  if (Array.isArray(prop.enumNames) && prop.enumNames.every((item) => typeof item === 'string')) {
+    result.enumNames = [...prop.enumNames];
+  }
+  const choiceList = Array.isArray(prop.oneOf) ? prop.oneOf : Array.isArray(prop.anyOf) ? prop.anyOf : undefined;
+  if (choiceList !== undefined) {
+    const parsedChoices: Array<{ const: string; title?: string }> = [];
+    for (const item of choiceList) {
+      if (isRecord(item) && typeof item.const === 'string') {
+        parsedChoices.push({
+          const: item.const,
+          ...(typeof item.title === 'string' ? { title: item.title } : {}),
+        });
+      }
+    }
+    if (parsedChoices.length > 0) {
+      result.oneOf = parsedChoices;
+    }
+  }
+  return result;
+}
+
+function parseElicitSchemaProperty(raw: unknown): AcpElicitSchemaProperty | undefined {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+  const parsed: AcpElicitSchemaProperty = {
+    ...(typeof raw.type === 'string' ? { type: raw.type } : {}),
+    ...(typeof raw.title === 'string' ? { title: raw.title } : {}),
+    ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
+    ...(raw.default !== undefined ? { default: raw.default } : {}),
+  };
+  const enumInfo = parseElicitEnumOptions(raw);
+  if (enumInfo.enumValues !== undefined) {
+    parsed.enum = enumInfo.enumValues;
+  }
+  if (enumInfo.enumNames !== undefined) {
+    parsed.enumNames = enumInfo.enumNames;
+  }
+  if (enumInfo.oneOf !== undefined) {
+    parsed.oneOf = enumInfo.oneOf;
+  }
+  if (isRecord(raw.items)) {
+    const items = parseElicitSchemaProperty(raw.items);
+    if (items !== undefined) {
+      parsed.items = items;
+    }
+  }
+  return parsed;
+}
+
+function parseElicitRequestParams(params: unknown): AcpElicitRequestParams {
+  if (!isRecord(params)) {
+    throw new JsonRpcError(-32602, 'Invalid params for elicitation/create');
+  }
+  const meta = isRecord(params._meta) ? params._meta : undefined;
+  const sessionId =
+    typeof params.sessionId === 'string' && params.sessionId.length > 0
+      ? params.sessionId
+      : meta !== undefined && typeof meta.sessionId === 'string' && meta.sessionId.length > 0
+        ? meta.sessionId
+        : undefined;
+  const message = typeof params.message === 'string' ? params.message : '';
+  const rawSchema = isRecord(params.requestedSchema) ? params.requestedSchema : {};
+  const properties: Record<string, AcpElicitSchemaProperty> = {};
+  if (isRecord(rawSchema.properties)) {
+    for (const [key, value] of Object.entries(rawSchema.properties)) {
+      const parsedProp = parseElicitSchemaProperty(value);
+      if (parsedProp !== undefined) {
+        properties[key] = parsedProp;
+      }
+    }
+  }
+  const requestedSchema: AcpElicitRequestedSchema = {
+    ...(typeof rawSchema.type === 'string' ? { type: rawSchema.type } : {}),
+    properties,
+    ...(Array.isArray(rawSchema.required)
+      ? { required: rawSchema.required.filter((item): item is string => typeof item === 'string') }
+      : {}),
+  };
+  return {
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    ...(typeof params.toolCallId === 'string' ? { toolCallId: params.toolCallId } : {}),
+    ...(typeof params.mode === 'string' ? { mode: params.mode } : {}),
+    message,
+    requestedSchema,
+    ...(typeof params.url === 'string' ? { url: params.url } : {}),
+    ...(typeof params.elicitationId === 'string' ? { elicitationId: params.elicitationId } : {}),
+    ...(meta !== undefined ? { _meta: meta } : {}),
   };
 }
 
@@ -472,6 +579,7 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
   private readonly terminalManager: AgyTerminalManager;
   private readonly sessionModes = new Map<string, string>();
   private readonly permissionPrompts = new Map<string, PermissionPrompt>();
+  private readonly elicitationPrompts = new Map<string, ElicitationPrompt>();
   private readonly fileWriteHandlers = new Map<string, FileWriteHandler>();
 
   public constructor(outputChannel: vscode.OutputChannel, terminalManager?: AgyTerminalManager) {
@@ -492,6 +600,15 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
     return new vscode.Disposable(() => {
       if (this.permissionPrompts.get(sessionId) === prompt) {
         this.permissionPrompts.delete(sessionId);
+      }
+    });
+  }
+
+  public registerElicitationPrompt(sessionId: string, prompt: ElicitationPrompt): vscode.Disposable {
+    this.elicitationPrompts.set(sessionId, prompt);
+    return new vscode.Disposable(() => {
+      if (this.elicitationPrompts.get(sessionId) === prompt) {
+        this.elicitationPrompts.delete(sessionId);
       }
     });
   }
@@ -523,6 +640,8 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
         return this.terminalManager.release(parseTerminalId(params));
       case 'session/request_permission':
         return await this.handleRequestPermission(params);
+      case 'elicitation/create':
+        return await this.handleCreateElicitation(params);
       default:
         throw new JsonRpcError(-32601, `Unsupported ACP client method: ${method}`);
     }
@@ -532,6 +651,7 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
     this.terminalManager.dispose();
     this.sessionModes.clear();
     this.permissionPrompts.clear();
+    this.elicitationPrompts.clear();
     this.fileWriteHandlers.clear();
   }
 
@@ -636,6 +756,80 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
     }
 
     return { outcome: { outcome: 'selected', optionId: picked.optionId } };
+  }
+
+  private async handleCreateElicitation(params: unknown): Promise<AcpElicitResult> {
+    const req = parseElicitRequestParams(params);
+    if (req.sessionId !== undefined) {
+      const prompt = this.elicitationPrompts.get(req.sessionId);
+      if (prompt !== undefined) {
+        return await prompt(req);
+      }
+    }
+
+    const content: Record<string, unknown> = {};
+    const entries = Object.entries(req.requestedSchema.properties).filter(
+      ([key, prop]) =>
+        !(
+          key.endsWith('_other') &&
+          Object.hasOwn(req.requestedSchema.properties, key.slice(0, -6)) &&
+          prop.type === 'string'
+        ),
+    );
+
+    if (entries.length === 0) {
+      return { action: 'decline' };
+    }
+
+    for (const [key, prop] of entries) {
+      const promptTitle = prop.description ?? prop.title ?? (req.message.length > 0 ? req.message : key);
+      const isMulti = prop.type === 'array';
+      const choiceSource = isMulti ? prop.items : prop;
+      const choices: Array<{ label: string; id: string }> = [];
+      if (choiceSource?.oneOf !== undefined) {
+        for (const option of choiceSource.oneOf) {
+          choices.push({ id: option.const, label: option.title ?? option.const });
+        }
+      } else if (choiceSource?.enum !== undefined) {
+        choiceSource.enum.forEach((value, idx) => {
+          choices.push({ id: value, label: choiceSource.enumNames?.[idx] ?? value });
+        });
+      }
+
+      if (choices.length > 0) {
+        if (isMulti) {
+          const picked = await vscode.window.showQuickPick(
+            choices.map((choice) => ({ label: choice.label, id: choice.id })),
+            { canPickMany: true, placeHolder: promptTitle, ignoreFocusOut: true },
+          );
+          if (picked === undefined) {
+            return { action: 'decline' };
+          }
+          content[key] = picked.map((item) => item.id);
+        } else {
+          const picked = await vscode.window.showQuickPick(
+            choices.map((choice) => ({ label: choice.label, id: choice.id })),
+            { placeHolder: promptTitle, ignoreFocusOut: true },
+          );
+          if (picked === undefined) {
+            return { action: 'decline' };
+          }
+          content[key] = picked.id;
+        }
+      } else {
+        const entered = await vscode.window.showInputBox({
+          prompt: promptTitle,
+          placeHolder: prop.title ?? key,
+          ignoreFocusOut: true,
+        });
+        if (entered === undefined) {
+          return { action: 'decline' };
+        }
+        content[key] = entered;
+      }
+    }
+
+    return { action: 'accept', content };
   }
 
   private shouldAutoApprove(mode: string, toolCall: AcpRequestPermissionParams['toolCall']): boolean {

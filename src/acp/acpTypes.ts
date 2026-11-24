@@ -249,3 +249,43 @@ export interface AcpSessionPromptResult {
   stopReason?: string | undefined;
   [key: string]: unknown;
 }
+
+export interface AcpElicitEnumOption {
+  const: string;
+  title?: string | undefined;
+}
+
+export interface AcpElicitSchemaProperty {
+  type?: string | undefined;
+  title?: string | undefined;
+  description?: string | undefined;
+  default?: unknown;
+  enum?: string[] | undefined;
+  enumNames?: string[] | undefined;
+  oneOf?: AcpElicitEnumOption[] | undefined;
+  anyOf?: AcpElicitEnumOption[] | undefined;
+  items?: AcpElicitSchemaProperty | undefined;
+  [key: string]: unknown;
+}
+
+export interface AcpElicitRequestedSchema {
+  type?: string | undefined;
+  properties: Record<string, AcpElicitSchemaProperty>;
+  required?: string[] | undefined;
+}
+
+export interface AcpElicitRequestParams {
+  sessionId?: string | undefined;
+  toolCallId?: string | undefined;
+  mode?: string | undefined;
+  message: string;
+  requestedSchema: AcpElicitRequestedSchema;
+  url?: string | undefined;
+  elicitationId?: string | undefined;
+  _meta?: Record<string, unknown> | undefined;
+}
+
+export interface AcpElicitResult {
+  action: 'accept' | 'decline' | 'cancel';
+  content?: Record<string, unknown> | undefined;
+}

@@ -104,4 +104,32 @@ describe('ACP client file writes', () => {
       handler.dispose();
     }
   });
+
+  it('routes elicitation/create requests to the registered session prompt handler', async () => {
+    const handler = createHandler();
+    const received: unknown[] = [];
+    const reg = handler.registerElicitationPrompt('sess-elicit', async (req) => {
+      received.push(req);
+      return { action: 'accept', content: { q0: 'vitest' } };
+    });
+    try {
+      const result = await handler.handleRequest('elicitation/create', {
+        sessionId: 'sess-elicit',
+        mode: 'form',
+        message: 'The agent has a question.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            q0: { type: 'string', title: 'Runner?', enum: ['vitest', 'jest'], enumNames: ['Vitest', 'Jest'] },
+          },
+          required: ['q0'],
+        },
+      });
+      expect(result).toEqual({ action: 'accept', content: { q0: 'vitest' } });
+      expect(received).toHaveLength(1);
+    } finally {
+      reg.dispose();
+      handler.dispose();
+    }
+  });
 });

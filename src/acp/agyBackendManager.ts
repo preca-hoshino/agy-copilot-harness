@@ -15,6 +15,7 @@ import type {
   AgySlashCommandDescriptor,
   AgyTokenGroupUsage,
   AgyTurnFileDiff,
+  ElicitationPrompt,
   FileWriteHandler,
   PermissionPrompt,
 } from '../shared/contracts.js';
@@ -438,6 +439,10 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
 
   public registerPermissionPrompt(sessionId: string, prompt: PermissionPrompt): vscode.Disposable {
     return this.capabilitiesHandler.registerPermissionPrompt(sessionId, prompt);
+  }
+
+  public registerElicitationPrompt(sessionId: string, prompt: ElicitationPrompt): vscode.Disposable {
+    return this.capabilitiesHandler.registerElicitationPrompt(sessionId, prompt);
   }
 
   public registerFileWriteHandler(sessionId: string, handler: FileWriteHandler): vscode.Disposable {
@@ -1099,6 +1104,9 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
             writeTextFile: true,
           },
           terminal: true,
+          elicitation: {
+            form: {},
+          },
         },
       });
 

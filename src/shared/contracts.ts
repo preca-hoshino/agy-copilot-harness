@@ -2,6 +2,8 @@ import type * as vscode from 'vscode';
 import type {
   AcpConfigOption,
   AcpContentBlock,
+  AcpElicitRequestParams,
+  AcpElicitResult,
   AcpRequestPermissionParams,
   AcpSessionListResult,
   AcpSessionLoadResult,
@@ -14,6 +16,7 @@ export const EXTENSION_ID = 'antigravity.agy-copilot-harness';
 export const AUTH_PROVIDER_ID = 'google-antigravity';
 
 export type PermissionPrompt = (request: AcpRequestPermissionParams) => Promise<string | undefined>;
+export type ElicitationPrompt = (request: AcpElicitRequestParams) => Promise<AcpElicitResult>;
 export type FileWriteHandler = (uri: vscode.Uri, write: () => Promise<void>) => Promise<void>;
 
 export interface AgySlashCommandDescriptor {
@@ -61,6 +64,8 @@ export interface ModelQuotaInfo {
   resetTime?: string | undefined;
   supportsThinking?: boolean | undefined;
   supportsImages?: boolean | undefined;
+  maxTokens?: number | undefined;
+  maxOutputTokens?: number | undefined;
 }
 
 export interface QuotaPoolSummary {
@@ -99,6 +104,7 @@ export interface AcpBackendInterface {
   readonly onDidChangeUpdate: vscode.Event<{ sessionId: string; update: AcpSessionUpdate }>;
   readonly onDidChangeBackendState: vscode.Event<{ ready: boolean; error?: string | undefined }>;
   registerPermissionPrompt?: (sessionId: string, prompt: PermissionPrompt) => vscode.Disposable;
+  registerElicitationPrompt?: (sessionId: string, prompt: ElicitationPrompt) => vscode.Disposable;
   registerFileWriteHandler?: (sessionId: string, handler: FileWriteHandler) => vscode.Disposable;
   getAvailableCommands?: (sessionId?: string) => AgySlashCommandDescriptor[];
   onDidChangeAvailableCommands?: (listener: () => void) => vscode.Disposable;
