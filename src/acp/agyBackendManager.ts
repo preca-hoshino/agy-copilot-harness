@@ -12,6 +12,7 @@ import type {
   AcpBackendInterface,
   AgyContextWindowUsage,
   AgyForkConversationResult,
+  AgyModelTokenTotal,
   AgySlashCommandDescriptor,
   AgyTokenGroupUsage,
   AgyTurnFileDiff,
@@ -337,6 +338,56 @@ function extractLatestOutputTokensFromMetadata(payload: Record<string, unknown> 
   return undefined;
 }
 
+function extractModelTotalsFromMetadata(payload: Record<string, unknown> | undefined): AgyModelTokenTotal[] {
+  const rawList: unknown = payload?.generatorMetadata;
+  if (!Array.isArray(rawList)) {
+    return [];
+  }
+  const byModel = new Map<string, { model: string; inputTokens: number; cachedTokens: number; outputTokens: number }>();
+  for (const entry of rawList) {
+    if (!isRecord(entry) || !isRecord(entry.chatModel) || !isRecord(entry.chatModel.usage)) {
+      continue;
+    }
+    const usage = entry.chatModel.usage;
+    const completionConfig = isRecord(entry.chatModel.completionConfig) ? entry.chatModel.completionConfig : undefined;
+    const rawModel =
+      (typeof entry.chatModel.model === 'string' && entry.chatModel.model.trim().length > 0
+        ? entry.chatModel.model.trim()
+        : undefined) ??
+      (typeof completionConfig?.model === 'string' && completionConfig.model.trim().length > 0
+        ? completionConfig.model.trim()
+        : undefined) ??
+      (typeof usage.model === 'string' && usage.model.trim().length > 0 ? usage.model.trim() : undefined) ??
+      'Antigravity';
+
+    const inputTokens = parseNonNegativeTokenCount(usage.inputTokens) ?? 0;
+    const cachedTokens = parseNonNegativeTokenCount(usage.cacheReadTokens) ?? 0;
+    const outputTokens =
+      parseNonNegativeTokenCount(usage.outputTokens) ??
+      (parseNonNegativeTokenCount(usage.thinkingOutputTokens) ?? 0) +
+        (parseNonNegativeTokenCount(usage.responseOutputTokens) ?? 0);
+
+    if (inputTokens === 0 && cachedTokens === 0 && outputTokens === 0) {
+      continue;
+    }
+
+    const existing = byModel.get(rawModel);
+    if (existing !== undefined) {
+      existing.inputTokens += inputTokens;
+      existing.cachedTokens += cachedTokens;
+      existing.outputTokens += outputTokens;
+    } else {
+      byModel.set(rawModel, {
+        model: rawModel,
+        inputTokens,
+        cachedTokens,
+        outputTokens,
+      });
+    }
+  }
+  return [...byModel.values()];
+}
+
 function parseConfigOptionChoices(rawChoices: unknown[]): AcpConfigOption['options'] {
   const choices: AcpConfigOption['options'] = [];
   for (const choice of rawChoices) {
@@ -417,6 +468,7 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
   private readonly idleWaits = new Set<AbortController>();
   private readonly availableCommandsBySession = new Map<string, AgySlashCommandDescriptor[]>();
   private latestAvailableCommands: AgySlashCommandDescriptor[] = [];
+  private readonly clientAutoSessions = new Set<string>();
 
   public constructor(storagePath: string, outputChannel: vscode.OutputChannel) {
     this.storagePath = storagePath;
@@ -434,6 +486,11 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
   }
 
   public setSessionMode(sessionId: string, mode: string): void {
+    if (mode === 'auto') {
+      this.clientAutoSessions.add(sessionId);
+    } else {
+      this.clientAutoSessions.delete(sessionId);
+    }
     this.capabilitiesHandler.setSessionMode(sessionId, mode);
   }
 
@@ -564,11 +621,13 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
     value: string,
   ): Promise<AcpConfigOption[] | undefined> {
     await this.ensureStarted();
+    const isClientAutoMode = configId === 'mode' && value === 'auto';
+    const wireValue = isClientAutoMode ? 'default' : value;
     const rawResult = await this.runSerializedBootOp(async () => {
       return await this.requireTransport().sendRequest<unknown>('session/set_config_option', {
         sessionId,
         configId,
-        value,
+        value: wireValue,
       });
     });
 
@@ -583,8 +642,19 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
       this.lastKnownConfigOptions = updatedOptions;
     }
     if (configId === 'mode') {
-      const confirmedMode = updatedOptions?.find((option) => option.id === configId)?.currentValue;
-      this.capabilitiesHandler.setSessionMode(sessionId, confirmedMode ?? value);
+      if (isClientAutoMode) {
+        this.clientAutoSessions.add(sessionId);
+        this.capabilitiesHandler.setSessionMode(sessionId, 'auto');
+        if (updatedOptions !== undefined) {
+          updatedOptions = updatedOptions.map((option) =>
+            option.id === 'mode' ? { ...option, currentValue: 'auto' } : option,
+          );
+        }
+      } else {
+        this.clientAutoSessions.delete(sessionId);
+        const confirmedMode = updatedOptions?.find((option) => option.id === configId)?.currentValue;
+        this.capabilitiesHandler.setSessionMode(sessionId, confirmedMode ?? value);
+      }
     }
     return updatedOptions;
   }
@@ -929,22 +999,27 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
     }
 
     let completionTokens: number | undefined;
+    let modelTotals: AgyModelTokenTotal[] = [];
+    const metadataOffset =
+      parsed.generatorMetadataIndex !== undefined ? Math.max(0, parsed.generatorMetadataIndex - 50) : 0;
     if (parsed.generatorMetadataIndex !== undefined) {
       const metadataPayload = await this.callLanguageServerJson(
         '/exa.language_server_pb.LanguageServerService/GetCascadeTrajectoryGeneratorMetadata',
         {
           cascadeId: trimmedSessionId,
-          generatorMetadataOffset: Math.max(0, parsed.generatorMetadataIndex - 1),
+          generatorMetadataOffset: metadataOffset,
           includeMessages: false,
         },
         1500,
       );
       completionTokens = extractLatestOutputTokensFromMetadata(metadataPayload);
+      modelTotals = extractModelTotalsFromMetadata(metadataPayload);
     }
 
     return {
       ...parsed.usage,
       ...(completionTokens !== undefined ? { completionTokens } : {}),
+      ...(modelTotals.length > 0 ? { modelTotals } : {}),
     };
   }
 
@@ -1269,10 +1344,19 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
       return;
     }
 
+    let emittedUpdate: Record<string, unknown> = update;
     if (update.sessionUpdate === 'config_option_update' && Array.isArray(update.configOptions)) {
       this.lastKnownConfigOptions = parseConfigOptions(update.configOptions);
     } else if (update.sessionUpdate === 'current_mode_update' && typeof update.currentModeId === 'string') {
-      this.capabilitiesHandler.setSessionMode(sessionId, update.currentModeId);
+      const effectiveModeId =
+        this.clientAutoSessions.has(sessionId) && update.currentModeId === 'default' ? 'auto' : update.currentModeId;
+      if (effectiveModeId !== 'auto') {
+        this.clientAutoSessions.delete(sessionId);
+      }
+      this.capabilitiesHandler.setSessionMode(sessionId, effectiveModeId);
+      if (effectiveModeId !== update.currentModeId) {
+        emittedUpdate = { ...update, currentModeId: effectiveModeId };
+      }
     } else if (update.sessionUpdate === 'available_commands_update' && Array.isArray(update.availableCommands)) {
       const normalized: AgySlashCommandDescriptor[] = [];
       for (const item of update.availableCommands) {
@@ -1305,7 +1389,7 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
     }
 
     const sessionUpdate: AcpSessionUpdate = {
-      ...update,
+      ...emittedUpdate,
       sessionUpdate: update.sessionUpdate,
     };
 
@@ -1316,15 +1400,17 @@ export class AgyBackendManager implements AcpBackendInterface, vscode.Disposable
   }
 
   private syncSessionMetadata(result: AcpSessionLoadResult): void {
+    const preserveClientAuto = (modeId: string): string =>
+      this.clientAutoSessions.has(result.sessionId) && modeId === 'default' ? 'auto' : modeId;
     if (result.configOptions !== undefined) {
       this.lastKnownConfigOptions = result.configOptions;
       const modeOption = result.configOptions.find((opt) => opt.id === 'mode');
       if (modeOption !== undefined) {
-        this.capabilitiesHandler.setSessionMode(result.sessionId, modeOption.currentValue);
+        this.capabilitiesHandler.setSessionMode(result.sessionId, preserveClientAuto(modeOption.currentValue));
       }
     }
     if (result.modes !== undefined) {
-      this.capabilitiesHandler.setSessionMode(result.sessionId, result.modes.currentModeId);
+      this.capabilitiesHandler.setSessionMode(result.sessionId, preserveClientAuto(result.modes.currentModeId));
     }
   }
 

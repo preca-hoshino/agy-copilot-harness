@@ -344,6 +344,7 @@ describe('backend fully-idle waiting', () => {
         maxContextTokens: 256_000,
         estimatedAfterCompaction: 12_000,
         completionTokens: 2_450,
+        modelTotals: [{ model: 'Antigravity', inputTokens: 60_000, cachedTokens: 0, outputTokens: 2_450 }],
         tokenGroups: [
           { name: 'System Prompt', type: 'TOKEN_TYPE_SYSTEM_PROMPT', source: 'TOKEN_SOURCE_SYSTEM', numTokens: 8_000 },
           { name: 'Chat Messages', type: 'TOKEN_TYPE_CHAT_MESSAGES', source: 'TOKEN_SOURCE_USER', numTokens: 54_000 },

@@ -713,7 +713,9 @@ export class ClientCapabilitiesHandler implements vscode.Disposable {
     const activeMode = this.sessionModes.get(req.sessionId) ?? configuredDefaultMode;
 
     if (this.shouldAutoApprove(activeMode, req.toolCall)) {
-      const allowOption = req.options.find((opt) => opt.kind === 'allow_once');
+      const allowOption =
+        req.options.find((opt) => opt.kind === 'allow_once') ??
+        req.options.find((opt) => opt.kind === 'allow_always');
       if (allowOption !== undefined) {
         this.outputChannel.appendLine(
           `[Permission] Auto-approved (${activeMode}) tool call "${req.toolCall.title ?? req.toolCall.name ?? req.toolCall.toolCallId}" via option "${allowOption.optionId}"`,
