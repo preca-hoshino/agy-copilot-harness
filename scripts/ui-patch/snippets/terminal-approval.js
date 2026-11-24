@@ -73,4 +73,37 @@ function buildTerminalApprovalSnippet({ invocation, source }, { sessionType }) {
   return body;
 }
 
-module.exports = { buildTerminalApprovalSnippet, createTerminalApproval };
+function buildRemoteTerminalApprovalSnippet({ slice, session, req, silent }, { invocation, source }, { sessionType }) {
+  const body = `if(${session}?.sessionResource&&${sessionType}(${session}.sessionResource)==="antigravity"&&${req}){
+    const _agyConvert=${createTerminalApproval.toString()};
+    ${slice}=${slice}.map(_agyItem=>{
+      if(_agyItem?.kind==="questionCarousel"&&_agyItem.questions?.length===1&&_agyItem.questions[0]?.id?.startsWith("agy-terminal:")){
+        if(!${req}.response)${session}.acceptResponseProgress(${req},{kind:"markdownContent",content:{value:"",isTrusted:!1}},void 0,${silent});
+        const _agyApproval=_agyConvert(_agyItem,${req}.id,${req}.response,${invocation},${source}.External,(_reqId,_resId,_ans)=>void this.commandService.executeCommand("antigravityHarness._resolveQuestionCarousel",{sessionResource:${session}.sessionResource.toString(),requestId:_reqId,resolveId:_resId,questionIds:_agyItem.questions.map(_q=>_q.id),answers:_ans}));
+        if(_agyApproval)return _agyApproval;
+      }
+      return _agyItem;
+    });
+  }`;
+  const check = validateSnippetSyntax(body, '(function(){', '})', 'remote terminal approval');
+  if (!check.ok) {
+    throw new Error(check.reason);
+  }
+  return body;
+}
+
+function buildQuestionCarouselNotifySnippet({ reqId, resolveId, answers }, { sessionType }) {
+  const body = `;for(const _agyModel of this._sessionModels.values()){if(${sessionType}(_agyModel.sessionResource)==="antigravity"){const _agyReq=_agyModel.getRequests().find(_r=>_r.id===${reqId});if(_agyReq&&!_agyReq.response?.isComplete){const _agyPart=_agyReq.response?.response?.value?.find(_p=>_p?.kind==="questionCarousel"&&_p.resolveId===${resolveId});void this.commandService.executeCommand("antigravityHarness._resolveQuestionCarousel",{sessionResource:_agyModel.sessionResource.toString(),requestId:${reqId},resolveId:${resolveId},questionIds:_agyPart?.questions?.map(_q=>_q.id),answers:${answers}});break}}}`;
+  const check = validateSnippetSyntax(body, '(function(){', '})', 'question carousel notify');
+  if (!check.ok) {
+    throw new Error(check.reason);
+  }
+  return body;
+}
+
+module.exports = {
+  buildQuestionCarouselNotifySnippet,
+  buildRemoteTerminalApprovalSnippet,
+  buildTerminalApprovalSnippet,
+  createTerminalApproval,
+};

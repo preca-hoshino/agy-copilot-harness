@@ -13,6 +13,11 @@ const {
   resolveModePermissionsViewModel,
   buildModePermissionsActionItems,
 } = requireFromProject('./scripts/patch-sessions-ui.js');
+const {
+  buildQuestionCarouselNotifySnippet,
+  buildRemoteTerminalApprovalSnippet,
+  buildTerminalApprovalSnippet,
+} = requireFromProject('./scripts/ui-patch/snippets/terminal-approval.js');
 const { buildSessionsPanelSnippet } = requireFromProject('./scripts/ui-patch/snippets/sessions-panel.js');
 const {
   buildEditingActionNotifySnippet,
@@ -103,6 +108,98 @@ describe('native terminal approval', () => {
     dismissed.invocation.confirmation.confirm({ type: 5 });
     expect(dismissed.send).toHaveBeenCalledExactlyOnceWith('request-1', 'resolve-1', { [dismissed.id]: 'no' });
     expect(dismissed.invocation.didExecuteTool).not.toHaveBeenCalled();
+  });
+
+  it('bridges terminal approval and question carousel answers in restored ChatService streams for antigravity only', () => {
+    const remoteSnippet = buildRemoteTerminalApprovalSnippet(
+      { slice: 'D', session: 'e', req: 'c', silent: 'x' },
+      { invocation: 'FakeInvocation', source: 'ToolSource' },
+      { sessionType: 'getSessionType' },
+    );
+    const notifySnippet = buildQuestionCarouselNotifySnippet(
+      { reqId: 'e', resolveId: 't', answers: 'i' },
+      { sessionType: 'getSessionType' },
+    );
+    expect(remoteSnippet).toContain('agy-terminal:');
+    expect(remoteSnippet).toContain('antigravityHarness._resolveQuestionCarousel');
+    expect(notifySnippet).toContain('!_agyReq.response?.isComplete');
+
+    const executed: Array<{ cmd: string; payload: unknown }> = [];
+    const options = [{ optionId: 'yes', kind: 'allow_once' }, { optionId: 'no', kind: 'reject_once' }];
+    const termQId = `agy-terminal:${JSON.stringify({ command: 'ls', cwd: 'D:\\repo', options })}`;
+    const fakeReq = {
+      id: 'req-restored',
+      response: {
+        isComplete: false,
+        onDidChange: () => ({ dispose() {} }),
+        response: {
+          value: [{ kind: 'questionCarousel', resolveId: 'res-elicit', questions: [{ id: 'agy-ask-1' }] }],
+        },
+      },
+    };
+    const fakeSessionModel = {
+      sessionResource: { scheme: 'antigravity', toString: () => 'antigravity:/s1' },
+      acceptResponseProgress: vi.fn(),
+      getRequests: () => [fakeReq],
+    };
+
+    const harness = {
+      sessionModels: new Map([['antigravity:/s1', fakeSessionModel]]),
+      executed,
+      runRemote(D: unknown[], e: typeof fakeSessionModel, c: typeof fakeReq, x: boolean) {
+        const ctx = { commandService: { executeCommand: (cmd: string, payload: unknown) => { executed.push({ cmd, payload }); return Promise.resolve(); } } };
+        const fn = new Function(
+          'D', 'e', 'c', 'x', 'FakeInvocation', 'ToolSource', 'getSessionType',
+          `return (function(){${remoteSnippet} return D;}).call(this);`,
+        );
+        return fn.call(ctx, D, e, c, x, FakeInvocation, { External: 'ext' }, (r: { scheme: string }) => r.scheme);
+      },
+      runNotify(e: string, t: string, i: unknown) {
+        const ctx = {
+          _sessionModels: harness.sessionModels,
+          commandService: { executeCommand: (cmd: string, payload: unknown) => { executed.push({ cmd, payload }); return Promise.resolve(); } },
+        };
+        const fn = new Function('e', 't', 'i', 'getSessionType', `return (function(){${notifySnippet}}).call(this);`);
+        return fn.call(ctx, e, t, i, (r: { scheme: string }) => r.scheme);
+      },
+    };
+
+    const transformed = harness.runRemote(
+      [{ kind: 'questionCarousel', resolveId: 'res-term', questions: [{ id: termQId, options: [{ id: 'yes', value: 'yes', label: 'Yes' }] }] }],
+      fakeSessionModel,
+      fakeReq,
+      false,
+    ) as FakeInvocation[];
+    expect(transformed[0]).toBeInstanceOf(FakeInvocation);
+    transformed[0]?.confirmation.confirm({ type: 4, selectedButton: 'yes' });
+    expect(executed[0]).toEqual({
+      cmd: 'antigravityHarness._resolveQuestionCarousel',
+      payload: {
+        sessionResource: 'antigravity:/s1',
+        requestId: 'req-restored',
+        resolveId: 'res-term',
+        questionIds: [termQId],
+        answers: { [termQId]: 'yes' },
+      },
+    });
+
+    harness.runNotify('req-restored', 'res-elicit', { 'agy-ask-1': 'vitest' });
+    expect(executed[1]).toEqual({
+      cmd: 'antigravityHarness._resolveQuestionCarousel',
+      payload: {
+        sessionResource: 'antigravity:/s1',
+        requestId: 'req-restored',
+        resolveId: 'res-elicit',
+        questionIds: ['agy-ask-1'],
+        answers: { 'agy-ask-1': 'vitest' },
+      },
+    });
+
+    // Completed response disposal must NOT trigger spurious skip/resolve.
+    fakeReq.response.isComplete = true;
+    harness.runNotify('req-restored', 'res-elicit', undefined);
+    expect(executed).toHaveLength(2);
+    expect(buildTerminalApprovalSnippet({ invocation: 'FakeInvocation', source: 'ToolSource' }, { sessionType: 'getSessionType' })).toContain('agy-terminal:');
   });
 });
 

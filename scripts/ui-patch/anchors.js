@@ -24,6 +24,14 @@ const COMMON_ANCHORS = {
     /let\{progress:n,chatSession:r,isSubagent:a\}=i,c=\[\],l=r\?\.getRequests\(\)\.find\(u=>u\.id===e\)\?\.response;for\(let u of t\)\{let\[p,h\]=Array\.isArray\(u\)\?u:\[u\];(?=if\(p\.kind==="externalEdits"\))/g,
     'MainThreadChatAgents2.$handleProgressChunk terminal approval',
   ],
+  remoteTerminalApproval: [
+    /let (?<slice>[$\w]+)=[$\w]+\.slice\([$\w]+\);(?=for\(let (?<item>[$\w]+) of \k<slice>\)(?<session>[$\w]+)\?\.acceptResponseProgress\((?<req>[$\w]+),\k<item>,void 0,(?<silent>[$\w]+)\))/g,
+    'ChatService.trackRemoteSession terminal approval',
+  ],
+  questionCarouselNotify: [
+    /\bnotifyQuestionCarouselAnswer\((?<reqId>[$\w]+),(?<resolveId>[$\w]+),(?<answers>[$\w]+)\)\{this\._onDidReceiveQuestionCarouselAnswer\.fire\(\{requestId:\k<reqId>,resolveId:\k<resolveId>,answers:\k<answers>\}\)(?=\})/g,
+    'ChatService.notifyQuestionCarouselAnswer antigravity bridge',
+  ],
   terminalInvocation: [
     /source:(?<source>[A-Za-z_$][\w$]*)\.External,displayName:e\.toolName,modelDescription:e\.toolName\},r=new (?<invocation>[A-Za-z_$][\w$]*)\(\{invocationMessage:e\.invocationMessage,pastTenseMessage:e\.pastTenseMessage,toolSpecificData:e\.toolSpecificData\}/g,
     'external tool invocation constructor and source',

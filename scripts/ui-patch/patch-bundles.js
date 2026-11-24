@@ -10,7 +10,11 @@ const {
 } = require('./snippets/sessions-provider');
 const { buildSessionHistoryUsageSnippet } = require('./snippets/session-usage');
 const { buildStatusBarTooltipSnippet } = require('./snippets/status-tooltip');
-const { buildTerminalApprovalSnippet } = require('./snippets/terminal-approval');
+const {
+  buildQuestionCarouselNotifySnippet,
+  buildRemoteTerminalApprovalSnippet,
+  buildTerminalApprovalSnippet,
+} = require('./snippets/terminal-approval');
 const {
   buildEditingActionNotifySnippet,
   buildExternalEditBaselineSnippet,
@@ -37,6 +41,20 @@ function commonInsertions(matches) {
     [matches.statusBar.end, 'status-bar', buildStatusBarTooltipSnippet('status bar tooltip')],
     [matches.trustedAuth.end, 'trusted-auth', buildTrustedAuthAccessSnippet('trusted auth')],
     [matches.terminalApproval.end, 'terminal-approval', buildTerminalApprovalSnippet(matches.terminalInvocation.groups, matches.sessionType.groups)],
+    [
+      matches.remoteTerminalApproval.end,
+      'remote-terminal-approval',
+      buildRemoteTerminalApprovalSnippet(
+        matches.remoteTerminalApproval.groups,
+        matches.terminalInvocation.groups,
+        matches.sessionType.groups,
+      ),
+    ],
+    [
+      matches.questionCarouselNotify.end,
+      'question-carousel-notify',
+      buildQuestionCarouselNotifySnippet(matches.questionCarouselNotify.groups, matches.sessionType.groups),
+    ],
     // VS Code 1.147 drops controller icons in transit; override even the cached terminal fallback on both the session model and row renderer.
     [agentSessionIcon.end, 'agent-session-icon', `if(${modelSession}.providerType==="antigravity")${modelSession}={...${modelSession},icon:{id:"antigravity-logo"}};`],
     [sessionHarnessIcon.end, 'session-harness-icon', `if(${session}.providerType==="antigravity")${icon}={id:"antigravity-logo"};`],
