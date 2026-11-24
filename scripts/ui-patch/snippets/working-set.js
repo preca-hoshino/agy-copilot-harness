@@ -68,10 +68,50 @@ function buildSideChatSessionSnippet({ revive }) {
   return snippet;
 }
 
+function buildSubagentReadOnlySnippet({ constObs }) {
+  const snippet = `,((t?.resource??this._sessionResource)?.scheme==="antigravity"&&((t?.resource??this._sessionResource)?.path?.startsWith("/subagent/")||(t?.resource??this._sessionResource)?.query?.includes("subagentChatResource="))&&(this.isReadOnly=${constObs}(!0)))`;
+  const check = validateSnippetSyntax(
+    snippet,
+    `function _w(t,${constObs}){this._canUseTools=t.canUseTools,this.isReadOnly=t.isReadOnly??${constObs}(!1)`,
+    `,this.isInputBlocked=t.isInputBlocked}`,
+    'subagent-read-only',
+  );
+  if (!check.ok) {
+    throw new Error(check.reason);
+  }
+  return snippet;
+}
+
+function buildSubagentSessionInputSnippet({ sess }) {
+  const snippet = `,...(${sess}?.scheme==="antigravity"&&(${sess}.path?.startsWith("/subagent/")||${sess}.query?.includes("subagentChatResource="))?{inputState:void 0}:{})`;
+  const check = validateSnippetSyntax(snippet, `function _w(${sess}){return{sessionResource:${sess}`, `}}`, 'subagent-session-input');
+  if (!check.ok) {
+    throw new Error(check.reason);
+  }
+  return snippet;
+}
+
+function buildEditorEditingSessionSnippet({ loc, model, transfer }) {
+  const snippet = `,(${loc}!=="panel"&&${model}.sessionResource?.scheme==="antigravity"&&!(${model}.sessionResource.path?.startsWith("/subagent/")||${model}.sessionResource.query?.includes("subagentChatResource="))&&${model}.startEditingSession(!1,${transfer}))`;
+  const check = validateSnippetSyntax(
+    snippet,
+    `function _w(${loc},${model},${transfer}){return ${loc}==="panel"&&${model}.startEditingSession(!0,${transfer})`,
+    `,${model}}`,
+    'editor-editing-session',
+  );
+  if (!check.ok) {
+    throw new Error(check.reason);
+  }
+  return snippet;
+}
+
 module.exports = {
+  buildEditingActionNotifySnippet,
+  buildEditorEditingSessionSnippet,
   buildExternalEditBaselineSnippet,
   buildLiveEditPillSnippet,
-  buildWorkingSetDedupSnippet,
-  buildEditingActionNotifySnippet,
   buildSideChatSessionSnippet,
+  buildSubagentReadOnlySnippet,
+  buildSubagentSessionInputSnippet,
+  buildWorkingSetDedupSnippet,
 };

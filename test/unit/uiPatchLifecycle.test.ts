@@ -25,6 +25,9 @@ function commonBundle() {
     'class RemoteSession{async _doInitializeContent(e,t){let i=await this._proxy.$provideChatSessionContent();this.history.length=0;this.history.push(...i.history.map(c=>{if(c.type==="request")return c;return{type:"response",parts:c.parts.map(l=>$revive(l)),participant:c.participant,details:c.details}})),i.hasActiveResponseCallback&&void 0,i.hasForkHandler&&!this.forkSession&&(this.forkSession=async(c,l)=>{let u=await this._proxy.$forkChatSession(this._providerHandle,this.sessionResource,c?this.toRequestDto(c):void 0,l);return $revive(u)})}}',
     'class EditingWidget{renderChatEditingSessionWithEntries(e,t,i,n){let C=i.read(e),k=n.read(e);return C.concat(k)}}',
     'class ChatSvc{notifyQuestionCarouselAnswer(e,t,i){this._onDidReceiveQuestionCarouselAnswer.fire({requestId:e,resolveId:t,answers:i})}track(w,p,e,c,x){if(c&&w.length>p){let D=w.slice(p);for(let O of D)e?.acceptResponseProgress(c,O,void 0,x);p=w.length}}notifyUserAction(e){if(this._chatServiceTelemetry.notifyUserAction(e),this._onDidPerformUserAction.fire(e),e.action.kind==="chatEditingSessionAction"){let t=this._sessionModels.get(e.sessionResource);t&&t.notifyEditingAction(e.action)}}}',
+    'class ChatSendSvc{trace(){}async sendRequest(e,g,Oe){let M=()=>{};e.setResponse(g,Oe),M(),this.trace("sendRequest",`Provider returned response for session ${e.sessionResource}`)}}',
+    'class ChatModel{constructor(d,t){this._sessionResource=t.resource,this._canUseTools=t.canUseTools,this.isReadOnly=t.isReadOnly??$obs(!1),this.isInputBlocked=t.isInputBlocked??$obs(!1)}}',
+    'class RemoteModelSvc{createRemoteSessionModel(e,t,i,n){let u={attachments:["a.js"]};return this._startSession({location:i,sessionResource:e,canUseTools:!1,transferEditingSession:t.transferredState?.editingSession,inputState:u,isReadOnly:t.isReadOnly})}_startSession(e){let{location:i,transferEditingSession:a,sessionResource:n}=e,C={sessionResource:n,inputState:e.inputState,started:[],startEditingSession(g,tr){this.started.push({global:g,transfer:tr})}};return i==="panel"&&C.startEditingSession(!0,a),C}}',
     'class ChatOptionPicker{renderLabel(e){let t=[];e.classList.add("chat-session-option-picker");let i=this.delegate.getOptionGroup(),n=this._pickerOptions?.compact.get()??!1;e.classList.toggle("compact",n);let r=this.currentOption?.name??i?.description??$d(15978,null),a=this.currentOption?.default&&this.currentOption?.icon;return e.classList.toggle("icon-only",n&&!!this.currentOption?.icon),this.currentOption?.icon&&t.push($ko($qu(this.currentOption.icon))),!a&&(!n||!this.currentOption?.icon)&&t.push($dom("span.chat-session-option-label",void 0,r)),$reset(e,...t),this.setAriaLabelAttributes(e),e.ariaLabel=r,null}}',
   ].join('\r\n');
 }
@@ -64,6 +67,7 @@ class Panel{createCombinedPanelContent(e){let t=$element("div"),l=$append(t,$ele
 if(this.accountName){let v=e.add(new $bar(l));e.add(v.onWillRun(()=>{this.hoverService.hideHover(!0),this.clickPanelDisposable.clear()})),v.push(e.add(new $action("copilot.manageModels","Models")))}
 if(this.chatEntitlementService.sentiment.hidden||e.add(this.instantiationService.createInstance(Widget,t))){}return t}
 renderContributedSections(e){for(let t of e){this.render(t)}}}
+var O3e=class extends $BaseCon{static{this.ID="workbench.contrib.openSubagentChatActionViewItem"}constructor(o,e,t,i,n){super();let r=(l,u)=>{},a=$ne(this,l=>$Qlc(e,t,r,l));this._register($eon.register({open:async l=>{let u=l.chatResource,p=a.get()(l);if(p)return await e.openChatToSide(p.session,p.chat.resource),!0;return!0}}));this._register(o.register(0,0,(l,u,p)=>{let h=p.createInstance($i0,void 0,l,{...u,draggable:!0},!1);return h.trackEnabled((g,f)=>f(!!a.get()(g))),h.setDragDataProvider(()=>!1),h},void 0))}};
 `;
 const workbenchOriginal = `${commonBundle()}
 class Menu{resolveMainMenuActions(e,t){let r=[],h=[],u=[],p=()=>{};if(h.length){r.length&&r.push(new $separator);for(let g of h)r.push(g instanceof Action?t.add(g):g)}return p(u),r}}
@@ -110,6 +114,13 @@ describe('VS Code UI patch lifecycle', () => {
     expect(patchedSessions).toContain('$session(r.sessionResource)==="antigravity"');
     expect(patchedSessions).toContain('p,e,l,$invocation,$source.External,');
     expect(patchedSessions).toContain(':v1:live-edit-pill:');
+    expect(patchedSessions).toContain(':v1:live-turn-stats:');
+    expect(patchedSessions).toContain(':v1:sessions-subagent-opener:');
+    expect(patchedSessions).toContain(':v1:sessions-subagent-track:');
+    expect(patchedWorkbench).toContain(':v1:live-turn-stats:');
+    expect(patchedWorkbench).toContain(':v1:subagent-read-only:');
+    expect(patchedWorkbench).toContain(':v1:subagent-session-input:');
+    expect(patchedWorkbench).toContain(':v1:editor-editing-session:');
     expect(patchedWorkbench).toContain('_act instanceof $separator');
     expect(runPatch('--check')).toMatchObject({ status: 0, output: expect.stringContaining('backup=verified') });
     expect(runPatch('--apply')).toMatchObject({ status: 0, output: expect.stringContaining('Already up to date') });
@@ -726,5 +737,51 @@ describe('VS Code UI patch lifecycle', () => {
       hasAntigravityChatInputAction: true,
       registeredActionCount: 4,
     });
+  });
+
+  it('enforces read-only mode without inherited inputState for antigravity subagents and starts editingSession in editor tabs', () => {
+    expect(runPatch('--apply').status).toBe(0);
+    for (const file of [sessions, workbench]) {
+      const outcome = runInNewContext(
+        `
+        ${fs.readFileSync(file, 'utf8')}
+        const makeRes = (path, query = '') => ({ scheme: 'antigravity', path, query, toString: () => 'antigravity:' + path + (query ? '?' + query : '') });
+        const svc = new RemoteModelSvc();
+        const directSub = svc.createRemoteSessionModel(makeRes('/subagent/sub-1'), {}, 'editor', 'open');
+        const querySub = svc.createRemoteSessionModel(makeRes('/parent-1', 'subagentChatResource=antigravity%3A%2Fsubagent%2Fsub-2'), {}, 'editor', 'open');
+        const normalEditor = svc.createRemoteSessionModel(makeRes('/parent-1'), {}, 'editor', 'open');
+        const normalPanel = svc.createRemoteSessionModel(makeRes('/parent-1'), {}, 'panel', 'open');
+        const roDirect = new ChatModel(undefined, { resource: makeRes('/subagent/sub-1'), canUseTools: false }).isReadOnly.get();
+        const roQuery = new ChatModel(undefined, { resource: makeRes('/parent-1', 'subagentChatResource=1'), canUseTools: false }).isReadOnly.get();
+        const roNormal = new ChatModel(undefined, { resource: makeRes('/parent-1'), canUseTools: true }).isReadOnly.get();
+        ({
+          directSubInput: directSub.inputState,
+          querySubInput: querySub.inputState,
+          normalEditorInput: normalEditor.inputState,
+          directSubStarted: directSub.started,
+          querySubStarted: querySub.started,
+          normalEditorStarted: normalEditor.started,
+          normalPanelStarted: normalPanel.started,
+          roDirect,
+          roQuery,
+          roNormal,
+        });
+      `,
+        {
+          token: vi.fn(),
+          $obs: (v: unknown) => ({ get: () => v }),
+        },
+      ) as Record<string, unknown>;
+      expect(outcome.directSubInput).toBeUndefined();
+      expect(outcome.querySubInput).toBeUndefined();
+      expect(outcome.normalEditorInput).toEqual({ attachments: ['a.js'] });
+      expect(outcome.roDirect).toBe(true);
+      expect(outcome.roQuery).toBe(true);
+      expect(outcome.roNormal).toBe(false);
+      expect(outcome.directSubStarted).toEqual([]);
+      expect(outcome.querySubStarted).toEqual([]);
+      expect(outcome.normalEditorStarted).toEqual([{ global: false, transfer: undefined }]);
+      expect(outcome.normalPanelStarted).toEqual([{ global: true, transfer: undefined }]);
+    }
   });
 });

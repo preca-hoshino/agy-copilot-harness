@@ -9,6 +9,59 @@ function buildSessionsProviderSnippet(
     'constructor(session,providerId,gitHubService,pullRequestIconCache,logService){' +
     'super(session,providerId,gitHubService,pullRequestIconCache,logService);' +
     'this.icon={id:"antigravity-logo"};' +
+    'this._agySubagentChats=new Map;' +
+    '}' +
+    '_ensureAgySubagentChat(chatResourceStr,titleStr){' +
+    'const uriCtor=this.resource?.constructor;' +
+    'if(typeof uriCtor?.parse!=="function"||typeof chatResourceStr!=="string"||!chatResourceStr.startsWith("antigravity:/subagent/"))return void 0;' +
+    'let chatUri;try{chatUri=uriCtor.parse(chatResourceStr);}catch{return void 0;}' +
+    'const key=chatUri.toString();' +
+    'const existing=this._agySubagentChats.get(key);' +
+    'if(existing){' +
+    'const cur=this._chatsObs?.get?.()??[];' +
+    'if(!cur.some(x=>x?.resource?.toString?.()===key))this._chatsObs?.set?.([...cur,existing],void 0);' +
+    'return existing;' +
+    '}' +
+    'const def=this._defaultChat;' +
+    'const sampleObs=this._mainChatObs;' +
+    'const obsCtor=sampleObs?.constructor;' +
+    'const mkObs=(fallbackVal)=>obsCtor?new obsCtor(sampleObs._debugNameData,fallbackVal,sampleObs._equalityComparator):def?.description;' +
+    'const canvases=typeof this._createChatCanvases==="function"?this._createChatCanvases():{};' +
+    'const childChat={' +
+    'resource:chatUri,' +
+    'harness:def?.harness??this.harness,' +
+    'createdAt:Date.now(),' +
+    'workspace:def?.workspace,' +
+    'title:mkObs(typeof titleStr==="string"&&titleStr.trim()?titleStr.trim():"Subagent"),' +
+    'updatedAt:def?.updatedAt,' +
+    'status:mkObs(2),' +
+    'changes:def?.changes,' +
+    'changesets:def?.changesets,' +
+    'changesSummary:def?.changesSummary,' +
+    'lastTurnChanges:mkObs([]),' +
+    'customizations:mkObs([]),' +
+    '...canvases,' +
+    'observeChanges:def?.observeChanges,' +
+    'backgroundShells:mkObs([]),' +
+    'checkpoints:mkObs(void 0),' +
+    'modelId:def?.modelId,' +
+    'modelSource:def?.modelSource,' +
+    'mode:def?.mode,' +
+    'completedStateIcon:mkObs(void 0),' +
+    'isArchived:def?.isArchived,' +
+    'isRead:mkObs(!0),' +
+    'interactivity:def?.interactivity,' +
+    'description:mkObs(void 0),' +
+    'lastTurnEnd:mkObs(void 0),' +
+    'origin:{kind:"tool",parentChat:this.resource},' +
+    '};' +
+    'this._agySubagentChats.set(key,childChat);' +
+    'this._aggregateChatResources?.add?.(chatUri);' +
+    'const curChats=this._chatsObs?.get?.()??[];' +
+    'if(!curChats.some(x=>x?.resource?.toString?.()===key)){' +
+    'this._chatsObs?.set?.([...curChats,childChat],void 0);' +
+    '}' +
+    'return childChat;' +
     '}' +
     '_buildWorkspace(session){' +
     'const base=super._buildWorkspace(session);' +
@@ -35,7 +88,19 @@ function buildSessionsProviderSnippet(
     ':{root:folderUri,workingDirectory:folderUri,name:folderName,description:void 0,gitRepository:void 0};' +
     'return{...base,uri:folderUri,label:folderName,folders:[folder],requiresWorkspaceTrust:!1,isVirtualWorkspace:!1};' +
     '}' +
-    'update(session){const changed=super.update(session);this.icon={id:"antigravity-logo"};return changed;}' +
+    'update(session){' +
+    'const changed=super.update(session);' +
+    'this.icon={id:"antigravity-logo"};' +
+    'if(this._agySubagentChats?.size>0&&this._chatsObs?.get){' +
+    'const cur=this._chatsObs.get();' +
+    'const missing=[];' +
+    'for(const[k,c]of this._agySubagentChats){' +
+    'if(!cur.some(x=>x?.resource?.toString?.()===k))missing.push(c);' +
+    '}' +
+    'if(missing.length>0)this._chatsObs.set([...cur,...missing],void 0);' +
+    '}' +
+    'return changed;' +
+    '}' +
     '}' +
     `class AntigravitySessionsProvider extends ${xfeCls}{` +
     'constructor(...args){super(...args);this._initAntigravity();}' +
@@ -49,6 +114,32 @@ function buildSessionsProviderSnippet(
     'const EmitterCtor=this._onDidChangeSessionTypes?.constructor;' +
     'this._agyOnDidChangeOptionState=EmitterCtor?this._register(new EmitterCtor):void 0;' +
     'globalThis[Symbol.for("antigravity.sessionsProvider")]=this;' +
+    'globalThis[Symbol.for("antigravity.ensureSubagentChat")]=(ctx,mgmt,hosts)=>{' +
+    'const chatRes=typeof ctx?.chatResource==="string"?ctx.chatResource:"";' +
+    'if(!chatRes.startsWith("antigravity:/subagent/"))return;' +
+    'let session;' +
+    'const parentRaw=typeof ctx?.parentSessionResource==="string"?ctx.parentSessionResource:"";' +
+    'const parentNoFrag=parentRaw?parentRaw.split("#")[0].split("?")[0]:"";' +
+    'if(parentNoFrag&&this._sessionCache){' +
+    'session=this._sessionCache.get(parentNoFrag);' +
+    'if(!session){' +
+    'for(const s of this._sessionCache.values()){' +
+    'if(s?.resource?.toString?.()?.split("?")[0]===parentNoFrag){session=s;break;}' +
+    '}' +
+    '}' +
+    '}' +
+    'if(!session&&hosts?.get){' +
+    'for(const h of hosts.get()){' +
+    'const hs=h?.session?.get?.();' +
+    'if(hs?._ensureAgySubagentChat&&(!parentNoFrag||hs.resource?.toString?.()?.split("?")[0]===parentNoFrag)){session=hs;break;}' +
+    '}' +
+    '}' +
+    'if(!session&&mgmt?.session?.get){' +
+    'const active=mgmt.session.get();' +
+    'if(active?._ensureAgySubagentChat)session=active;' +
+    '}' +
+    'session?._ensureAgySubagentChat?.(chatRes,ctx?.title);' +
+    '};' +
     'this._register(this.languageModelsService?.onDidChangeLanguageModels?.(()=>{' +
     'this._onDidChangeSessionTypes?.fire?.();' +
     '})??{dispose(){}});' +
@@ -423,8 +514,30 @@ function buildSessionsNewModeActionSnippet({ disp, regAct, actCls }, { expr, ses
   return newSessionAct + chatInputAct;
 }
 
+function buildSessionsSubagentOpenerSnippet({ arg, mgmt, hosts }) {
+  return `globalThis[Symbol.for("antigravity.ensureSubagentChat")]?.(${arg},${mgmt},${hosts});`;
+}
+
+function buildSessionsSubagentTrackSnippet({ item }, { mgmt, hosts }) {
+  return (
+    `if(${item}?.trackEnabled){const _agyOrigTrack=${item}.trackEnabled.bind(${item});` +
+    `${item}.trackEnabled=cb=>_agyOrigTrack((g,f)=>{` +
+    `if(typeof g?.chatResource==="string"&&g.chatResource.startsWith("antigravity:/subagent/")){` +
+    `queueMicrotask(()=>{globalThis[Symbol.for("antigravity.ensureSubagentChat")]?.(g,${mgmt},${hosts});});` +
+    `f(!0);return{dispose(){}};` +
+    `}return cb(g,f);});}` +
+    `if(${item}?.setDragDataProvider){const _agyOrigDrag=${item}.setDragDataProvider.bind(${item});` +
+    `${item}.setDragDataProvider=cb=>_agyOrigDrag((g,f)=>{` +
+    `if(typeof g?.chatResource==="string"&&g.chatResource.startsWith("antigravity:/subagent/")){` +
+    `globalThis[Symbol.for("antigravity.ensureSubagentChat")]?.(g,${mgmt},${hosts});` +
+    `}return cb(g,f);});}`
+  );
+}
+
 module.exports = {
   buildSessionsNewModeActionSnippet,
   buildSessionsNewModeViewItemSnippet,
   buildSessionsProviderSnippet,
+  buildSessionsSubagentOpenerSnippet,
+  buildSessionsSubagentTrackSnippet,
 };

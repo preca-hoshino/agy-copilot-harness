@@ -45,6 +45,10 @@ const COMMON_ANCHORS = {
     /return\{type:"response",parts:(?<turn>[$\w]+)\.parts\.map\((?<part>[$\w]+)=>(?<revive>[$\w]+)\(\k<part>\)\),participant:\k<turn>\.participant,details:\k<turn>\.details\}\}\)\)(?=,[$\w]+\.hasActiveResponseCallback)/g,
     'ChatSessions._doInitializeContent history usage',
   ],
+  liveTurnStats: [
+    /(?<modelVar>[$\w]+)\.setResponse\((?<req>[$\w]+),(?<res>[$\w]+)\),[$\w]+\(\),(?=this\.trace\("sendRequest",`Provider returned response for session \$\{\k<modelVar>\.sessionResource\}`\))/g,
+    'ChatService.sendRequest live turn stats',
+  ],
   externalEditBaseline: [
     /if\((?<item>[A-Za-z_$][\w$]*)\.kind==="externalEdits"\)\{(?=if\((?<session>[A-Za-z_$][\w$]*)\?\.editingSession&&(?<idx>[A-Za-z_$][\w$]*)!==void 0&&(?<reqId>[A-Za-z_$][\w$]*)\)\{let [A-Za-z_$][\w$]*=\k<item>\.start\?await \k<session>\.editingSession\.startExternalEdits\(\k<reqId>,\k<idx>,(?<revive>[A-Za-z_$][\w$]*)\(\k<item>\.resources\),\k<item>\.undoStopId\):await \k<session>\.editingSession\.stopExternalEdits\(\k<reqId>,\k<idx>\);(?<parts>[A-Za-z_$][\w$]*)\.push\()/g,
     'MainThreadChatAgents2.$handleProgressChunk externalEdits baseline',
@@ -64,6 +68,18 @@ const COMMON_ANCHORS = {
   sideChatSession: [
     /(?<dto>[A-Za-z_$][\w$]*)\.hasForkHandler&&!this\.forkSession&&\(this\.forkSession=async\((?<c>[A-Za-z_$][\w$]*),(?<l>[A-Za-z_$][\w$]*)\)=>\{let (?<u>[A-Za-z_$][\w$]*)=await this\._proxy\.\$forkChatSession\(this\._providerHandle,this\.sessionResource,\k<c>\?this\.toRequestDto\(\k<c>\):void 0,\k<l>\);return (?<revive>[A-Za-z_$][\w$]*)\(\k<u>\)\}\)/g,
     'RemoteSession sideChat and fork bridge',
+  ],
+  subagentReadOnly: [
+    /this\._canUseTools=t\.canUseTools,this\.isReadOnly=t\.isReadOnly\?\?(?<constObs>[$\w]+)\(!1\)/g,
+    'ChatModel subagent read-only enforcement',
+  ],
+  subagentSessionInput: [
+    /sessionResource:(?<sess>[$\w]+),canUseTools:!1,transferEditingSession:[$\w]+\.transferredState\?\.editingSession,inputState:[$\w]+,isReadOnly:[$\w]+\.isReadOnly/g,
+    'ChatService.createRemoteSessionModel subagent input isolation',
+  ],
+  editorEditingSession: [
+    /(?<loc>[$\w]+)==="panel"&&(?<model>[$\w]+)\.startEditingSession\(!0,(?<transfer>[$\w]+)\)/g,
+    'ChatService._startSession antigravity editor editingSession',
   ],
   modePermissionsPicker: [
     /\brenderLabel\((?<el>[$\w]+)\)\{let (?<children>[$\w]+)=\[\];\k<el>\.classList\.add\("chat-session-option-picker"\);let (?<group>[$\w]+)=this\.delegate\.getOptionGroup\(\),(?<compact>[$\w]+)=this\._pickerOptions\?\.compact\.get\(\)\?\?!1;\k<el>\.classList\.toggle\("compact",\k<compact>\);(?=let (?<label>[$\w]+)=this\.currentOption\?\.name\?\?\k<group>\?\.description\?\?[$\w]+\(15978,null\),(?<isDefaultIcon>[$\w]+)=this\.currentOption\?\.default&&this\.currentOption\?\.icon;return \k<el>\.classList\.toggle\("icon-only",\k<compact>&&!!this\.currentOption\?\.icon\),this\.currentOption\?\.icon&&\k<children>\.push\((?<renderIcon>[A-Za-z_$][\w$]*)\((?<toIcon>[A-Za-z_$][\w$]*)\(this\.currentOption\.icon\)\)\),!\k<isDefaultIcon>&&\(!\k<compact>\|\|!this\.currentOption\?\.icon\)&&\k<children>\.push\((?<dom>[A-Za-z_$][\w$]*)\("span\.chat-session-option-label",void 0,\k<label>\)\),(?<reset>[A-Za-z_$][\w$]*)\(\k<el>,\.\.\.\k<children>\),this\.setAriaLabelAttributes\(\k<el>\),\k<el>\.ariaLabel=\k<label>,null\})/g,
@@ -122,6 +138,14 @@ const SESSIONS_ANCHORS = {
   sessionsDefaultProvider: [
     /function Nos\((?<services>[$\w]+)\)\{let (?<inst>[$\w]+)=\k<services>\.get\([$\w]+\),(?<regSvc>[$\w]+)=\k<services>\.get\([$\w]+\),[^;]+,(?<disp>[$\w]+)=new [$\w]+,(?<prov>[$\w]+)=\k<disp>\.add\(\k<inst>\.createInstance\((?<xfeCls>[$\w]+),"default"\)\);(?=if\(\k<disp>\.add\(\k<regSvc>\.registerProvider\(\k<prov>\)\),)/g,
     'Sessions default provider registration',
+  ],
+  sessionsSubagentOpener: [
+    /static\{this\.ID="workbench\.contrib\.openSubagentChatActionViewItem"\}constructor\((?<reg>[$\w]+),(?<mgmt>[$\w]+),(?<hosts>[$\w]+),[$\w]+,[$\w]+\)\{[\s\S]{1,350}?open:async (?<arg>[$\w]+)=>\{(?=let [$\w]+=\k<arg>\.chatResource,)/g,
+    'Sessions subagent openChatToSide antigravity bridge',
+  ],
+  sessionsSubagentTrack: [
+    /static\{this\.ID="workbench\.contrib\.openSubagentChatActionViewItem"\}[\s\S]{1,1200}?let (?<item>[$\w]+)=[$\w]+\.createInstance\([$\w]+,void 0,[$\w]+,\{\.\.\.[$\w]+,draggable:!0\},!1\);(?=return \k<item>\.trackEnabled\()/g,
+    'Sessions subagent pill enablement and drag bridge',
   ],
 };
 

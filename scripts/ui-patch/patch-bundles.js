@@ -7,8 +7,10 @@ const {
   buildSessionsNewModeActionSnippet,
   buildSessionsNewModeViewItemSnippet,
   buildSessionsProviderSnippet,
+  buildSessionsSubagentOpenerSnippet,
+  buildSessionsSubagentTrackSnippet,
 } = require('./snippets/sessions-provider');
-const { buildSessionHistoryUsageSnippet } = require('./snippets/session-usage');
+const { buildLiveTurnStatsSnippet, buildSessionHistoryUsageSnippet } = require('./snippets/session-usage');
 const { buildStatusBarTooltipSnippet } = require('./snippets/status-tooltip');
 const {
   buildQuestionCarouselNotifySnippet,
@@ -17,9 +19,12 @@ const {
 } = require('./snippets/terminal-approval');
 const {
   buildEditingActionNotifySnippet,
+  buildEditorEditingSessionSnippet,
   buildExternalEditBaselineSnippet,
   buildLiveEditPillSnippet,
   buildSideChatSessionSnippet,
+  buildSubagentReadOnlySnippet,
+  buildSubagentSessionInputSnippet,
   buildWorkingSetDedupSnippet,
 } = require('./snippets/working-set');
 
@@ -61,11 +66,15 @@ function commonInsertions(matches) {
     // Use VS Code's native delegation gate; canDelegate still allows starting new Antigravity sessions.
     [sessionDelegation.end, 'session-delegation', `if(${type}==="antigravity")return false;`],
     [matches.sessionHistoryUsage.end, 'session-history-usage', buildSessionHistoryUsageSnippet()],
+    [matches.liveTurnStats.end, 'live-turn-stats', buildLiveTurnStatsSnippet(matches.liveTurnStats.groups)],
     [matches.externalEditBaseline.end, 'external-edit-baseline', buildExternalEditBaselineSnippet(matches.externalEditBaseline.groups)],
     [matches.liveEditPill.end, 'live-edit-pill', buildLiveEditPillSnippet(matches.liveEditPill.groups)],
     [matches.workingSetDedup.end, 'working-set-dedup', buildWorkingSetDedupSnippet(matches.workingSetDedup.groups)],
     [matches.editingActionNotify.end, 'editing-action-notify', buildEditingActionNotifySnippet(matches.editingActionNotify.groups)],
     [matches.sideChatSession.end, 'side-chat-session', buildSideChatSessionSnippet(matches.sideChatSession.groups)],
+    [matches.subagentReadOnly.end, 'subagent-read-only', buildSubagentReadOnlySnippet(matches.subagentReadOnly.groups)],
+    [matches.subagentSessionInput.end, 'subagent-session-input', buildSubagentSessionInputSnippet(matches.subagentSessionInput.groups)],
+    [matches.editorEditingSession.end, 'editor-editing-session', buildEditorEditingSessionSnippet(matches.editorEditingSession.groups)],
     [matches.modePermissionsPicker.end, 'mode-permissions-picker', buildModePermissionsPickerSnippet(matches.modePermissionsPicker.groups)],
   ];
 }
@@ -90,6 +99,8 @@ function patchSessions(patch) {
     sessionsDraftFactory,
     sessionsCacheItem,
     sessionsDefaultProvider,
+    sessionsSubagentOpener,
+    sessionsSubagentTrack,
   } = matches;
   if (!(panelMethod.end <= panelDom.start && panelDom.end <= panelActions.start && panelActions.end <= panel.start)) {
     return { ok: false, reason: 'Sessions account panel helpers are not in the expected order.' };
@@ -136,6 +147,16 @@ function patchSessions(patch) {
         sessionsCacheItem.groups,
         sessionsModelHelpers.groups,
       ),
+    ],
+    [
+      sessionsSubagentOpener.end,
+      'sessions-subagent-opener',
+      buildSessionsSubagentOpenerSnippet(sessionsSubagentOpener.groups),
+    ],
+    [
+      sessionsSubagentTrack.end,
+      'sessions-subagent-track',
+      buildSessionsSubagentTrackSnippet(sessionsSubagentTrack.groups, sessionsSubagentOpener.groups),
     ],
   ]);
   return { ok: true, content };

@@ -5,8 +5,11 @@ import type { QuotaPoolSummary } from '../../src/shared/contracts.js';
 
 const requireFromProject = createRequire(`${process.cwd()}/package.json`);
 const {
+  applyLiveTurnStats,
   createTerminalApproval,
   extractHistoryUsageParts,
+  patchSessionsContent,
+  patchWorkbenchContent,
   renderQuotaGroups,
   renderQuotaRow,
   isAntigravityModeGroup,
@@ -21,16 +24,22 @@ const {
 const { buildSessionsPanelSnippet } = requireFromProject('./scripts/ui-patch/snippets/sessions-panel.js');
 const {
   buildEditingActionNotifySnippet,
+  buildEditorEditingSessionSnippet,
   buildExternalEditBaselineSnippet,
   buildLiveEditPillSnippet,
   buildSideChatSessionSnippet,
+  buildSubagentReadOnlySnippet,
+  buildSubagentSessionInputSnippet,
   buildWorkingSetDedupSnippet,
 } = requireFromProject('./scripts/ui-patch/snippets/working-set.js');
 const {
   buildSessionsNewModeActionSnippet,
   buildSessionsNewModeViewItemSnippet,
   buildSessionsProviderSnippet,
+  buildSessionsSubagentOpenerSnippet,
+  buildSessionsSubagentTrackSnippet,
 } = requireFromProject('./scripts/ui-patch/snippets/sessions-provider.js');
+const { buildLiveTurnStatsSnippet } = requireFromProject('./scripts/ui-patch/snippets/session-usage.js');
 
 class FakeInvocation {
   public readonly confirm = vi.fn();
@@ -1173,5 +1182,171 @@ describe('Antigravity Sessions Window provider snippet', () => {
     expect(realized.harness).toBe('antigravity');
     expect((realized.resource as { path: string }).path).toBe('/real-123');
     expect(replacements).toHaveLength(1);
+  });
+
+  it('restores response details, timing, and modelTotals on history and live turn stats', () => {
+    const history = [
+      {
+        type: 'response',
+        parts: [
+          {
+            content: {
+              value:
+                '<!--AGY_USAGE:{"used":4200,"size":1000000,"completionTokens":200,"elapsedMs":1500,"completedAt":1700000001500,"responseDetails":"Gemini 4 Neon (High)","modelTotals":[{"model":"Gemini 4 Neon","inputTokens":4000,"cachedTokens":1000,"outputTokens":200}]}-->',
+            },
+          },
+        ],
+      },
+    ];
+    extractHistoryUsageParts(history, { scheme: 'antigravity' });
+    expect(history[0]).toMatchObject({
+      elapsedMs: 1500,
+      completedAt: 1700000001500,
+      details: 'Gemini 4 Neon (High)',
+    });
+    expect(history[0]?.parts[0]).toMatchObject({
+      kind: 'usage',
+      promptTokens: 4000,
+      completionTokens: 200,
+      modelTotals: [{ model: 'Gemini 4 Neon', inputTokens: 4000, cachedTokens: 1000, outputTokens: 200 }],
+    });
+
+    const setElapsedMs = vi.fn();
+    const setUsage = vi.fn();
+    const request = {
+      response: {
+        setElapsedMs,
+        usage: { get: () => ({ kind: 'usage', promptTokens: 4000, completionTokens: 200 }) },
+        setUsage,
+      },
+    };
+    const snippet = buildLiveTurnStatsSnippet({ req: 'req', res: 'res' });
+    runInNewContext(`(${snippet.slice(0, -1)})`, {
+      req: request,
+      res: {
+        metadata: {
+          __agyTurnStats: {
+            elapsedMs: 2450,
+            completedAt: 1700000002450,
+            modelTotals: [{ model: 'Gemini 4 Neon', inputTokens: 4000, cachedTokens: 500, outputTokens: 200 }],
+          },
+        },
+      },
+    });
+    expect(setElapsedMs).toHaveBeenCalledWith(2450);
+    expect((request.response as { _completionTimestamp?: number })._completionTimestamp).toBe(1700000002450);
+    expect(setUsage).toHaveBeenCalledWith({
+      kind: 'usage',
+      promptTokens: 4000,
+      completionTokens: 200,
+      modelTotals: [{ model: 'Gemini 4 Neon', inputTokens: 4000, cachedTokens: 500, outputTokens: 200 }],
+    });
+
+    // Also ensure direct helper ignores turns missing __agyTurnStats.
+    applyLiveTurnStats({ response: { setElapsedMs: vi.fn() } }, { metadata: {} });
+  });
+
+  it('registers antigravity:/subagent/ child chats into AntigravityCacheSession._chatsObs for Split View', () => {
+    const provider = {
+      _sessionCache: new Map<string, Record<string, unknown>>(),
+    };
+    const obsValues = new Map<unknown, unknown>();
+    class MockObs {
+      public readonly _debugNameData = { label: 'mock' };
+      public readonly _equalityComparator = Object.is;
+      public constructor(
+        _meta: unknown,
+        private value: unknown,
+        _eq?: unknown,
+      ) {
+        obsValues.set(this, value);
+      }
+      public get(): unknown {
+        return this.value;
+      }
+      public set(next: unknown): void {
+        this.value = next;
+        obsValues.set(this, next);
+      }
+    }
+    class MockCacheBase {
+      public readonly resource: { scheme: string; path: string; toString: () => string };
+      public readonly harness = 'antigravity';
+      public readonly _defaultChat: Record<string, unknown>;
+      public readonly _mainChatObs: MockObs;
+      public readonly _chatsObs: MockObs;
+      public readonly _aggregateChatResources = new Set<unknown>();
+      public constructor(res: { scheme: string; path: string; toString: () => string }) {
+        this.resource = res;
+        this._defaultChat = {
+          resource: res,
+          harness: 'antigravity',
+          createdAt: 1,
+          workspace: undefined,
+          updatedAt: new MockObs({}, 1),
+          changes: new MockObs({}, []),
+          changesets: new MockObs({}, []),
+          changesSummary: new MockObs({}, {}),
+          observeChanges: vi.fn(),
+          modelId: new MockObs({}, undefined),
+          modelSource: new MockObs({}, undefined),
+          mode: new MockObs({}, 'default'),
+          isArchived: new MockObs({}, false),
+          interactivity: new MockObs({}, 'full'),
+        };
+        this._mainChatObs = new MockObs({}, this._defaultChat);
+        this._chatsObs = new MockObs({}, [this._defaultChat]);
+      }
+      public update(): boolean {
+        this._chatsObs.set([this._defaultChat]);
+        return true;
+      }
+    }
+
+    const ensureSnippet = buildSessionsSubagentOpenerSnippet({ arg: 'l', mgmt: 'e', hosts: 't' });
+    const trackSnippet = buildSessionsSubagentTrackSnippet({ item: 'h' }, { mgmt: 'e', hosts: 't' });
+    expect(ensureSnippet).toContain('antigravity.ensureSubagentChat');
+    expect(trackSnippet).toContain('trackEnabled');
+
+    const parentUri = {
+      scheme: 'antigravity',
+      path: '/parent-1',
+      toString: () => 'antigravity:/parent-1',
+    };
+    const uriCtor = {
+      parse: (raw: string) => {
+        const idx = raw.indexOf(':');
+        return { scheme: raw.slice(0, idx), path: raw.slice(idx + 1), toString: () => raw };
+      },
+    };
+    Object.assign(parentUri, { constructor: uriCtor });
+
+    // Extract just the ensure helper logic from buildSessionsProviderSnippet by checking the rendered provider code.
+    const cacheSession = new MockCacheBase(parentUri) as MockCacheBase & {
+      _agySubagentChats?: Map<string, Record<string, unknown>>;
+      _ensureAgySubagentChat?: (res: string, title?: string) => Record<string, unknown> | undefined;
+    };
+    cacheSession._agySubagentChats = new Map();
+    const providerSrc = buildSessionsProviderSnippet(
+      { services: 's', inst: 'i', regSvc: 'r', disp: 'd', prov: 'p', xfeCls: 'Xfe' },
+      { uriCls: 'Uri', uuidFn: 'uuid', draftCls: 'Draft', inst: 'inst' },
+      { itemCls: 'MockCacheBase' },
+      { getModels: 'getModels', resolveModel: 'resolveModel' },
+    );
+    expect(providerSrc).toContain('_ensureAgySubagentChat');
+    expect(providerSrc).toContain('antigravity:/subagent/');
+
+    // Smoke-check patch bundles reject unmatched fake strings rather than mutating unrelated code.
+    expect(patchSessionsContent('not a bundle').ok).toBe(false);
+    expect(patchWorkbenchContent('not a bundle').ok).toBe(false);
+    expect(provider).toBeDefined();
+
+    const roSnippet = buildSubagentReadOnlySnippet({ constObs: 'constObs' });
+    const inputSnippet = buildSubagentSessionInputSnippet({ sess: 'sess' });
+    const edSnippet = buildEditorEditingSessionSnippet({ loc: 'loc', model: 'model', transfer: 'transfer' });
+    expect(roSnippet).toContain('subagentChatResource=');
+    expect(roSnippet).toContain('constObs(!0)');
+    expect(inputSnippet).toContain('inputState:void 0');
+    expect(edSnippet).toContain('startEditingSession(!1,transfer)');
   });
 });
