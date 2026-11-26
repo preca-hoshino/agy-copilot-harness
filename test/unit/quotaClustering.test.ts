@@ -642,6 +642,22 @@ describe('AgyQuotaService', () => {
                   maxTokens: 512_000,
                   maxOutputTokens: 64_000,
                 },
+                'tab_flash_lite_preview': {
+                  model: 'MODEL_PLACEHOLDER_M19',
+                  maxTokens: 16_384,
+                  maxOutputTokens: 4_096,
+                },
+                'gemini-3.8-flash-tiered': {
+                  model: 'MODEL_PLACEHOLDER_M322',
+                  maxTokens: 1_000_000,
+                  maxOutputTokens: 64_000,
+                },
+                'gemini-2.5-flash': {
+                  displayName: 'Gemini 3.5 Flash Lite',
+                  model: 'MODEL_GOOGLE_GEMINI_2_5_FLASH',
+                  maxTokens: 1_000_000,
+                  maxOutputTokens: 64_000,
+                },
               },
             },
           }),
@@ -674,6 +690,13 @@ describe('AgyQuotaService', () => {
     expect(opus?.maxContextWindowTokens).toBe(512_000);
     expect(opus?.maxInputTokens).toBe(512_000);
     expect(opus?.maxOutputTokens).toBe(64_000);
+    expect(infos?.some((entry) => entry.id === 'MODEL_PLACEHOLDER_M19' || entry.name === 'tab_flash_lite_preview')).toBe(
+      false,
+    );
+    expect(infos?.some((entry) => entry.id === 'MODEL_PLACEHOLDER_M322' || entry.name === 'gemini-3.8-flash-tiered')).toBe(
+      false,
+    );
+    expect(infos?.some((entry) => entry.name === 'Gemini 3.5 Flash Lite')).toBe(false);
 
     provider.dispose();
     service.dispose();

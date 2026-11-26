@@ -411,8 +411,6 @@ function normalizeModelLookupKey(value: string): string {
 }
 
 function mergeAvailableModelLimits(models: ModelQuotaInfo[], available: readonly AvailableModelLimits[]): void {
-  const unmatched = new Set<AvailableModelLimits>(available);
-
   for (const quotaModel of models) {
     const exactId = quotaModel.modelId.trim().toLowerCase();
     const exactLabel = quotaModel.label.trim().toLowerCase();
@@ -435,31 +433,12 @@ function mergeAvailableModelLimits(models: ModelQuotaInfo[], available: readonly
     if (match === undefined) {
       continue;
     }
-    unmatched.delete(match);
     if (match.maxTokens !== undefined && match.maxTokens > 0) {
       quotaModel.maxTokens = match.maxTokens;
     }
     if (match.maxOutputTokens !== undefined && match.maxOutputTokens > 0) {
       quotaModel.maxOutputTokens = match.maxOutputTokens;
     }
-  }
-
-  for (const extra of unmatched) {
-    if (extra.maxTokens === undefined && extra.maxOutputTokens === undefined) {
-      continue;
-    }
-    const id = extra.modelId ?? extra.modelKey;
-    const label = extra.displayName ?? extra.modelKey;
-    models.push({
-      label,
-      modelId: id,
-      remainingFraction: extra.remainingFraction ?? 1,
-      ...(extra.resetTime !== undefined ? { resetTime: extra.resetTime } : {}),
-      ...(extra.supportsThinking !== undefined ? { supportsThinking: extra.supportsThinking } : {}),
-      ...(extra.supportsImages !== undefined ? { supportsImages: extra.supportsImages } : {}),
-      ...(extra.maxTokens !== undefined ? { maxTokens: extra.maxTokens } : {}),
-      ...(extra.maxOutputTokens !== undefined ? { maxOutputTokens: extra.maxOutputTokens } : {}),
-    });
   }
 }
 
@@ -512,7 +491,7 @@ export function parseGetUserStatusPayload(
 
   const models: ModelQuotaInfo[] = [];
   for (const item of rawConfigs) {
-    if (!isRecord(item)) {
+    if (!isRecord(item) || item.disabled === true || item.hidden === true || item.isInternal === true) {
       continue;
     }
     const rawLabel = getNonEmptyString(item.label);
